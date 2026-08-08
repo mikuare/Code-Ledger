@@ -189,9 +189,19 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                     target_row = self.db.execute("SELECT id FROM symbols WHERE name=? AND status='active' LIMIT 1", (target,)).fetchone()
                     resolved[target] = target_row[0] if target_row else None
                 self.db.execute("INSERT OR IGNORE INTO dependencies(source_file_id,source_symbol_id,target_name,target_symbol_id,kind) VALUES(?,?,?,?,?)", (file_id, symbol_ids.get(source), target, resolved[target], kind))
-        for row in self.db.execute("SELECT id,path FROM files").fetchall():
+        # A deletion is an event, not a state to re-report. Without the status
+        # check every refresh re-marked an already-deleted file and recorded it
+        # again, so `watch` logged a change every poll forever for any file that
+        # had ever been removed — and never idled down, because it always
+        # believed something had just changed.
+        for row in self.db.execute("SELECT id,path FROM files WHERE status!='deleted'").fetchall():
             if row["path"] not in seen and not (self.root / row["path"]).exists():
-                self.db.execute("UPDATE files SET status='deleted' WHERE id=?", (row["id"],)); deleted += 1; changed_paths.append(row["path"])
+                self.db.execute("UPDATE files SET status='deleted',last_modified_by=?,last_modified_session=? WHERE id=?", (actor, session, row["id"])); deleted += 1; changed_paths.append(row["path"])
+                # The file's symbols went with it. Leaving them active let
+                # `impact` name a deleted file's symbols as live dependents.
+                for symbol in self.db.execute("SELECT name FROM symbols WHERE file_id=? AND status='active'", (row["id"],)).fetchall():
+                    changed_symbols.append(symbol["name"])
+                self.db.execute("UPDATE symbols SET status='deleted',deleted_at=?,updated_at=?,last_modified_by=?,last_modified_session=? WHERE file_id=? AND status='active'", (NOW(), NOW(), actor, session, row["id"]))
         db_started = time.perf_counter(); self.db.commit(); db_seconds = time.perf_counter() - db_started; total = time.perf_counter() - started
         change_id = None
         if record and changed_paths:

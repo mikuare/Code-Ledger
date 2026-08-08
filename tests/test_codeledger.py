@@ -212,6 +212,22 @@ class CodeLedgerTests(unittest.TestCase):
             self.assertEqual(answer["attribution"][0]["last_modified_session"], "s-1")
             self.assertEqual(answer["recorded_changes"][0]["agent"], "codex")
 
+    def test_a_deleted_file_is_reported_once_not_every_refresh(self):
+        """`watch` polls continuously; a deletion must not re-fire each poll."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); temp=root/"scratch.py"
+            (root/"keep.py").write_text("def keep():\n    return 1\n")
+            temp.write_text("def temporary():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            temp.unlink()
+            first=ledger.refresh(changed_only=True)
+            self.assertIn("scratch.py", first["files"]); self.assertEqual(first["files_deleted"], 1)
+            for poll in range(3):
+                again=ledger.refresh(changed_only=True)
+                self.assertEqual(again["files"], [], f"poll {poll} re-reported the deletion")
+                self.assertIsNone(again["change_id"], f"poll {poll} recorded a phantom change")
+            self.assertEqual(ledger.lookup("temporary")[0]["status"], "deleted")   # still queryable history
+
     def test_a_sentence_request_finds_its_symbols(self):
         """Real requests are sentences, not bare symbol names.
 
