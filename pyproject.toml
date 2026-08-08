@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeledger"
+version = "0.1.0"
+description = "CodeLedger — persistent project memory and change intelligence for AI coding agents."
+requires-python = ">=3.10"
+dependencies = []
+readme = "README.md"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Version Control",
+  "Environment :: Console",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+codeledger = "codeledger.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codeledger*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
