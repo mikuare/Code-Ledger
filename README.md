@@ -140,6 +140,43 @@ Installing or removing grammars upgrades an existing index in place — `files.a
 
 The design and its trade-offs are in [docs/LANGUAGE_SUPPORT.md](docs/LANGUAGE_SUPPORT.md).
 
+## Did the change actually do anything?
+
+The most expensive failure in agent-assisted work is the silent loop: you prompt, the agent edits, nothing changes, you prompt again. The agent has no memory of the last attempt, so it re-reads the repository and often tries the same thing — spending tokens to rediscover what already failed.
+
+Every refresh now reports what an edit actually achieved:
+
+| `effect` | Meaning |
+|---|---|
+| `symbols-changed` | real code changed |
+| `text-only` | files changed but no symbol did — formatting, comments, or an edit that missed |
+| `none` | nothing changed at all |
+
+A file rewritten with identical content never counts. `codeledger run` says so directly rather than burying it:
+
+```text
+[CODELEDGER] NO EFFECT: this attempt changed 1 file(s) but no symbol.
+[CODELEDGER] Run `codeledger progress 'Fix the total calculation rounding'` before retrying.
+```
+
+Before retrying a task that did not work, ask what previous attempts did — one cheap query instead of re-reading the codebase:
+
+```bash
+codeledger progress "Fix the total calculation rounding"
+```
+
+```text
+status:   REPEATING
+guidance: 3 attempts have edited calculate_total and verification still fails.
+          Editing the same symbol again is unlikely to help. Re-read the failure
+          output, widen the search with `codeledger impact <symbol>`, or ask the
+          user whether the request describes the real problem.
+```
+
+The four verdicts are `NO_EFFECT` (attempts changed no symbol — the edits are not reaching the code that runs), `REPEATING` (same symbols edited repeatedly, verification still failing), `UNVERIFIED` (real changes, no evidence recorded), and `VERIFIED` (verification passed after the last attempt — stop editing). Agents reach it through MCP as `codeledger_get_progress`, and the protocol written into `CLAUDE.md`/`AGENTS.md`/`CODEX.md` tells them to call it before a retry.
+
+Note what this does *not* do: it never claims the user's prompt was wrong. It reports what the attempts changed and whether verification passed, and where the evidence points at the request itself, it says to ask you.
+
 ## Attribution
 
 Every file and symbol records the agent and session that last changed it, and `why` links a symbol to the request behind it:

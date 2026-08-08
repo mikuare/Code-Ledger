@@ -12,6 +12,17 @@ to be wrong — which is the failure mode this project exists to avoid.
 
 ### Added
 
+- **Effect tracking and loop detection.** Every refresh reports whether an edit
+  changed real code (`symbols-changed`), only text (`text-only`), or nothing
+  (`none`), stored on `changes.effect`. `codeledger progress "<request>"` (MCP:
+  `codeledger_get_progress`) reports whether prior attempts at a request
+  achieved anything: `NO_EFFECT`, `REPEATING`, `UNVERIFIED`, or `VERIFIED`, with
+  guidance for each. `codeledger run` prints a `NO EFFECT` warning immediately,
+  and the agent protocol instructs agents to check progress before retrying.
+  This targets the common failure where an agent edits, nothing changes, and it
+  retries the same thing — re-reading the repository each time. It reports what
+  attempts changed and whether verification passed; it never claims the user's
+  prompt was wrong.
 - **Multi-language analysis via tree-sitter** (`providers.py`). Analysis sits
   behind a provider protocol declaring a coverage tier: tree-sitter (`full`),
   Python AST (`full`, no dependency), line patterns (`shallow`). Verified end to

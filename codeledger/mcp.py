@@ -10,6 +10,7 @@ from .core import Ledger
 TOOLS = [
     ("codeledger_get_context", "Retrieve compact project context for a task."),
     ("codeledger_get_plan", "Generate pre-change intelligence and recommendations."),
+    ("codeledger_get_progress", "Check whether previous attempts at this request changed anything or are repeating. Call before retrying a task that did not work."),
     ("codeledger_analyze_prompt", "Convert a user request into an explicit task brief."),
     ("codeledger_task_handshake", "Compare the user request with the AI implementation plan before editing."),
     ("codeledger_find_symbol", "Find active or deleted symbols."),
@@ -30,6 +31,7 @@ TOOLS = [
 SCHEMAS = {
     "codeledger_get_context": {"type": "object", "properties": {"query": {"type": "string"}, "task": {"type": "string"}}},
     "codeledger_get_plan": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}}},
+    "codeledger_get_progress": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}}, "required": ["request"]},
     "codeledger_analyze_prompt": {"type": "object", "properties": {"prompt": {"type": "string"}, "task": {"type": "string"}}, "required": ["prompt"]},
     "codeledger_task_handshake": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "ai_plan": {"type": "string"}}, "required": ["ai_plan"]},
     "codeledger_find_symbol": {"type": "object", "properties": {"query": {"type": "string"}, "task": {"type": "string"}}, "required": ["query"]},
@@ -68,6 +70,7 @@ def serve(root):
                 params = request.get("params", {}); name = params.get("name"); args = params.get("arguments", {})
                 if name == "codeledger_get_context": result = _result(ledger.context(arg(args, "query", "task")))
                 elif name == "codeledger_get_plan": result = _result(ledger.plan(arg(args, "request", "task", "query")))
+                elif name == "codeledger_get_progress": result = _result(ledger.progress(arg(args, "request", "task", "query")))
                 elif name == "codeledger_analyze_prompt": result = _result(ledger.analyze_prompt(arg(args, "prompt", "task", "query")))
                 elif name == "codeledger_task_handshake": result = _result(ledger.handshake(arg(args, "request", "task"), args.get("ai_plan", "")))
                 elif name == "codeledger_find_symbol": result = _result(ledger.lookup(arg(args, "query", "task")))

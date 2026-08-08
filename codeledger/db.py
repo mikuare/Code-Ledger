@@ -19,7 +19,7 @@ CREATE INDEX IF NOT EXISTS idx_dependencies_source_file ON dependencies(source_f
 CREATE TABLE IF NOT EXISTS features (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT, status TEXT NOT NULL DEFAULT 'UNKNOWN', last_verified TEXT, last_changed TEXT);
 CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, provider TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, agent_id INTEGER REFERENCES agents(id), working_directory TEXT, start_time TEXT NOT NULL, end_time TEXT, request TEXT, result TEXT, status TEXT NOT NULL DEFAULT 'active');
-CREATE TABLE IF NOT EXISTS changes (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, agent TEXT, session_id TEXT, user_request TEXT, summary TEXT, risk TEXT, git_commit TEXT, result TEXT, files_added INTEGER DEFAULT 0, files_modified INTEGER DEFAULT 0, files_deleted INTEGER DEFAULT 0, symbols_added INTEGER DEFAULT 0, symbols_modified INTEGER DEFAULT 0, symbols_deleted INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS changes (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, agent TEXT, session_id TEXT, user_request TEXT, summary TEXT, risk TEXT, git_commit TEXT, result TEXT, effect TEXT, files_added INTEGER DEFAULT 0, files_modified INTEGER DEFAULT 0, files_deleted INTEGER DEFAULT 0, symbols_added INTEGER DEFAULT 0, symbols_modified INTEGER DEFAULT 0, symbols_deleted INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_changes_time ON changes(timestamp DESC);
 CREATE TABLE IF NOT EXISTS change_files (change_id INTEGER REFERENCES changes(id) ON DELETE CASCADE, file_id INTEGER REFERENCES files(id) ON DELETE SET NULL, path TEXT NOT NULL, status TEXT, PRIMARY KEY(change_id, path));
 CREATE TABLE IF NOT EXISTS change_symbols (change_id INTEGER REFERENCES changes(id) ON DELETE CASCADE, symbol_id INTEGER REFERENCES symbols(id) ON DELETE SET NULL, name TEXT NOT NULL, status TEXT, PRIMARY KEY(change_id, name));
@@ -35,6 +35,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("dependencies", "source_file_id", "ALTER TABLE dependencies ADD COLUMN source_file_id INTEGER REFERENCES files(id)"),
     ("files", "analysis_provider", "ALTER TABLE files ADD COLUMN analysis_provider TEXT"),
     ("files", "coverage", "ALTER TABLE files ADD COLUMN coverage TEXT"),
+    ("changes", "effect", "ALTER TABLE changes ADD COLUMN effect TEXT"),
 ]
 
 def connect(root: Path) -> sqlite3.Connection:

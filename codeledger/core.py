@@ -59,6 +59,17 @@ class Ledger:
 
 Before changing code, analyze the user request (CLI: `codeledger prompt \"<task>\"`; MCP: `codeledger_analyze_prompt`), then query CodeLedger pre-change intelligence (CLI: `codeledger plan \"<task>\"`; MCP: `codeledger_get_plan`) and context (MCP: `codeledger_get_context`). Review relevant symbols, history, issues, decisions, impact, risk, constraints, acceptance criteria, and suggested tests before inspecting broad source areas. State your proposed files, implementation, and tests, then submit it for alignment (CLI: `codeledger handshake \"<task>\" --ai-plan \"<plan>\"`; MCP: `codeledger_task_handshake`). If the handshake warns, revise the plan before editing. Prefer targeted inspection; avoid repository-wide scans when CodeLedger says they are unnecessary. After changing code, refresh/record changed files (CLI: `codeledger refresh --changed`; MCP: `codeledger_refresh`), review any scope `WARNING`, run affected tests, and record verification evidence. If verification fails after a previous pass, query regressions (MCP: `codeledger_get_regressions`).
 
+## If a task did not work the first time
+
+Before retrying a request that produced no visible result, ask what the previous attempt actually did (CLI: `codeledger progress \"<task>\"`; MCP: `codeledger_get_progress`). Do not re-read the repository to work it out. The answer is one of:
+
+- `NO_EFFECT` — earlier attempts changed no symbol, only text or nothing. The edit is not reaching the code that runs. Confirm which file is actually imported and executed before editing again.
+- `REPEATING` — the same symbols have been edited repeatedly and verification still fails. Editing them again is unlikely to help. Re-read the failure output, widen the search with `codeledger impact <symbol>`, or ask the user whether the request describes the real problem.
+- `UNVERIFIED` — real symbols changed but nothing was verified. Record evidence with `codeledger verify-run project project TEST -- <command>`.
+- `VERIFIED` — verification passed after the last attempt. Stop editing and report it.
+
+A refresh reports `effect` for every attempt: `symbols-changed`, `text-only`, or `none`. Treat anything other than `symbols-changed` as a task that has not been done yet, whatever the edit appeared to do.
+
 For automatic lifecycle tracking, run the agent through `codeledger run --agent <name> --request \"<task>\" -- <agent command>`, or run `codeledger watch --agent <name>` in a second terminal while the agent edits this project. MCP-capable agents may launch `codeledger mcp --root <project>`.
 """
         for name in ("AGENTS.md", "CLAUDE.md", "CODEX.md"):
@@ -205,9 +216,13 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 self.db.execute("UPDATE symbols SET status='deleted',deleted_at=?,updated_at=?,last_modified_by=?,last_modified_session=? WHERE file_id=? AND status='active'", (NOW(), NOW(), actor, session, row["id"]))
         db_started = time.perf_counter(); self.db.commit(); db_seconds = time.perf_counter() - db_started; total = time.perf_counter() - started
         change_id = None
+        # Did the edit actually do anything? A file rewritten with identical
+        # content never reaches here, so "text-only" means the bytes moved but
+        # no symbol did: formatting, comments, or an edit that missed.
+        effect = "symbols-changed" if changed_symbols else "text-only" if changed_paths else "none"
         if record and changed_paths:
-            change_id = self.record_change(agent, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN")
-        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
+            change_id = self.record_change(agent, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN", effect=effect)
+        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
         if request:
             result["scope"] = self.scope_check(request, changed_paths, changed_symbols)
         if verbose: print(f"Discovery: {result['timing']['discovery_seconds']}s | Hashing: {result['timing']['hashing_seconds']}s | Parsing: {result['timing']['parsing_seconds']}s | Database: {result['timing']['database_seconds']}s | Total: {result['timing']['total_seconds']}s")
@@ -410,6 +425,76 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         analysis = context["task_analysis"]
         return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols, "recent_changes": context["recent_changes"], "known_issues": context["known_issues"], "decisions": context["decisions"], "risk": "HIGH" if analysis["risk"] == "HIGH" else risk, "recommendation": recommendation, "full_scan_required": context["scan_required"], "suggested_tests": self.suggest_tests(sorted(impact_files), [symbol["name"] for symbol in symbols])}
 
+    def _salient(self, text: str) -> set[str]:
+        return {word.lower() for word in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text or "") if word.lower() not in STOPWORDS}
+
+    def progress(self, request: str, limit: int = 20) -> dict:
+        """Has work on this request actually achieved anything yet?
+
+        Agents repeat themselves. They edit, the behaviour does not change, and
+        with no memory of the previous attempt they try the same thing again —
+        re-reading the repository each time and spending tokens to rediscover
+        what already failed. The ledger already knows: which attempts changed a
+        symbol rather than only text, which symbols keep being rewritten, and
+        whether verification ever passed afterwards.
+        """
+        wanted = self._salient(request)
+        attempts = []
+        for row in self.db.execute("SELECT * FROM changes WHERE user_request IS NOT NULL AND user_request!='' ORDER BY id DESC LIMIT 200"):
+            overlap = wanted & self._salient(row["user_request"])
+            if not overlap:
+                continue
+            symbols = [item["name"] for item in self.db.execute("SELECT name FROM change_symbols WHERE change_id=?", (row["id"],))]
+            files = [item["path"] for item in self.db.execute("SELECT path FROM change_files WHERE change_id=?", (row["id"],))]
+            attempts.append({"change_id": row["id"], "timestamp": row["timestamp"], "agent": row["agent"] or "unknown",
+                             "request": row["user_request"], "effect": row["effect"] or "unknown",
+                             "matched_terms": sorted(overlap), "files": files, "symbols": symbols})
+            if len(attempts) >= limit:
+                break
+        attempts.reverse()
+        if not attempts:
+            return {"request": request, "status": "NO_PRIOR_ATTEMPTS", "attempts": [], "attempt_count": 0,
+                    "repeated_symbols": [], "verifications": [],
+                    "guidance": "No recorded attempt matches this request. Proceed, then run `codeledger refresh --changed --request \"...\"` so the next attempt can see this one."}
+
+        counts: dict[str, int] = {}
+        for attempt in attempts:
+            for name in set(attempt["symbols"]):
+                counts[name] = counts.get(name, 0) + 1
+        repeated = sorted(name for name, count in counts.items() if count > 1)
+        subjects = sorted({name for attempt in attempts for name in attempt["symbols"]})
+        latest = attempts[-1]["timestamp"]
+        verifications = [dict(row) for row in self.db.execute(
+            "SELECT subject_type,subject_id,kind,result,recorded_at FROM verifications ORDER BY recorded_at DESC LIMIT 20")]
+        after = [v for v in verifications if v["recorded_at"] >= latest]
+        passed_after = [v for v in after if v["result"] in {"PASSED", "WORKING"}]
+        failed_after = [v for v in after if v["result"] in {"FAILED", "BROKEN", "ERROR"}]
+        ineffective = [a for a in attempts if a["effect"] in {"text-only", "none"}]
+
+        if passed_after and not failed_after:
+            status = "VERIFIED"
+            guidance = "Verification passed after the most recent attempt. The change took effect; stop editing and report it."
+        elif len(attempts) >= 3 and repeated and failed_after:
+            status = "REPEATING"
+            guidance = (f"{len(attempts)} attempts have edited {', '.join(repeated[:5])} and verification still fails. "
+                        "Editing the same symbol again is unlikely to help. Re-read the failure output, widen the search with "
+                        "`codeledger impact <symbol>`, or ask the user whether the request describes the real problem.")
+        elif len(ineffective) >= 2:
+            status = "NO_EFFECT"
+            guidance = (f"{len(ineffective)} of {len(attempts)} attempts changed no symbol — only text, or nothing at all. "
+                        "The edits are not reaching the code that runs. Confirm you are editing the file that is actually "
+                        "imported and executed before trying again.")
+        elif len(attempts) >= 2 and not any(v["result"] in {"PASSED", "WORKING"} for v in verifications):
+            status = "UNVERIFIED"
+            guidance = ("Attempts are changing real symbols but nothing has been verified. Record evidence with "
+                        "`codeledger verify-run project project TEST -- <your test command>` so a repeat can be detected.")
+        else:
+            status = "PROGRESSING"
+            guidance = "The most recent attempt changed real symbols. Verify it before making further edits."
+        return {"request": request, "status": status, "attempt_count": len(attempts), "attempts": attempts,
+                "repeated_symbols": repeated, "subjects": subjects, "verifications": after or verifications[:3],
+                "ineffective_attempts": len(ineffective), "guidance": guidance}
+
     def handshake(self, request: str, ai_plan: str = "") -> dict:
         analysis = self.analyze_prompt(request); plan_text = " ".join(ai_plan.split()); lower = plan_text.lower()
         if not plan_text:
@@ -449,12 +534,13 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         row = self.db.execute("SELECT s.*,a.name AS agent FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id WHERE s.session_id=?", (session_id,)).fetchone()
         return dict(row) if row else {"session_id": session_id, "status": "not_found"}
 
-    def record_change(self, agent: str, session: str, request: str, summary: str, result: str = "unverified", files: list[str] | None = None, symbols: list[str] | None = None, added: int = 0, modified: int = 0, deleted: int = 0, risk: str | None = None) -> int:
+    def record_change(self, agent: str, session: str, request: str, summary: str, result: str = "unverified", files: list[str] | None = None, symbols: list[str] | None = None, added: int = 0, modified: int = 0, deleted: int = 0, risk: str | None = None, effect: str | None = None) -> int:
         files, symbols = files or [], symbols or []
         # `risk` is derived from the recorded request, never invented: with no
         # request there is no evidence, so it stays UNKNOWN.
         risk = (risk or (self.analyze_prompt(request)["risk"] if request else "UNKNOWN")).upper()
-        cur = self.db.execute("INSERT INTO changes(timestamp,agent,session_id,user_request,summary,risk,result,git_commit,files_added,files_modified,files_deleted,symbols_modified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (NOW(), agent, session, request, summary, risk, result, head(self.root), added, modified, deleted, len(symbols)))
+        effect = effect or ("symbols-changed" if symbols else "text-only" if files else "none")
+        cur = self.db.execute("INSERT INTO changes(timestamp,agent,session_id,user_request,summary,risk,result,effect,git_commit,files_added,files_modified,files_deleted,symbols_modified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (NOW(), agent, session, request, summary, risk, result, effect, head(self.root), added, modified, deleted, len(symbols)))
         change_id = cur.lastrowid
         for path in files:
             file_row = self.db.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()

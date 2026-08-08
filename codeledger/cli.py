@@ -63,6 +63,7 @@ def build_parser():
     scope.add_argument("--symbols", nargs="*", default=[])
 
     add("plan", "Generate pre-change intelligence").add_argument("request")
+    add("progress", "Check whether prior attempts at this request achieved anything").add_argument("request")
     add("prompt", "Normalize a user request into an agent task brief").add_argument("request")
 
     handshake = add("handshake", "Compare the user request with the AI implementation plan")
@@ -207,6 +208,13 @@ def main(argv=None):
         refresh = ledger.refresh(True, args.agent, session, args.request)
         if not args.session: ledger.end_session(session, "completed" if completed.returncode == 0 else "failed")
         print(json.dumps({"session_id": session, "exit_code": completed.returncode, "refresh": refresh}, indent=2, default=str))
+        # Say plainly when an agent's turn achieved nothing. Without this the
+        # only signal is an empty file list buried in the JSON, which is exactly
+        # how an agent ends up repeating the same edit.
+        if refresh["effect"] != "symbols-changed":
+            detail = "no file changed at all" if refresh["effect"] == "none" else f"changed {len(refresh['files'])} file(s) but no symbol"
+            print(f"\n[CODELEDGER] NO EFFECT: this attempt {detail}.", flush=True)
+            print(f"[CODELEDGER] Run `codeledger progress {args.request!r}` before retrying.", flush=True)
         return completed.returncode
     if args.command == "init": value=ledger.init(args.quick, args.verbose); value["root"]=str(ledger.root)
     elif args.command == "status": value=ledger.status()
@@ -219,6 +227,7 @@ def main(argv=None):
     elif args.command == "restore-info": value={"query":args.query,"last_known_versions":ledger.lookup(args.query),"history":ledger.history(args.query),"automatic_restore":False}
     elif args.command == "scope": value=ledger.scope_check(args.request, args.files, args.symbols)
     elif args.command == "plan": value=ledger.plan(args.request)
+    elif args.command == "progress": value=ledger.progress(args.request)
     elif args.command == "prompt": value=ledger.analyze_prompt(args.request)
     elif args.command == "handshake": value=ledger.handshake(args.request, args.ai_plan)
     elif args.command == "tests": value=ledger.suggest_tests(args.files, args.symbols)

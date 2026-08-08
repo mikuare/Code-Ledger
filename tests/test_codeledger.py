@@ -212,6 +212,53 @@ class CodeLedgerTests(unittest.TestCase):
             self.assertEqual(answer["attribution"][0]["last_modified_session"], "s-1")
             self.assertEqual(answer["recorded_changes"][0]["agent"], "codex")
 
+    def test_refresh_reports_whether_an_edit_changed_any_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"billing.py"
+            source.write_text("def total(items):\n    return sum(items)\n")
+            ledger=Ledger(root); ledger.init()
+            self.assertEqual(ledger.refresh(changed_only=True)["effect"], "none")
+            source.write_text("# a comment only\ndef total(items):\n    return sum(items)\n")
+            self.assertEqual(ledger.refresh(changed_only=True)["effect"], "text-only")
+            source.write_text("# a comment only\ndef total(items):\n    return round(sum(items), 2)\n")
+            self.assertEqual(ledger.refresh(changed_only=True)["effect"], "symbols-changed")
+
+    def test_progress_detects_ineffective_and_repeating_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"billing.py"
+            source.write_text("def total(items):\n    return sum(items)\n")
+            ledger=Ledger(root); ledger.init()
+            request="Fix the total calculation rounding"
+            self.assertEqual(ledger.progress(request)["status"], "NO_PRIOR_ATTEMPTS")
+
+            for comment in ("# try one", "# try two"):                      # edits that touch no symbol
+                source.write_text(f"{comment}\ndef total(items):\n    return sum(items)\n")
+                ledger.refresh(changed_only=True, agent="codex", request=request)
+            no_effect=ledger.progress(request)
+            self.assertEqual(no_effect["status"], "NO_EFFECT"); self.assertEqual(no_effect["ineffective_attempts"], 2)
+
+            for value in ("round(sum(items))", "round(sum(items), 2)", "round(float(sum(items)), 2)"):
+                source.write_text(f"def total(items):\n    return {value}\n")
+                ledger.refresh(changed_only=True, agent="codex", request=request)
+                ledger.verify("project", "project", "TEST", "FAILED", "still failing")
+            repeating=ledger.progress(request)
+            self.assertEqual(repeating["status"], "REPEATING")
+            self.assertIn("total", repeating["repeated_symbols"])
+
+            source.write_text("def total(items):\n    return round(sum(float(i) for i in items), 2)\n")
+            ledger.refresh(changed_only=True, agent="codex", request=request)
+            ledger.verify("project", "project", "TEST", "PASSED", "suite green")
+            self.assertEqual(ledger.progress(request)["status"], "VERIFIED")
+
+    def test_progress_ignores_an_unrelated_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"billing.py"
+            source.write_text("def total(items):\n    return sum(items)\n")
+            ledger=Ledger(root); ledger.init()
+            source.write_text("def total(items):\n    return sum(items) + 1\n")
+            ledger.refresh(changed_only=True, agent="codex", request="Fix the total calculation rounding")
+            self.assertEqual(ledger.progress("Add dark mode to the settings page")["status"], "NO_PRIOR_ATTEMPTS")
+
     def test_an_unknown_agent_is_recorded_as_a_generic_provider(self):
         """Documented behaviour that the adapter seam never actually applied."""
         with tempfile.TemporaryDirectory() as directory:
