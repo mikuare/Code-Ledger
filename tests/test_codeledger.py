@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from codeledger.cli import build_parser
 from codeledger.core import Ledger
+from codeledger.providers import capabilities, provider_for
 
 class CodeLedgerTests(unittest.TestCase):
     def test_incremental_symbols_and_deletion(self):
@@ -149,10 +150,15 @@ class CodeLedgerTests(unittest.TestCase):
                 "import React from 'react';\nimport { useAuth } from '../hooks/useAuth';\nimport './UserList.css';\n\n"
                 "export const UserList = () => {\n  const { user } = useAuth();\n  return <div>{user}</div>;\n};\n")
             ledger=Ledger(root); ledger.init(); result=ledger.impact("useAuth")
-            self.assertEqual(result["source"], "index")
             self.assertEqual(result["referencing_files"], ["src/components/UserList.tsx"])
-            kinds={(row["target_name"], row["kind"]) for row in result["dependencies"]}
-            self.assertIn(("useAuth", "uses"), kinds)
+            # A real parse tree records this as `calls`; the regex provider can
+            # only tell that the name is used. Either is a dependency edge.
+            kinds={row["kind"] for row in result["dependencies"] if row["target_name"] == "useAuth"}
+            self.assertTrue(kinds & {"calls", "uses"}, f"no dependency edge recorded, only {kinds}")
+            # Without grammars a .tsx file is shallow, and the honest answer is
+            # to verify against the working tree rather than trust the index.
+            expected = "index" if capabilities()["tree_sitter_installed"] else "index + fallback scan"
+            self.assertEqual(result["source"], expected)
 
     def test_impact_falls_back_instead_of_claiming_no_dependents(self):
         """An empty index must never be reported as an absence of impact."""
@@ -218,6 +224,47 @@ class CodeLedgerTests(unittest.TestCase):
             self.assertIn("request keywords matched against file paths (weak evidence)", inside["boundary_evidence"])
             outside=ledger.scope_check("Add activity tracking to the admin area", ["src/billing/charge.ts"], [])
             self.assertEqual(outside["status"], "WARNING")
+
+    POLYGLOT = {
+        "main.go":     'package main\nimport "fmt"\nfunc helper() int { return 1 }\nfunc Run() int { return helper() }\n',
+        "lib.rs":      "use std::fmt;\nfn helper() -> i32 { 1 }\npub fn run() -> i32 { helper() }\n",
+        "App.java":    "public class App {\n    int helper() { return 1; }\n    int run() { return helper(); }\n}\n",
+        "Service.cs":  "public class Service {\n    int Helper() { return 1; }\n    int Run() { return Helper(); }\n}\n",
+        "app.rb":      "def helper; 1; end\ndef run; helper; end\n",
+        "index.php":   "<?php\nfunction helper() { return 1; }\nfunction run() { return helper(); }\n",
+        "Main.kt":     "fun helper(): Int = 1\nfun run(): Int = helper()\n",
+        "App.swift":   "func helper() -> Int { return 1 }\nfunc run() -> Int { return helper() }\n",
+        "engine.cpp":  "int helper() { return 1; }\nint run() { return helper(); }\n",
+    }
+
+    def test_every_supported_language_yields_symbols_and_a_call_graph(self):
+        if not capabilities()["tree_sitter_installed"]:
+            self.skipTest("grammars not installed: pip install 'codeledger[languages]'")
+        from codeledger.providers import analyze
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name, source in self.POLYGLOT.items():
+                (root/name).write_text(source)
+            for name in self.POLYGLOT:
+                with self.subTest(language=name):
+                    path=root/name
+                    symbols, edges, provider, coverage = analyze(path, path.read_text())
+                    defined={item.name for item in symbols}
+                    self.assertTrue(defined, f"{name}: no symbols extracted")
+                    self.assertEqual(coverage, "full")
+                    internal=[(a, b) for a, b, _ in edges if b in defined and a != "__module__"]
+                    self.assertTrue(internal, f"{name}: no call graph, only {edges[:5]}")
+
+    def test_full_coverage_is_never_claimed_without_symbols(self):
+        """A grammar that yields nothing must degrade, not claim full coverage."""
+        from codeledger.providers import analyze
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"thing.go"
+            path.write_text("func helper() int { return 1 }\n")
+            _symbols, _edges, _provider, coverage = analyze(path, path.read_text())
+            self.assertIn(coverage, ("full", "shallow"))
+            if not capabilities()["tree_sitter_installed"]:
+                self.assertEqual(coverage, "shallow")   # regex provider must be honest about its limits
 
     def test_lookup_treats_wildcards_as_literal_text(self):
         with tempfile.TemporaryDirectory() as directory:

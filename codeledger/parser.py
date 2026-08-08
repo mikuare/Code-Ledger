@@ -32,6 +32,7 @@ LANGUAGES = {".py":"python", ".js":"javascript", ".jsx":"javascript", ".ts":"typ
 @dataclass
 class SymbolData:
     name: str; kind: str; start: int; end: int; signature: str; hash: str
+    qualified: str = ""      # dotted scope path when the provider knows one
 
 def language(path: Path) -> str:
     return LANGUAGES.get(path.suffix.lower(), "text")
@@ -49,21 +50,32 @@ def digest_bytes(raw: bytes) -> str:
     """
     return hashlib.sha256(raw).hexdigest()
 
+def ast_symbols(text: str) -> list[SymbolData] | None:
+    """Python symbols via the AST. None when the source does not parse."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    lines = text.splitlines(); result = []
+    scopes: dict[int, list[str]] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                scopes[id(child)] = scopes.get(id(node), []) + [node.name]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start, end = node.lineno, getattr(node, "end_lineno", node.lineno)
+            kind = "class" if isinstance(node, ast.ClassDef) else "function"
+            signature = lines[start - 1].strip() if start <= len(lines) else node.name
+            qualified = ".".join(scopes.get(id(node), []) + [node.name])
+            result.append(SymbolData(node.name, kind, start, end, signature, digest("\n".join(lines[start-1:end])), qualified))
+    return sorted(result, key=lambda x: (x.start, x.name))
+
 def parse_file(path: Path, text: str) -> list[SymbolData]:
-    if language(path) == "python":
-        try:
-            tree = ast.parse(text)
-            lines = text.splitlines()
-            result = []
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    start, end = node.lineno, getattr(node, "end_lineno", node.lineno)
-                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
-                    signature = lines[start - 1].strip() if start <= len(lines) else node.name
-                    result.append(SymbolData(node.name, kind, start, end, signature, digest("\n".join(lines[start-1:end]))))
-            return sorted(result, key=lambda x: (x.start, x.name))
-        except SyntaxError:
-            pass
+    from .providers import analyze
+    return analyze(path, text)[0]
+
+def regex_symbols(text: str) -> list[SymbolData]:
     patterns = [
         ("class", re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)")),
         ("interface", re.compile(r"\b(?:interface|type)\s+([A-Za-z_$][\w$]*)")),
@@ -115,26 +127,32 @@ def _enclosing(symbols: list[SymbolData], line: int) -> str:
 
 def dependencies(path: Path, text: str) -> list[tuple[str, str, str]]:
     """Return conservative (source symbol, target name, relationship) edges."""
+    from .providers import analyze
+    return analyze(path, text)[1]
+
+def ast_edges(text: str) -> list[tuple[str, str, str]]:
     result: list[tuple[str, str, str]] = []
-    if language(path) == "python":
-        try:
-            tree = ast.parse(text)
-            scopes = [(node.name, node) for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-            for source, node in scopes:
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        target = child.func.id if isinstance(child.func, ast.Name) else child.func.attr if isinstance(child.func, ast.Attribute) else None
-                        if target and target != source:
-                            result.append((source, target, "calls"))
-                    elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id != source:
-                        result.append((source, child.id, "uses"))
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.Import, ast.ImportFrom)):
-                    names = [a.name.split(".")[0] for a in node.names]
-                    result.extend(("__module__", name, "imports") for name in names)
-            return sorted(set(result))
-        except SyntaxError:
-            return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    scopes = [(node.name, node) for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    for source, node in scopes:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                target = child.func.id if isinstance(child.func, ast.Name) else child.func.attr if isinstance(child.func, ast.Attribute) else None
+                if target and target != source:
+                    result.append((source, target, "calls"))
+            elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id != source:
+                result.append((source, child.id, "uses"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.name.split(".")[0] for a in node.names]
+            result.extend(("__module__", name, "imports") for name in names)
+    return sorted(set(result))
+
+def regex_edges(path: Path, text: str, symbols: list[SymbolData]) -> list[tuple[str, str, str]]:
+    result: list[tuple[str, str, str]] = []
     imported, modules = set(), set()
     for match in ES_FROM.finditer(text):
         imported.update(_imported_names(match.group("body"))); modules.add(match.group("module"))
@@ -154,7 +172,6 @@ def dependencies(path: Path, text: str) -> list[tuple[str, str, str]]:
             result.append(("__module__", name, "uses"))
     # Symbol-level edges inside the file. Only names this file imports or
     # defines are considered, which keeps builtins and member calls out.
-    symbols = parse_file(path, text)
     known = imported | {item.name for item in symbols}
     for index, line in enumerate(text.splitlines(), 1):
         stripped = re.sub(r"//.*$", "", line)

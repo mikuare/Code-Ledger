@@ -90,9 +90,37 @@ codeledger impact authenticateUser          # indexed edges, bounded work
 codeledger impact authenticateUser --scan   # also reads every source file
 ```
 
-Language coverage is uneven by design: Python is parsed with the AST, giving symbol-level call and use edges. JavaScript, TypeScript, JSX/TSX, Vue, and Svelte are matched conservatively — default, named, aliased, namespace, side-effect, and `require()` imports are all recorded; an imported name used again in the file is recorded as a use; and calls and JSX element uses are attributed to their enclosing symbol by brace-depth ranges, so `UserList -> formatName` is recorded even when both live in one file. Only names the file imports or defines are considered, which keeps builtins and member calls out of the graph. Other languages fall back to import extraction only.
+See [Language support](#language-support) for what each language's analysis is actually based on.
 
 Because that coverage is uneven, **absence of evidence is never reported as absence of impact**. If the index finds no dependents at all, `impact` reads the working tree before answering and reports `"source": "index + fallback scan"`. A query matching no indexed symbol returns `risk: UNKNOWN` with the reason, rather than a falsely reassuring `LOW`. Pass `fallback=False` through the API to keep a query strictly indexed.
+
+## Language support
+
+Install the grammars for full parse-tree analysis across languages:
+
+```bash
+pip install "codeledger[languages]"
+```
+
+This adds `tree-sitter` and a bundled grammar pack (~3 MB, 370+ grammars, prebuilt wheels — no compiler, no network at runtime). Every language then gets the same treatment: real symbol ranges, qualified names, and call graphs.
+
+| Tier | Analysis | Languages |
+|---|---|---|
+| `full` | parse tree — symbols, scopes, call graph | Python, JS, TS, JSX/TSX, Go, Rust, Java, C#, Kotlin, Swift, Ruby, PHP, C, C++, Scala, Elixir, Lua, Dart, Haskell, and any other grammar in the pack |
+| `full` (no install) | Python AST | Python |
+| `shallow` | line patterns, imports only | everything else when grammars are absent |
+
+Analysis is optional on purpose. `pip install codeledger` stays dependency-free and keeps working; it simply reports reduced coverage instead of guessing. Every file records the provider and coverage tier that produced it, so the system can tell *"nothing depends on this"* apart from *"this language is not really analysed"* — and `impact` verifies against the working tree whenever coverage is `shallow`, rather than trusting a partial index.
+
+```bash
+codeledger status      # includes analysis.shallow_languages and an install hint
+```
+
+Coverage is checked in, not asserted: `test_every_supported_language_yields_symbols_and_a_call_graph` builds a real file in each of nine languages and fails if symbols or the call graph are missing. A grammar that yields nothing degrades to `shallow` rather than reporting empty results as full coverage.
+
+Installing or removing grammars upgrades an existing index in place — `files.analysis_version` records the provider, so the next `refresh --changed` reparses only what a different analyser would now read. No re-init, no migration command.
+
+The design and its trade-offs are in [docs/LANGUAGE_SUPPORT.md](docs/LANGUAGE_SUPPORT.md).
 
 ## Attribution
 

@@ -6,7 +6,8 @@ from pathlib import Path
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, language TEXT, size INTEGER, hash TEXT, mtime REAL, git_status TEXT, status TEXT NOT NULL DEFAULT 'current', last_analyzed TEXT, analysis_version TEXT, last_modified_by TEXT, last_modified_session TEXT);
+CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, language TEXT, size INTEGER, hash TEXT, mtime REAL, git_status TEXT, status TEXT NOT NULL DEFAULT 'current', last_analyzed TEXT, analysis_version TEXT, analysis_provider TEXT, coverage TEXT, last_modified_by TEXT, last_modified_session TEXT);
+CREATE INDEX IF NOT EXISTS idx_files_coverage ON files(coverage);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);
 CREATE TABLE IF NOT EXISTS symbols (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qualified_name TEXT, kind TEXT NOT NULL, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE, line_start INTEGER, line_end INTEGER, signature TEXT, hash TEXT, status TEXT NOT NULL DEFAULT 'active', created_at TEXT, updated_at TEXT, deleted_at TEXT, last_modified_by TEXT, last_modified_session TEXT, last_verified TEXT);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -32,6 +33,8 @@ CREATE TABLE IF NOT EXISTS git_commit_files (commit_hash TEXT REFERENCES git_com
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("files", "mtime_ns", "ALTER TABLE files ADD COLUMN mtime_ns INTEGER"),
     ("dependencies", "source_file_id", "ALTER TABLE dependencies ADD COLUMN source_file_id INTEGER REFERENCES files(id)"),
+    ("files", "analysis_provider", "ALTER TABLE files ADD COLUMN analysis_provider TEXT"),
+    ("files", "coverage", "ALTER TABLE files ADD COLUMN coverage TEXT"),
 ]
 
 def connect(root: Path) -> sqlite3.Connection:

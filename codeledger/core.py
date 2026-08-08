@@ -11,7 +11,8 @@ from pathlib import Path
 from .config import Config
 from .db import connect
 from .git import commit_files, commits, head, status as git_status
-from .parser import dependencies, digest, digest_bytes, language, parse_file
+from .parser import digest, digest_bytes, language
+from .providers import FULL, SHALLOW, analyze as analyze_source, capabilities, version_for
 
 LIKE_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 # Words too generic to define a task boundary from a file path.
@@ -135,10 +136,15 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 print(f"{phase}: {index}/{len(discovered)}", flush=True)
             seen.add(rel)
             old = self.db.execute("SELECT * FROM files WHERE path=?", (rel,)).fetchone()
-            if changed_only and old and old["status"] == "current" and old["size"] == size and old["mtime_ns"] == mtime_ns:
+            # A file is up to date only if the analyser that produced its index
+            # is still the one that would run now; otherwise installing (or
+            # losing) grammars would leave stale, weaker analysis in place.
+            current_version = version_for(path) if analyze else None
+            fresh = bool(old) and old["status"] == "current" and old["analysis_version"] == current_version
+            if changed_only and fresh and old["size"] == size and old["mtime_ns"] == mtime_ns:
                 continue
             hash_started = time.perf_counter(); raw = path.read_bytes(); file_hash = digest_bytes(raw); hash_seconds += time.perf_counter() - hash_started
-            if changed_only and old and old["status"] == "current" and old["hash"] == file_hash:
+            if changed_only and fresh and old["hash"] == file_hash:
                 self.db.execute("UPDATE files SET size=?,mtime_ns=?,mtime=? WHERE path=?", (size, mtime_ns, mtime_ns / 1_000_000_000, rel)); continue
             if not analyze:
                 if old:
@@ -146,12 +152,12 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 else:
                     self.db.execute("INSERT INTO files(path,language,size,hash,mtime,mtime_ns,git_status,status,last_analyzed,analysis_version) VALUES(?,?,?,?,?,?,?,?,?,?)", (rel, language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), "unindexed", None, "metadata")); added += 1
                 changed_paths.append(rel); continue
-            parse_started = time.perf_counter(); text = raw.decode("utf-8", errors="replace"); parsed = parse_file(path, text); edges = dependencies(path, text); parse_seconds += time.perf_counter() - parse_started; now = NOW()
+            parse_started = time.perf_counter(); text = raw.decode("utf-8", errors="replace"); parsed, edges, provider, coverage = analyze_source(path, text); parse_seconds += time.perf_counter() - parse_started; now = NOW()
             changed_paths.append(rel)
             if not old:
-                cursor = self.db.execute("INSERT INTO files(path,language,size,hash,mtime,mtime_ns,git_status,status,last_analyzed,analysis_version,last_modified_by,last_modified_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (rel, language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), "current", now, "1", actor, session)); added += 1; file_id = cursor.lastrowid
+                cursor = self.db.execute("INSERT INTO files(path,language,size,hash,mtime,mtime_ns,git_status,status,last_analyzed,analysis_version,analysis_provider,coverage,last_modified_by,last_modified_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (rel, language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), "current", now, current_version, provider, coverage, actor, session)); added += 1; file_id = cursor.lastrowid
             else:
-                self.db.execute("UPDATE files SET language=?,size=?,hash=?,mtime=?,mtime_ns=?,git_status=?,status='current',last_analyzed=?,analysis_version='1',last_modified_by=?,last_modified_session=? WHERE path=?", (language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), now, actor, session, rel)); modified += 1; file_id = old["id"]
+                self.db.execute("UPDATE files SET language=?,size=?,hash=?,mtime=?,mtime_ns=?,git_status=?,status='current',last_analyzed=?,analysis_version=?,analysis_provider=?,coverage=?,last_modified_by=?,last_modified_session=? WHERE path=?", (language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), now, current_version, provider, coverage, actor, session, rel)); modified += 1; file_id = old["id"]
             old_symbols = {r["name"]: r for r in self.db.execute("SELECT * FROM symbols WHERE file_id=? AND status='active'", (file_id,))}
             current = set()
             for item in parsed:
@@ -200,7 +206,24 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         queries = {"files": "SELECT count(*) FROM files WHERE status IN ('current','unindexed')", "symbols": "SELECT count(*) FROM symbols WHERE status='active'", "deleted_symbols": "SELECT count(*) FROM symbols WHERE status='deleted'", "changes": "SELECT count(*) FROM changes", "issues": "SELECT count(*) FROM issues WHERE status='OPEN'"}
         result = {key: self.db.execute(sql).fetchone()[0] for key, sql in queries.items()}
         result.update(stale_files=self.db.execute("SELECT count(*) FROM files WHERE status='stale' OR hash IS NULL").fetchone()[0], project=self.config.project_name, git_commit=head(self.root))
+        result["analysis"] = self.coverage_report()
         return result
+
+    def coverage_report(self) -> dict:
+        """How much of this project is actually analysed, by language.
+
+        Surfaced so a developer learns their impact analysis is shallow from
+        `status`, rather than from being wrong.
+        """
+        by_language: dict[str, dict] = {}
+        for row in self.db.execute("SELECT language,coverage,count(*) AS files FROM files WHERE status='current' GROUP BY language,coverage"):
+            entry = by_language.setdefault(row["language"] or "unknown", {"full": 0, "shallow": 0})
+            entry["shallow" if (row["coverage"] or SHALLOW) != FULL else "full"] += row["files"]
+        caps = capabilities()
+        shallow_languages = sorted(name for name, counts in by_language.items() if counts["shallow"])
+        return {"tree_sitter_installed": caps["tree_sitter_installed"], "files_by_language": by_language,
+                "shallow_languages": shallow_languages,
+                "hint": caps["install_hint"] if shallow_languages else None}
 
     def import_git(self, limit: int = 200) -> dict:
         imported = files = 0
@@ -255,13 +278,24 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             (*ids, *names))]
         refs = {row["source_path"] for row in dependency_rows if row["source_path"]}
         defining = {row["path"] for row in matches}
-        used_scan = scan or (fallback and not refs)
+        # Coverage decides whether the index can be trusted, rather than
+        # inferring it from an empty result. A shallowly-analysed defining file
+        # means the edges for this symbol were never fully recorded, so an
+        # empty answer proves nothing.
+        shallow = [row["path"] for row in self.db.execute(
+            f"SELECT path,coverage FROM files WHERE path IN ({','.join('?' * len(matches))})",
+            [row["path"] for row in matches]) if (row["coverage"] or SHALLOW) != FULL]
+        used_scan = scan or (fallback and (shallow or not refs))
         if used_scan:
             refs |= self._scan_for_names(names)
         refs -= defining
         blast = refs | defining
         source = "filesystem scan" if scan else "index + fallback scan" if used_scan else "index"
-        return {"query": query, "symbols": matches, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": source, "evidence": "The dependency index reported no dependents, so the working tree was read directly." if used_scan and not scan else ""}
+        evidence = ""
+        if used_scan and not scan:
+            evidence = (f"Shallow analysis coverage for {', '.join(sorted(set(shallow)))}; the working tree was read directly. Install grammars for full coverage: pip install 'codeledger[languages]'."
+                        if shallow else "The dependency index reported no dependents, so the working tree was read directly.")
+        return {"query": query, "symbols": matches, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": source, "coverage": "shallow" if shallow else "full", "evidence": evidence}
 
     def context(self, query: str) -> dict:
         matches = self.lookup(query); paths = sorted({r["path"] for r in matches})

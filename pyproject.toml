@@ -16,6 +16,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+# Full parse-tree analysis for every bundled grammar. Optional on purpose:
+# without it CodeLedger still runs with zero dependencies and reports its
+# reduced coverage honestly rather than guessing.
+languages = ["tree-sitter>=0.23", "tree-sitter-language-pack>=1.0"]
 dev = ["pytest>=7"]
 
 [project.scripts]
