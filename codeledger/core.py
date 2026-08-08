@@ -293,7 +293,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         source = "filesystem scan" if scan else "index + fallback scan" if used_scan else "index"
         evidence = ""
         if used_scan and not scan:
-            evidence = (f"Shallow analysis coverage for {', '.join(sorted(set(shallow)))}; the working tree was read directly. Install grammars for full coverage: pip install 'codeledger[languages]'."
+            evidence = (f"Shallow analysis coverage for {', '.join(sorted(set(shallow)))}; the working tree was read directly. Install grammars for full coverage: pip install 'code-ledger[languages]'."
                         if shallow else "The dependency index reported no dependents, so the working tree was read directly.")
         return {"query": query, "symbols": matches, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": source, "coverage": "shallow" if shallow else "full", "evidence": evidence}
 

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    name: Python ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Both installation paths are supported, so both are tested. The
+      # zero-dependency path must keep working on its own.
+      - name: Install without grammars
+        run: pip install -e .
+      - name: Test without grammars
+        run: python -W error::DeprecationWarning -m unittest discover -s tests -v
+
+      - name: Install with grammars
+        run: pip install -e ".[languages]"
+      - name: Test with grammars
+        run: python -W error::DeprecationWarning -m unittest discover -s tests -v
+
+      - name: CLI smoke test
+        run: |
+          mkdir -p /tmp/smoke/src
+          printf 'def helper():\n    return 1\n' > /tmp/smoke/src/helpers.py
+          printf 'from helpers import helper\n\ndef run():\n    return helper()\n' > /tmp/smoke/src/app.py
+          codeledger --root /tmp/smoke init
+          codeledger --root /tmp/smoke status
+          codeledger --root /tmp/smoke impact helper --json
+          codeledger --root /tmp/smoke why helper --json

@@ -1,5 +1,23 @@
 # CodeLedger
 
+[![CI](https://github.com/mikuare/Code-Ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/mikuare/Code-Ledger/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+
+**Give your coding agent a memory of your codebase — what exists, what changed, who changed it, and what breaks if you touch it.**
+
+Coding agents start every session blind. They re-read your repository, rebuild something that already exists, or change a file the task never mentioned. CodeLedger keeps a local index so the agent can ask instead of guess, and so you can see afterwards exactly what it touched.
+
+```bash
+codeledger impact authenticateUser   # who breaks if I change this?
+codeledger why formatName            # who changed this, and for what request?
+codeledger scope "fix login" --files src/billing/charge.py   # is this even in scope?
+```
+
+It runs entirely on your machine, stores everything in SQLite, and speaks [MCP](#mcp) so Claude Code, Codex, Cursor, Gemini, and Aider can query it mid-conversation. No source code ever leaves the machine.
+
+Its one design rule: **never assert what it cannot back up.** Unknown authorship stays `unknown`, an unanalysable language reports `shallow` coverage, and an ambiguous task returns `UNKNOWN` rather than a confident wrong answer.
+
 CodeLedger is a local-first, SQLite-backed project memory and change-intelligence CLI for coding agents and human developers. It indexes file hashes and symbols incrementally, preserving deleted symbols as historical evidence instead of inventing authorship or intent.
 
 For the complete installation and daily workflow, see [docs/SETUP_AND_WORKFLOW.md](docs/SETUP_AND_WORKFLOW.md).
@@ -99,7 +117,7 @@ Because that coverage is uneven, **absence of evidence is never reported as abse
 Install the grammars for full parse-tree analysis across languages:
 
 ```bash
-pip install "codeledger[languages]"
+pip install "code-ledger[languages]"
 ```
 
 This adds `tree-sitter` and a bundled grammar pack (~3 MB, 370+ grammars, prebuilt wheels — no compiler, no network at runtime). Every language then gets the same treatment: real symbol ranges, qualified names, and call graphs.
@@ -110,7 +128,7 @@ This adds `tree-sitter` and a bundled grammar pack (~3 MB, 370+ grammars, prebui
 | `full` (no install) | Python AST | Python |
 | `shallow` | line patterns, imports only | everything else when grammars are absent |
 
-Analysis is optional on purpose. `pip install codeledger` stays dependency-free and keeps working; it simply reports reduced coverage instead of guessing. Every file records the provider and coverage tier that produced it, so the system can tell *"nothing depends on this"* apart from *"this language is not really analysed"* — and `impact` verifies against the working tree whenever coverage is `shallow`, rather than trusting a partial index.
+Analysis is optional on purpose. `pip install code-ledger` stays dependency-free and keeps working; it simply reports reduced coverage instead of guessing. Every file records the provider and coverage tier that produced it, so the system can tell *"nothing depends on this"* apart from *"this language is not really analysed"* — and `impact` verifies against the working tree whenever coverage is `shallow`, rather than trusting a partial index.
 
 ```bash
 codeledger status      # includes analysis.shallow_languages and an install hint

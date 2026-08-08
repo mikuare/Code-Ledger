@@ -91,11 +91,11 @@ This is the same principle already applied to `risk: UNKNOWN` and
 
 ### 4. Optional dependency, never a hard requirement
 
-`pip install codeledger` stays dependency-free and behaves exactly as it does
+`pip install code-ledger` stays dependency-free and behaves exactly as it does
 today. Grammars are an extra:
 
 ```bash
-pip install "codeledger[languages]"     # tree-sitter + tree-sitter-language-pack, ~3 MB
+pip install "code-ledger[languages]"     # tree-sitter + tree-sitter-language-pack, ~3 MB
 ```
 
 `TreeSitterProvider` is selected only if the import succeeds and a grammar for

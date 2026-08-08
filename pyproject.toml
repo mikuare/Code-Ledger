@@ -1,19 +1,35 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]   # PEP 639 SPDX license expressions
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codeledger"
+# Distribution name differs from the import name: `codeledger` was already
+# taken on PyPI. `import codeledger` and the `codeledger` command are unchanged.
+name = "code-ledger"
 version = "0.1.0"
-description = "CodeLedger — persistent project memory and change intelligence for AI coding agents."
+description = "Persistent project memory and change intelligence for AI coding agents — local, SQLite-backed, MCP-native."
 requires-python = ">=3.10"
 dependencies = []
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mcp", "ai-agents", "code-intelligence", "developer-tools", "static-analysis", "claude-code", "codex", "local-first"]
 classifiers = [
-  "Programming Language :: Python :: 3",
-  "Topic :: Software Development :: Version Control",
+  "Development Status :: 3 - Alpha",
   "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Version Control",
+  "Topic :: Software Development :: Quality Assurance",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mikuare/Code-Ledger"
+Repository = "https://github.com/mikuare/Code-Ledger"
+Issues = "https://github.com/mikuare/Code-Ledger/issues"
 
 [project.optional-dependencies]
 # Full parse-tree analysis for every bundled grammar. Optional on purpose:

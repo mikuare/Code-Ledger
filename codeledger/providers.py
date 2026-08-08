@@ -258,4 +258,4 @@ def capabilities() -> dict:
         else:
             languages.setdefault(grammar, FULL)
     return {"tree_sitter_installed": available, "coverage_by_language": languages,
-            "install_hint": None if available else "pip install 'codeledger[languages]' for full analysis beyond Python"}
+            "install_hint": None if available else "pip install 'code-ledger[languages]' for full analysis beyond Python"}
