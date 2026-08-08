@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
+from .agents import identify
 from .config import Config
 from .db import connect
 from .git import commit_files, commits, head, status as git_status
@@ -434,7 +435,10 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
     def start_session(self, agent: str, request: str = "", session_id: str | None = None) -> dict:
         session_id = session_id or f"session-{uuid.uuid4().hex[:10]}"
         now = NOW()
-        self.db.execute("INSERT OR IGNORE INTO agents(name,provider,created_at) VALUES(?,?,?)", (agent, agent, now))
+        # The adapter seam exists so an unrecognised agent is recorded as a
+        # generic provider rather than inventing a vendor for it.
+        identified = identify(agent); agent = identified.name
+        self.db.execute("INSERT OR IGNORE INTO agents(name,provider,created_at) VALUES(?,?,?)", (agent, identified.provider, now))
         agent_id = self.db.execute("SELECT id FROM agents WHERE name=?", (agent,)).fetchone()[0]
         self.db.execute("INSERT INTO sessions(session_id,agent_id,working_directory,start_time,request) VALUES(?,?,?,?,?)", (session_id, agent_id, str(self.root), now, request))
         self.db.commit()

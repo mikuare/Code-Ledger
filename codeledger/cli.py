@@ -243,7 +243,15 @@ def main(argv=None):
     elif args.command == "git-import": value=ledger.import_git(args.limit)
     elif args.command == "record": value={"change_id":ledger.record_change(args.agent,args.session,args.request,args.summary,args.result)}
     elif args.command == "export": value=ledger.export()
-    else: value={"database":"OK","files":ledger.status()["files"],"symbols":ledger.status()["symbols"],"recommended_action":"codeledger refresh --changed" if ledger.status()["stale_files"] else "none"}
+    else:
+        status = ledger.status(); analysis = status["analysis"]
+        actions = []
+        if status["stale_files"]: actions.append("codeledger refresh --changed")
+        if analysis["shallow_languages"]: actions.append(analysis["hint"])
+        value = {"database": "OK", "files": status["files"], "symbols": status["symbols"],
+                 "tree_sitter_installed": analysis["tree_sitter_installed"],
+                 "shallow_languages": analysis["shallow_languages"] or "none",
+                 "recommended_action": actions or "none"}
     emit(value,args.as_json)
 
 if __name__ == "__main__": main()

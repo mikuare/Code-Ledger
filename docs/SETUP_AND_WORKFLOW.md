@@ -7,17 +7,34 @@ CodeLedger is a local project-memory and change-intelligence layer for AI-assist
 Use WSL for projects developed through WSL or stored on the Windows filesystem.
 
 ```bash
-cd "/mnt/c/Users/edujk/Desktop/Code Ledger"
+cd "~/code-ledger"
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 codeledger --version
 ```
 
+For full analysis of languages other than Python, install the grammar extra
+(~3 MB of prebuilt parsers, no compiler required):
+
+```bash
+python -m pip install -e ".[languages]"
+```
+
+Without it, only Python is fully analysed and every other language is indexed
+with line patterns. CodeLedger reports which, rather than guessing:
+
+```bash
+codeledger doctor      # tree_sitter_installed, shallow_languages, next action
+```
+
+Installing the extra later upgrades an existing project index automatically on
+the next `refresh --changed`. There is no re-init and no migration step.
+
 The virtual environment must be activated again whenever a new terminal is opened:
 
 ```bash
-source "/mnt/c/Users/edujk/Desktop/Code Ledger/.venv/bin/activate"
+source "~/code-ledger/.venv/bin/activate"
 ```
 
 Do not use `--break-system-packages` on Debian/Ubuntu. The virtual environment keeps the system Python untouched.
@@ -27,8 +44,8 @@ Do not use `--break-system-packages` on Debian/Ubuntu. The virtual environment k
 Replace the example path with your project path. Quote paths containing spaces.
 
 ```bash
-source "/mnt/c/Users/edujk/Desktop/Code Ledger/.venv/bin/activate"
-cd "/mnt/c/Users/edujk/Desktop/HD anti gravity/clever-ticket-buddy-94-96"
+source "~/code-ledger/.venv/bin/activate"
+cd "/path/to/your-project"
 codeledger init
 ```
 
@@ -74,16 +91,16 @@ Restart Codex after setup so it loads the new MCP server.
 Open a second WSL terminal and leave this running:
 
 ```bash
-source "/mnt/c/Users/edujk/Desktop/Code Ledger/.venv/bin/activate"
-cd "/mnt/c/Users/edujk/Desktop/HD anti gravity/clever-ticket-buddy-94-96"
+source "~/code-ledger/.venv/bin/activate"
+cd "/path/to/your-project"
 codeledger watch --agent codex
 ```
 
 In another terminal, start Codex normally:
 
 ```bash
-source "/mnt/c/Users/edujk/Desktop/Code Ledger/.venv/bin/activate"
-cd "/mnt/c/Users/edujk/Desktop/HD anti gravity/clever-ticket-buddy-94-96"
+source "~/code-ledger/.venv/bin/activate"
+cd "/path/to/your-project"
 codex
 ```
 
@@ -317,7 +334,7 @@ CodeLedger automatically ignores its own `.ai/codeledger/` data, dependencies, b
 Activate the virtual environment:
 
 ```bash
-source "/mnt/c/Users/edujk/Desktop/Code Ledger/.venv/bin/activate"
+source "~/code-ledger/.venv/bin/activate"
 ```
 
 ### Initialization appears slow on WSL
@@ -343,7 +360,33 @@ Then restart Codex. An already-running Codex process does not gain newly configu
 
 ### Scope says `UNKNOWN`
 
-This is intentional. CodeLedger will not claim that a change is safe when it lacks enough evidence. Add a more specific task, run `codeledger plan`, or inspect the diff manually.
+This is intentional. CodeLedger will not claim that a change is safe when it lacks enough evidence. Every scope result reports `boundary_evidence` naming what the judgement was based on; an empty list means no evidence was found. Add a more specific task, name the files in the request, run `codeledger plan`, or inspect the diff manually.
+
+### `impact` says the coverage is shallow
+
+The language is being indexed with line patterns rather than a parse tree, so
+the dependency graph is incomplete and `impact` verified against the working
+tree instead of trusting it. Install the grammars:
+
+```bash
+python -m pip install -e ".[languages]"
+codeledger refresh --changed
+```
+
+### The watcher keeps recording the same files
+
+Check whether those files are generated or temporary. Build output, scratch
+directories, and dev-server artifacts should be excluded, or every rewrite is
+recorded as a change:
+
+```bash
+echo "__scratch__/" >> codeledger.ignore
+echo "dist/" >> codeledger.ignore
+codeledger refresh --changed
+```
+
+A file being rewritten with identical content is *not* recorded — only a real
+content change is. Repeated records mean the content is genuinely changing.
 
 ### Tests fail after a change
 

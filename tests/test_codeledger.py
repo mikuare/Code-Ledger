@@ -212,6 +212,15 @@ class CodeLedgerTests(unittest.TestCase):
             self.assertEqual(answer["attribution"][0]["last_modified_session"], "s-1")
             self.assertEqual(answer["recorded_changes"][0]["agent"], "codex")
 
+    def test_an_unknown_agent_is_recorded_as_a_generic_provider(self):
+        """Documented behaviour that the adapter seam never actually applied."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger=Ledger(Path(directory))
+            ledger.start_session("codex"); ledger.start_session("SomeRandomBot")
+            providers={row["name"]: row["provider"] for row in ledger.db.execute("SELECT name,provider FROM agents")}
+            self.assertEqual(providers["codex"], "codex")
+            self.assertEqual(providers["somerandombot"], "generic")   # normalised, not invented
+
     def test_a_deleted_file_is_reported_once_not_every_refresh(self):
         """`watch` polls continuously; a deletion must not re-fire each poll."""
         with tempfile.TemporaryDirectory() as directory:

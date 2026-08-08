@@ -48,7 +48,7 @@ codeledger regressions
 For large repositories, especially projects under `/mnt/c` in WSL, use the fast metadata pass first:
 
 ```bash
-cd "/mnt/c/Users/edujk/Desktop/HD anti gravity/clever-ticket-buddy-94-96"
+cd "/path/to/your-project"
 codeledger init --quick --verbose
 codeledger refresh --changed --verbose
 ```
