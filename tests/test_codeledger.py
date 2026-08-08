@@ -212,6 +212,34 @@ class CodeLedgerTests(unittest.TestCase):
             self.assertEqual(answer["attribution"][0]["last_modified_session"], "s-1")
             self.assertEqual(answer["recorded_changes"][0]["agent"], "codex")
 
+    def test_a_sentence_request_finds_its_symbols(self):
+        """Real requests are sentences, not bare symbol names.
+
+        A substring match on the whole phrase never hits, which left context,
+        plan and scope blind for every realistic request.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"src"/"auth").mkdir(parents=True); (root/"src"/"payments").mkdir()
+            (root/"src"/"auth"/"session.py").write_text("def login(token):\n    return bool(token)\n")
+            (root/"src"/"payments"/"charge.py").write_text("def charge(amount):\n    return amount\n")
+            ledger=Ledger(root); ledger.init()
+            self.assertEqual(ledger.lookup("Fix the login timeout"), [])       # the old behaviour
+            context=ledger.context("Fix the login timeout")
+            self.assertEqual(context["files"], ["src/auth/session.py"])
+            self.assertFalse(context["scan_required"])
+            self.assertEqual(ledger.scope_check("Fix the login timeout", ["src/auth/session.py"], [])["status"], "SAFE")
+            unrelated=ledger.scope_check("Fix the login timeout", ["src/payments/charge.py"], [])
+            self.assertEqual(unrelated["status"], "WARNING")
+            self.assertIn("src/payments/charge.py", unrelated["unexpected_files"])
+
+    def test_plan_suggests_tests_covering_the_affected_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"src").mkdir(); (root/"tests").mkdir()
+            (root/"src"/"auth.py").write_text("def authenticateUser(t):\n    return bool(t)\n")
+            (root/"tests"/"test_auth.py").write_text("def test_authenticateUser():\n    assert True\n")
+            ledger=Ledger(root); ledger.init()
+            self.assertIn("tests/test_auth.py", ledger.plan("Fix authenticateUser token expiry")["suggested_tests"])
+
     def test_scope_boundary_falls_back_to_path_keywords(self):
         """A request naming no indexed symbol should still get a boundary."""
         with tempfile.TemporaryDirectory() as directory:

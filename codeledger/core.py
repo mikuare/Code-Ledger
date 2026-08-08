@@ -297,8 +297,29 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                         if shallow else "The dependency index reported no dependents, so the working tree was read directly.")
         return {"query": query, "symbols": matches, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": source, "coverage": "shallow" if shallow else "full", "evidence": evidence}
 
+    def search_symbols(self, query: str, limit: int = 200) -> list[dict]:
+        """Find symbols relevant to a natural-language request.
+
+        `lookup` matches the query as a single substring, which only ever hits
+        when the user typed a bare symbol name. Real requests are sentences
+        ("Fix the login timeout"), so the whole pre-change layer — context,
+        plan, scope — saw nothing and fell back to UNKNOWN. Search the salient
+        words as well, ranked by how many of them a symbol matches.
+        """
+        found: dict[int, list] = {}
+        for row in self.lookup(query, limit=limit):
+            found[row["id"]] = [row, 2]                       # whole-phrase hit is the strongest signal
+        words = [word for word in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", query) if word.lower() not in STOPWORDS]
+        for word in dict.fromkeys(words):
+            for row in self.lookup(word, limit=limit):
+                entry = found.get(row["id"])
+                if entry: entry[1] += 1
+                else: found[row["id"]] = [row, 1]
+        ranked = sorted(found.values(), key=lambda item: (-item[1], item[0]["status"] != "active", item[0]["name"]))
+        return [row for row, _score in ranked][:limit]
+
     def context(self, query: str) -> dict:
-        matches = self.lookup(query); paths = sorted({r["path"] for r in matches})
+        matches = self.search_symbols(query); paths = sorted({r["path"] for r in matches})
         recent = [dict(r) for r in self.db.execute("SELECT id,timestamp,agent,summary,risk FROM changes ORDER BY id DESC LIMIT 5")]
         issues = [dict(r) for r in self.db.execute("SELECT key,title,severity FROM issues WHERE status='OPEN' ORDER BY updated_at DESC LIMIT 10")]
         decisions = [dict(r) for r in self.db.execute("SELECT key,title,rationale FROM decisions WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 10")]
@@ -376,7 +397,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         risk = "UNKNOWN" if context["scan_required"] else "HIGH" if len(impact_files) > 10 else "MEDIUM" if len(impact_files) > 3 else "LOW"
         recommendation = "Inspect the existing implementation before adding new code." if symbols else "Use targeted discovery; CodeLedger has no exact symbol match yet."
         analysis = context["task_analysis"]
-        return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols, "recent_changes": context["recent_changes"], "known_issues": context["known_issues"], "decisions": context["decisions"], "risk": "HIGH" if analysis["risk"] == "HIGH" else risk, "recommendation": recommendation, "full_scan_required": context["scan_required"], "suggested_tests": sorted({path for path in impact_files if "test" in path.lower() or "spec" in path.lower()})}
+        return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols, "recent_changes": context["recent_changes"], "known_issues": context["known_issues"], "decisions": context["decisions"], "risk": "HIGH" if analysis["risk"] == "HIGH" else risk, "recommendation": recommendation, "full_scan_required": context["scan_required"], "suggested_tests": self.suggest_tests(sorted(impact_files), [symbol["name"] for symbol in symbols])}
 
     def handshake(self, request: str, ai_plan: str = "") -> dict:
         analysis = self.analyze_prompt(request); plan_text = " ".join(ai_plan.split()); lower = plan_text.lower()
