@@ -140,6 +140,33 @@ class CodeLedgerTests(unittest.TestCase):
             row=ledger.db.execute("SELECT * FROM dependencies WHERE target_name='helpers' AND kind='imports'").fetchone()
             self.assertIsNotNone(row); self.assertIsNotNone(row["source_file_id"])
 
+    def test_impact_finds_a_react_component_that_uses_a_hook(self):
+        """ES named imports must be visible: `import { x } from` binds no AST."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"src"/"hooks").mkdir(parents=True); (root/"src"/"components").mkdir(parents=True)
+            (root/"src"/"hooks"/"useAuth.ts").write_text("export const useAuth = () => {\n  return { user: null };\n};\n")
+            (root/"src"/"components"/"UserList.tsx").write_text(
+                "import React from 'react';\nimport { useAuth } from '../hooks/useAuth';\nimport './UserList.css';\n\n"
+                "export const UserList = () => {\n  const { user } = useAuth();\n  return <div>{user}</div>;\n};\n")
+            ledger=Ledger(root); ledger.init(); result=ledger.impact("useAuth")
+            self.assertEqual(result["source"], "index")
+            self.assertEqual(result["referencing_files"], ["src/components/UserList.tsx"])
+            kinds={(row["target_name"], row["kind"]) for row in result["dependencies"]}
+            self.assertIn(("useAuth", "uses"), kinds)
+
+    def test_impact_falls_back_instead_of_claiming_no_dependents(self):
+        """An empty index must never be reported as an absence of impact."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/"helpers.py").write_text("def helper():\n    return 1\n")
+            (root/"report.sql").write_text("-- calls helper() nightly\nSELECT 1;\n")
+            ledger=Ledger(root); ledger.init()
+            result=ledger.impact("helper")
+            self.assertEqual(result["source"], "index + fallback scan")
+            self.assertIn("report.sql", result["referencing_files"])
+            strict=ledger.impact("helper", fallback=False)
+            self.assertEqual(strict["source"], "index"); self.assertEqual(strict["referencing_files"], [])
+
     def test_lookup_treats_wildcards_as_literal_text(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/"main.py").write_text("def run():\n    pass\n")

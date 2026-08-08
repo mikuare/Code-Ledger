@@ -4,7 +4,26 @@ import ast
 import hashlib
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+NAME = r"[A-Za-z_$][\w$]*"
+# `import a, { b as c } from "m"` / `export { d } from "m"`
+ES_FROM = re.compile(rf"(?:^|[;\n])\s*(?:import|export)\s+(?P<body>(?:type\s+)?[^;'\"]*?)\s+from\s*['\"](?P<module>[^'\"]+)['\"]")
+ES_BARE = re.compile(r"(?:^|[;\n])\s*import\s*['\"](?P<module>[^'\"]+)['\"]")          # import "./styles.css"
+ES_REQUIRE = re.compile(r"require\(\s*['\"](?P<module>[^'\"]+)['\"]\s*\)")
+GENERIC_IMPORT = re.compile(rf"(?:^|\n)\s*(?:import|use|require|include)\s+([A-Za-z_$][\w$.:/-]*)")
+
+def _imported_names(body: str) -> list[str]:
+    """Extract bound names from an ES import/export clause."""
+    body = re.sub(r"^\s*type\s+", "", body.strip())
+    names = [match.group(1) for match in re.finditer(rf"\*\s+as\s+({NAME})", body)]
+    for block in re.findall(r"\{([^}]*)\}", body):
+        for piece in block.split(","):
+            match = re.match(rf"(?:type\s+)?({NAME})(?:\s+as\s+{NAME})?\s*$", piece.strip())
+            if match: names.append(match.group(1))          # bind the exported name, not the local alias
+    head = re.split(r"[,{]", body, maxsplit=1)[0].strip()
+    if re.fullmatch(NAME, head or ""): names.append(head)   # default import
+    return names
 
 LANGUAGES = {".py":"python", ".js":"javascript", ".jsx":"javascript", ".ts":"typescript", ".tsx":"typescript", ".java":"java", ".go":"go", ".rs":"rust", ".rb":"ruby", ".php":"php", ".cs":"csharp", ".cpp":"cpp", ".c":"c"}
 @dataclass
@@ -82,8 +101,21 @@ def dependencies(path: Path, text: str) -> list[tuple[str, str, str]]:
             return sorted(set(result))
         except SyntaxError:
             return []
-    for line in text.splitlines():
-        match = re.match(r"\s*(?:import|from)\s+([A-Za-z_$][\w$.-]*)", line)
-        if match:
-            result.append(("__module__", match.group(1).split(".")[0], "imports"))
+    imported, modules = set(), set()
+    for match in ES_FROM.finditer(text):
+        imported.update(_imported_names(match.group("body"))); modules.add(match.group("module"))
+    for pattern in (ES_BARE, ES_REQUIRE):
+        modules.update(match.group("module") for match in pattern.finditer(text))
+    for match in GENERIC_IMPORT.finditer(text):
+        modules.add(match.group(1))
+    for module in modules:
+        stem = PurePosixPath(module.replace("\\", "/")).name.split(".")[0]
+        if stem: result.append(("__module__", stem, "imports"))
+    for name in imported:
+        result.append(("__module__", name, "imports"))
+        # The name occurs once in its own import statement. A second occurrence
+        # means the file actually uses it, which is what `impact` needs to
+        # answer "who breaks if this changes?".
+        if len(re.findall(r"\b" + re.escape(name) + r"\b", text)) > 1:
+            result.append(("__module__", name, "uses"))
     return sorted(set(result))

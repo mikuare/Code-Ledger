@@ -213,13 +213,25 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         rows = self.db.execute("SELECT c.* FROM changes c WHERE c.summary LIKE ? ESCAPE '\\' OR c.user_request LIKE ? ESCAPE '\\' ORDER BY c.id DESC LIMIT ?", (pattern, pattern, limit)).fetchall()
         return [dict(r) for r in rows]
 
-    def impact(self, query: str, scan: bool = False, limit: int = 50) -> dict:
+    def _scan_for_names(self, names: list[str]) -> set[str]:
+        found = set()
+        for path in self._files():
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if any(re.search(r"\b" + re.escape(name) + r"\b", text) for name in names):
+                found.add(path.relative_to(self.root).as_posix())
+        return found
+
+    def impact(self, query: str, scan: bool = False, limit: int = 50, fallback: bool = True) -> dict:
         """Find dependents of a symbol from the index.
 
-        The dependency graph already records who calls, uses, and imports each
-        name, so the default path is a bounded set of indexed queries. Reading
-        every file in the repository is available behind ``scan=True`` for the
-        case where the index is known to be incomplete.
+        The dependency graph records who calls, uses, and imports each name, so
+        the default path is a bounded set of indexed queries. Language coverage
+        is uneven — Python is parsed with the AST, other languages are matched
+        conservatively — so when the index reports no dependents at all the
+        result falls back to reading the working tree. "No evidence" must never
+        be presented as "no impact"; that is the failure mode that lets an agent
+        change a symbol believing nothing depends on it. Pass ``fallback=False``
+        to keep the query strictly indexed.
         """
         matches = self.lookup(query, limit=limit)
         if not matches:
@@ -233,13 +245,13 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             (*ids, *names))]
         refs = {row["source_path"] for row in dependency_rows if row["source_path"]}
         defining = {row["path"] for row in matches}
-        if scan:
-            for path in self._files():
-                text = path.read_text(encoding="utf-8", errors="ignore")
-                if any(re.search(r"\b" + re.escape(name) + r"\b", text) for name in names):
-                    refs.add(path.relative_to(self.root).as_posix())
+        used_scan = scan or (fallback and not refs)
+        if used_scan:
+            refs |= self._scan_for_names(names)
+        refs -= defining
         blast = refs | defining
-        return {"query": query, "symbols": matches, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": "filesystem scan" if scan else "index"}
+        source = "filesystem scan" if scan else "index + fallback scan" if used_scan else "index"
+        return {"query": query, "symbols": matches, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": source, "evidence": "The dependency index reported no dependents, so the working tree was read directly." if used_scan and not scan else ""}
 
     def context(self, query: str) -> dict:
         matches = self.lookup(query); paths = sorted({r["path"] for r in matches})

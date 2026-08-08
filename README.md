@@ -83,14 +83,16 @@ Current source and filesystem state outrank indexed memory. An unchanged file is
 
 File identity is the SHA-256 of the raw bytes, never of a lossily decoded string, so an edit confined to bytes that are not valid UTF-8 still registers as a change.
 
-`impact` answers from the dependency index — call, use, and import edges recorded at parse time — rather than reading the working tree, and reports `"source": "index"`. When the index is known to be incomplete, `--scan` adds a full filesystem pass and reports `"source": "filesystem scan"`:
+`impact` answers from the dependency index — call, use, and import edges recorded at parse time — rather than reading the working tree, and reports `"source": "index"`. When the index is known to be incomplete, `--scan` adds a full filesystem pass:
 
 ```bash
 codeledger impact authenticateUser          # indexed edges, bounded work
 codeledger impact authenticateUser --scan   # also reads every source file
 ```
 
-A query that matches no indexed symbol returns `risk: UNKNOWN` with the reason, rather than a falsely reassuring `LOW`.
+Language coverage is uneven by design: Python is parsed with the AST, giving symbol-level call and use edges. JavaScript, TypeScript, JSX/TSX, Vue, and Svelte are matched conservatively — default, named, aliased, namespace, side-effect, and `require()` imports are all recorded, and an imported name that appears again in the file is recorded as a use. Other languages fall back to import extraction only.
+
+Because that coverage is uneven, **absence of evidence is never reported as absence of impact**. If the index finds no dependents at all, `impact` reads the working tree before answering and reports `"source": "index + fallback scan"`. A query matching no indexed symbol returns `risk: UNKNOWN` with the reason, rather than a falsely reassuring `LOW`. Pass `fallback=False` through the API to keep a query strictly indexed.
 
 ## Issues, decisions, and verification
 
