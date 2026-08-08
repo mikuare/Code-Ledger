@@ -12,6 +12,9 @@ ES_FROM = re.compile(rf"(?:^|[;\n])\s*(?:import|export)\s+(?P<body>(?:type\s+)?[
 ES_BARE = re.compile(r"(?:^|[;\n])\s*import\s*['\"](?P<module>[^'\"]+)['\"]")          # import "./styles.css"
 ES_REQUIRE = re.compile(r"require\(\s*['\"](?P<module>[^'\"]+)['\"]\s*\)")
 GENERIC_IMPORT = re.compile(rf"(?:^|\n)\s*(?:import|use|require|include)\s+([A-Za-z_$][\w$.:/-]*)")
+CALL_SITE = re.compile(rf"(?<![.\w$])({NAME})\s*\(")     # foo(...) but not obj.foo(...)
+JSX_SITE = re.compile(rf"<({NAME})[\s/>]")               # <UserList ... />
+
 
 def _imported_names(body: str) -> list[str]:
     """Extract bound names from an ES import/export clause."""
@@ -74,10 +77,41 @@ def parse_file(path: Path, text: str) -> list[SymbolData]:
         for kind, pattern in patterns:
             match = pattern.search(line)
             if match:
-                name = match.group(1)
-                result.append(SymbolData(name, kind, i, i, line.strip(), digest(line)))
+                end = _block_end(lines, i)
+                # Hash the whole block, not the declaration line. Hashing one
+                # line meant an edit inside a function body never changed the
+                # symbol's hash, so the edit was invisible to attribution.
+                result.append(SymbolData(match.group(1), kind, i, end, line.strip(), digest("\n".join(lines[i-1:end]))))
                 break
     return result
+
+def _block_end(lines: list[str], start: int) -> int:
+    """Approximate the last line of a brace-delimited block (1-indexed).
+
+    Brace counting, not parsing: braces inside strings or block comments can
+    skew it. Ranges are only used to attribute a call to its enclosing symbol,
+    where being approximately right beats having no scope at all.
+    """
+    depth = 0; opened = False
+    for index in range(start - 1, len(lines)):
+        for char in re.sub(r"//.*$", "", lines[index]):
+            if char == "{":
+                depth += 1; opened = True
+            elif char == "}" and opened:
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        if not opened and index >= start:   # nothing opened on the declaration or the line after it
+            return start
+    return len(lines) if opened else start
+
+def _enclosing(symbols: list[SymbolData], line: int) -> str:
+    """Innermost symbol whose block contains this line."""
+    best = None
+    for item in symbols:
+        if item.start <= line <= item.end and (best is None or item.start >= best.start):
+            best = item
+    return best.name if best else "__module__"
 
 def dependencies(path: Path, text: str) -> list[tuple[str, str, str]]:
     """Return conservative (source symbol, target name, relationship) edges."""
@@ -118,4 +152,16 @@ def dependencies(path: Path, text: str) -> list[tuple[str, str, str]]:
         # answer "who breaks if this changes?".
         if len(re.findall(r"\b" + re.escape(name) + r"\b", text)) > 1:
             result.append(("__module__", name, "uses"))
+    # Symbol-level edges inside the file. Only names this file imports or
+    # defines are considered, which keeps builtins and member calls out.
+    symbols = parse_file(path, text)
+    known = imported | {item.name for item in symbols}
+    for index, line in enumerate(text.splitlines(), 1):
+        stripped = re.sub(r"//.*$", "", line)
+        source = _enclosing(symbols, index)
+        for pattern, kind in ((CALL_SITE, "calls"), (JSX_SITE, "uses")):
+            for match in pattern.finditer(stripped):
+                target = match.group(1)
+                if target in known and target != source:
+                    result.append((source, target, kind))
     return sorted(set(result))

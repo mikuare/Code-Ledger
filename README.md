@@ -90,9 +90,24 @@ codeledger impact authenticateUser          # indexed edges, bounded work
 codeledger impact authenticateUser --scan   # also reads every source file
 ```
 
-Language coverage is uneven by design: Python is parsed with the AST, giving symbol-level call and use edges. JavaScript, TypeScript, JSX/TSX, Vue, and Svelte are matched conservatively — default, named, aliased, namespace, side-effect, and `require()` imports are all recorded, and an imported name that appears again in the file is recorded as a use. Other languages fall back to import extraction only.
+Language coverage is uneven by design: Python is parsed with the AST, giving symbol-level call and use edges. JavaScript, TypeScript, JSX/TSX, Vue, and Svelte are matched conservatively — default, named, aliased, namespace, side-effect, and `require()` imports are all recorded; an imported name used again in the file is recorded as a use; and calls and JSX element uses are attributed to their enclosing symbol by brace-depth ranges, so `UserList -> formatName` is recorded even when both live in one file. Only names the file imports or defines are considered, which keeps builtins and member calls out of the graph. Other languages fall back to import extraction only.
 
 Because that coverage is uneven, **absence of evidence is never reported as absence of impact**. If the index finds no dependents at all, `impact` reads the working tree before answering and reports `"source": "index + fallback scan"`. A query matching no indexed symbol returns `risk: UNKNOWN` with the reason, rather than a falsely reassuring `LOW`. Pass `fallback=False` through the API to keep a query strictly indexed.
+
+## Attribution
+
+Every file and symbol records the agent and session that last changed it, and `why` links a symbol to the request behind it:
+
+```bash
+codeledger why formatName
+```
+
+```text
+answer:      Last recorded request touching this symbol: Uppercase the formatted name
+attribution: formatName  src/admin/users.tsx  last_modified_by=claude-code  session=sess-42
+```
+
+Credit is assigned only to symbols whose content actually changed. A symbol that merely shifted lines because of an edit elsewhere in the same file keeps its previous author and `updated_at` — a refresh never reassigns authorship for work nobody did. Symbols changed outside a recorded session are attributed to `unknown`, never guessed.
 
 ## Issues, decisions, and verification
 
@@ -147,6 +162,8 @@ codeledger scope "Update authentication" --files src/auth/service.py src/auth/se
 ```
 
 Scope warnings are advisory, not destructive blocking. A new file is allowed only in a directory that already contains a task-relevant file — a sibling directory such as `src/billing/` is not covered by a match in `src/auth/` — while ambiguous tasks remain `UNKNOWN` instead of being falsely marked safe.
+
+The boundary is drawn from indexed symbols matching the request and from any paths written into the request itself. When neither exists, request keywords are matched against file paths so that a task whose wording happens not to match a symbol name still gets a judgement rather than `UNKNOWN`. Every result reports `boundary_evidence` naming which of these was used, and keyword matches are labelled weak evidence.
 
 ## Safety loop
 

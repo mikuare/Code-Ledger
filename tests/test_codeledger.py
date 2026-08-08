@@ -167,6 +167,58 @@ class CodeLedgerTests(unittest.TestCase):
             strict=ledger.impact("helper", fallback=False)
             self.assertEqual(strict["source"], "index"); self.assertEqual(strict["referencing_files"], [])
 
+    TSX_SOURCE = ("import { useAuth } from '../hooks/useAuth';\n\n"
+                  "export const formatName = (u) => {\n  return u.name.trim();\n};\n\n"
+                  "export const UserList = () => {\n  const { user } = useAuth();\n"
+                  "  const label = formatName(user);\n  return <div>{label}</div>;\n};\n")
+
+    def test_symbol_level_call_edges_inside_one_file(self):
+        """JS/TS coverage must reach beyond imports to calls within a file."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"src").mkdir(); (root/"src"/"users.tsx").write_text(self.TSX_SOURCE)
+            ledger=Ledger(root); ledger.init()
+            edges={(row["src"], row["target_name"]) for row in ledger.db.execute(
+                "SELECT s.name AS src, d.target_name FROM dependencies d JOIN symbols s ON s.id=d.source_symbol_id WHERE d.kind='calls'")}
+            self.assertIn(("UserList", "formatName"), edges)
+            self.assertIn(("UserList", "useAuth"), edges)
+
+    def test_attribution_credits_only_the_symbol_that_changed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"src").mkdir(); source=root/"src"/"users.tsx"
+            source.write_text(self.TSX_SOURCE)
+            ledger=Ledger(root); ledger.init()
+            source.write_text(self.TSX_SOURCE.replace("u.name.trim()", "u.name.trim().toUpperCase()"))
+            result=ledger.refresh(changed_only=True, agent="claude-code", session="sess-42", request="Uppercase the name")
+            attribution={row["name"]: (row["last_modified_by"], row["last_modified_session"]) for row in ledger.db.execute("SELECT name,last_modified_by,last_modified_session FROM symbols")}
+            self.assertEqual(attribution["formatName"], ("claude-code", "sess-42"))
+            self.assertEqual(attribution["UserList"], ("unknown", ""))   # untouched: credit must not move
+            self.assertEqual(result["symbols"], ["formatName"])          # and it is not reported as changed
+
+    def test_why_links_a_symbol_to_the_request_that_changed_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"auth.py"; source.write_text("def authenticate():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            source.write_text("def authenticate():\n    return 2\n")
+            ledger.refresh(changed_only=True, agent="codex", session="s-1", request="Fix the login timeout")
+            answer=ledger.why("authenticate")
+            self.assertIn("Fix the login timeout", answer["answer"])
+            self.assertEqual(answer["attribution"][0]["last_modified_by"], "codex")
+            self.assertEqual(answer["attribution"][0]["last_modified_session"], "s-1")
+            self.assertEqual(answer["recorded_changes"][0]["agent"], "codex")
+
+    def test_scope_boundary_falls_back_to_path_keywords(self):
+        """A request naming no indexed symbol should still get a boundary."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"src"/"admin").mkdir(parents=True); (root/"src"/"billing").mkdir(parents=True)
+            (root/"src"/"admin"/"users.tsx").write_text("export const UserList = () => null;\n")
+            (root/"src"/"billing"/"charge.ts").write_text("export const charge = () => null;\n")
+            ledger=Ledger(root); ledger.init()
+            inside=ledger.scope_check("Add activity tracking to the admin area", ["src/admin/users.tsx"], [])
+            self.assertEqual(inside["status"], "SAFE")
+            self.assertIn("request keywords matched against file paths (weak evidence)", inside["boundary_evidence"])
+            outside=ledger.scope_check("Add activity tracking to the admin area", ["src/billing/charge.ts"], [])
+            self.assertEqual(outside["status"], "WARNING")
+
     def test_lookup_treats_wildcards_as_literal_text(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/"main.py").write_text("def run():\n    pass\n")

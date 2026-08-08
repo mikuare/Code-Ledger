@@ -14,6 +14,8 @@ from .git import commit_files, commits, head, status as git_status
 from .parser import dependencies, digest, digest_bytes, language, parse_file
 
 LIKE_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
+# Words too generic to define a task boundary from a file path.
+STOPWORDS = {"add", "also", "and", "any", "app", "back", "been", "code", "create", "change", "changes", "current", "delete", "each", "file", "files", "fix", "from", "have", "into", "make", "more", "must", "need", "new", "not", "only", "page", "please", "remove", "should", "some", "that", "the", "them", "then", "there", "this", "update", "use", "using", "when", "where", "which", "with", "without", "work"}
 
 NOW = lambda: datetime.now(timezone.utc).isoformat()
 
@@ -120,6 +122,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
 
     def refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False) -> dict[str, int | str | None | list[str] | dict]:
         started = time.perf_counter(); statuses = git_status(self.root) if include_git_status and (self.root / ".git").exists() and analyze else {}
+        actor = agent or "unknown"   # attribution is recorded as given; it is never guessed
         seen, changed_paths, changed_symbols = set(), [], []
         added, modified, deleted, symbols = 0, 0, 0, 0
         discovery_started = time.perf_counter(); discovered = list(self._discover(verbose=verbose)); discovery_seconds = time.perf_counter() - discovery_started
@@ -146,21 +149,28 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             parse_started = time.perf_counter(); text = raw.decode("utf-8", errors="replace"); parsed = parse_file(path, text); edges = dependencies(path, text); parse_seconds += time.perf_counter() - parse_started; now = NOW()
             changed_paths.append(rel)
             if not old:
-                cursor = self.db.execute("INSERT INTO files(path,language,size,hash,mtime,mtime_ns,git_status,status,last_analyzed,analysis_version) VALUES(?,?,?,?,?,?,?,?,?,?)", (rel, language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), "current", now, "1")); added += 1; file_id = cursor.lastrowid
+                cursor = self.db.execute("INSERT INTO files(path,language,size,hash,mtime,mtime_ns,git_status,status,last_analyzed,analysis_version,last_modified_by,last_modified_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (rel, language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), "current", now, "1", actor, session)); added += 1; file_id = cursor.lastrowid
             else:
-                self.db.execute("UPDATE files SET language=?,size=?,hash=?,mtime=?,mtime_ns=?,git_status=?,status='current',last_analyzed=?,analysis_version='1' WHERE path=?", (language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), now, rel)); modified += 1; file_id = old["id"]
+                self.db.execute("UPDATE files SET language=?,size=?,hash=?,mtime=?,mtime_ns=?,git_status=?,status='current',last_analyzed=?,analysis_version='1',last_modified_by=?,last_modified_session=? WHERE path=?", (language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), now, actor, session, rel)); modified += 1; file_id = old["id"]
             old_symbols = {r["name"]: r for r in self.db.execute("SELECT * FROM symbols WHERE file_id=? AND status='active'", (file_id,))}
             current = set()
             for item in parsed:
                 current.add(item.name); prior = old_symbols.get(item.name)
+                if prior and prior["hash"] == item.hash:
+                    # Same content, possibly shifted by an edit elsewhere in the
+                    # file. Line numbers are facts and get refreshed; authorship
+                    # and updated_at must not move, or every refresh would
+                    # reassign credit for symbols nobody touched.
+                    self.db.execute("UPDATE symbols SET kind=?,line_start=?,line_end=?,signature=?,status='active' WHERE id=?", (item.kind, item.start, item.end, item.signature, prior["id"]))
+                    continue
                 if prior:
-                    self.db.execute("UPDATE symbols SET kind=?,line_start=?,line_end=?,signature=?,hash=?,updated_at=?,status='active' WHERE id=?", (item.kind, item.start, item.end, item.signature, item.hash, now, prior["id"]))
+                    self.db.execute("UPDATE symbols SET kind=?,line_start=?,line_end=?,signature=?,hash=?,updated_at=?,status='active',last_modified_by=?,last_modified_session=? WHERE id=?", (item.kind, item.start, item.end, item.signature, item.hash, now, actor, session, prior["id"]))
                 else:
-                    self.db.execute("INSERT INTO symbols(name,qualified_name,kind,file_id,line_start,line_end,signature,hash,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (item.name, item.name, item.kind, file_id, item.start, item.end, item.signature, item.hash, "active", now, now)); symbols += 1
+                    self.db.execute("INSERT INTO symbols(name,qualified_name,kind,file_id,line_start,line_end,signature,hash,status,created_at,updated_at,last_modified_by,last_modified_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (item.name, item.name, item.kind, file_id, item.start, item.end, item.signature, item.hash, "active", now, now, actor, session)); symbols += 1
                 changed_symbols.append(item.name)
             for name, prior in old_symbols.items():
                 if name not in current:
-                    self.db.execute("UPDATE symbols SET status='deleted',deleted_at=?,updated_at=? WHERE id=?", (now, now, prior["id"])); deleted += 1
+                    self.db.execute("UPDATE symbols SET status='deleted',deleted_at=?,updated_at=?,last_modified_by=?,last_modified_session=? WHERE id=?", (now, now, actor, session, prior["id"])); deleted += 1
                     changed_symbols.append(name)
             self.db.execute("DELETE FROM dependencies WHERE source_file_id=? OR source_symbol_id IN (SELECT id FROM symbols WHERE file_id=?)", (file_id, file_id))
             symbol_ids = {row["name"]: row["id"] for row in self.db.execute("SELECT id,name FROM symbols WHERE file_id=? AND status='active'", (file_id,))}
@@ -288,9 +298,9 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         changed_files = sorted(set(changed_files)); changed_symbols = sorted(set(changed_symbols or []))
         if not changed_files:
             return {"status": "NO_CHANGES", "request": request, "allowed_files": [], "unexpected_files": [], "unexpected_symbols": []}
-        context = self.context(request); allowed = set(context["files"])
-        if context["scan_required"] or not allowed:
-            return {"status": "UNKNOWN", "request": request, "reason": "Insufficient task-specific context to define a safe boundary.", "allowed_files": [], "unexpected_files": [], "unexpected_symbols": changed_symbols}
+        context = self.context(request); allowed, evidence = self._task_boundary(context)
+        if not allowed:
+            return {"status": "UNKNOWN", "request": request, "reason": "Insufficient task-specific context to define a safe boundary.", "allowed_files": [], "unexpected_files": [], "unexpected_symbols": changed_symbols, "boundary_evidence": []}
         # A new file is tolerated only in a directory that already holds a
         # task-relevant file. Matching on prefixes instead let one hit under
         # `src/` mark the whole subtree SAFE, which made the guard vacuous.
@@ -299,7 +309,31 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         relevant_names = {row["name"] for row in context["symbols"]}
         unexpected_symbols = [name for name in changed_symbols if name not in relevant_names]
         status = "WARNING" if unexpected or unexpected_symbols else "SAFE"
-        return {"status": status, "request": request, "allowed_files": sorted(allowed), "unexpected_files": unexpected, "unexpected_symbols": unexpected_symbols, "reason": "Review the diff for unrelated changes." if status == "WARNING" else "Changed files are within the known task boundary."}
+        return {"status": status, "request": request, "allowed_files": sorted(allowed), "unexpected_files": unexpected, "unexpected_symbols": unexpected_symbols, "boundary_evidence": evidence, "reason": "Review the diff for unrelated changes." if status == "WARNING" else "Changed files are within the known task boundary."}
+
+    def _task_boundary(self, context: dict) -> tuple[set[str], list[str]]:
+        """Files a task may legitimately touch, with the evidence behind them.
+
+        Indexed symbol matches are the strong signal. Paths written into the
+        request are equally strong and are always honoured. Only when neither
+        exists does this fall back to matching request keywords against file
+        paths, which is weak but still better than refusing to judge at all —
+        the guard was returning UNKNOWN on any request whose wording did not
+        happen to match an indexed symbol name.
+        """
+        analysis = context["task_analysis"]; allowed = set(context["files"]); evidence = []
+        if allowed:
+            evidence.append("indexed symbols matching the request")
+        indexed = [row["path"] for row in self.db.execute("SELECT path FROM files WHERE status!='deleted'")]
+        named = {path for token in analysis["paths"] for path in indexed if token.strip("/") in path}
+        if named:
+            allowed |= named; evidence.append("paths named in the request")
+        if not allowed:
+            words = {word for word in re.findall(r"[a-z][a-z0-9]{3,}", analysis["normalized"].lower()) if word not in STOPWORDS}
+            keyword_matches = {path for path in indexed if any(word in path.lower() for word in words)}
+            if keyword_matches:
+                allowed |= keyword_matches; evidence.append("request keywords matched against file paths (weak evidence)")
+        return allowed, evidence
 
     def plan(self, request: str) -> dict:
         context = self.context(request); symbols = context["symbols"][:20]; impact_files = set(context["files"])
@@ -434,7 +468,23 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
     def why(self, query: str) -> dict:
         symbols = self.lookup(query)
         changes = self.history(query)
-        return {"query": query, "symbols": symbols, "changes": changes, "answer": "History found; inspect the recorded changes." if changes else "No recorded reason found. Current source and Git evidence should be inspected; attribution is UNKNOWN."}
+        # A symbol's own name rarely appears in a change summary, so text search
+        # alone answered "why does this exist?" with nothing. Walk the recorded
+        # symbol->change links instead, which is what the ledger is for.
+        linked, attribution = [], []
+        for symbol in symbols:
+            attribution.append({"symbol": symbol["name"], "file": symbol["path"], "status": symbol["status"], "last_modified_by": symbol["last_modified_by"] or "unknown", "last_modified_session": symbol["last_modified_session"] or "NOT RECORDED", "updated_at": symbol["updated_at"]})
+            linked.extend(dict(row) for row in self.db.execute(
+                "SELECT c.*,cs.name AS symbol FROM change_symbols cs JOIN changes c ON c.id=cs.change_id WHERE cs.symbol_id=? OR cs.name=? ORDER BY c.id DESC LIMIT 20",
+                (symbol["id"], symbol["name"])))
+        seen, recorded = set(), []
+        for row in linked:
+            if row["id"] not in seen: seen.add(row["id"]); recorded.append(row)
+        requests = [row["user_request"] for row in recorded if row["user_request"]]
+        answer = "No recorded reason found. Current source and Git evidence should be inspected; attribution is UNKNOWN."
+        if requests: answer = f"Last recorded request touching this symbol: {requests[0]}"
+        elif recorded or changes: answer = "Changes are recorded, but no originating request was captured."
+        return {"query": query, "symbols": symbols, "attribution": attribution, "changes": changes, "recorded_changes": recorded, "answer": answer}
 
     def export(self) -> list[str]:
         target = self.root / ".ai" / "codeledger" / "exports"; target.mkdir(parents=True, exist_ok=True)
