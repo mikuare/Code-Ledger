@@ -250,6 +250,25 @@ class CodeLedgerTests(unittest.TestCase):
             ledger.verify("project", "project", "TEST", "PASSED", "suite green")
             self.assertEqual(ledger.progress(request)["status"], "VERIFIED")
 
+    def test_progress_does_not_confuse_tasks_sharing_one_word(self):
+        """A shared keyword is not a repeated attempt."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"auth.py"
+            source.write_text("def login(u):\n    return u\n")
+            ledger=Ledger(root); ledger.init()
+            for index, other in enumerate(["Change the login button colour to blue",
+                                           "Add login analytics events"], 1):
+                source.write_text(f"def login(u):\n    return u  # {index}\n")
+                ledger.refresh(changed_only=True, agent="codex", request=other)
+                ledger.verify("project", "project", "TEST", "FAILED", "x")
+            result=ledger.progress("Fix the login timeout bug")
+            self.assertEqual(result["attempt_count"], 0, f"unrelated tasks matched: {result['attempts']}")
+            self.assertEqual(result["status"], "NO_PRIOR_ATTEMPTS")
+            # the same request reworded slightly must still match
+            source.write_text("def login(u):\n    return u  # real\n")
+            ledger.refresh(changed_only=True, agent="codex", request="Fix the login timeout bug")
+            self.assertEqual(ledger.progress("Fix the login timeout bug urgently")["attempt_count"], 1)
+
     def test_progress_ignores_an_unrelated_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); source=root/"billing.py"

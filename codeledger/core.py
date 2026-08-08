@@ -441,14 +441,22 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         wanted = self._salient(request)
         attempts = []
         for row in self.db.execute("SELECT * FROM changes WHERE user_request IS NOT NULL AND user_request!='' ORDER BY id DESC LIMIT 200"):
-            overlap = wanted & self._salient(row["user_request"])
-            if not overlap:
+            other = self._salient(row["user_request"])
+            overlap = wanted & other
+            # One shared word is not the same task: "fix the login timeout" and
+            # "change the login button colour" would otherwise be counted as
+            # repeated attempts and produce a false REPEATING. A missed retry
+            # merely reports NO_PRIOR_ATTEMPTS, which is honest; a false one
+            # tells an agent to stop working on something it has never tried.
+            smaller = min(len(wanted), len(other)) if wanted and other else 0
+            score = len(overlap) / smaller if smaller else 0.0
+            if score < 0.5 or (len(overlap) < 2 and smaller > 1):
                 continue
             symbols = [item["name"] for item in self.db.execute("SELECT name FROM change_symbols WHERE change_id=?", (row["id"],))]
             files = [item["path"] for item in self.db.execute("SELECT path FROM change_files WHERE change_id=?", (row["id"],))]
             attempts.append({"change_id": row["id"], "timestamp": row["timestamp"], "agent": row["agent"] or "unknown",
                              "request": row["user_request"], "effect": row["effect"] or "unknown",
-                             "matched_terms": sorted(overlap), "files": files, "symbols": symbols})
+                             "matched_terms": sorted(overlap), "match_score": round(score, 2), "files": files, "symbols": symbols})
             if len(attempts) >= limit:
                 break
         attempts.reverse()
