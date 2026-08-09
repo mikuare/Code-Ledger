@@ -8,7 +8,14 @@ Entries describe what was wrong and how it was found, not only what changed.
 Most of these were silent — the tool returned a confident answer that happened
 to be wrong — which is the failure mode this project exists to avoid.
 
-## [Unreleased]
+## [0.2.0]
+
+Released with the version number bumped for a reason worth recording: it had
+stayed at `0.1.0` through every change below, so `pip install --upgrade` saw the
+requirement already satisfied and silently did nothing. An upgrade appeared to
+succeed, reported the same version, and left the old code running. Any release
+that people install from a git URL has to move its version or it cannot be
+upgraded at all.
 
 ### Changed
 

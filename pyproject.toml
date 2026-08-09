@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # Distribution name differs from the import name: `codeledger` was already
 # taken on PyPI. `import codeledger` and the `codeledger` command are unchanged.
 name = "code-ledger"
-version = "0.1.0"
+version = "0.2.0"
 description = "Persistent project memory and change intelligence for AI coding agents — local, SQLite-backed, MCP-native."
 requires-python = ">=3.10"
 dependencies = []
