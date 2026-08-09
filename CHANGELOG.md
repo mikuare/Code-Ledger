@@ -8,7 +8,11 @@ Entries describe what was wrong and how it was found, not only what changed.
 Most of these were silent — the tool returned a confident answer that happened
 to be wrong — which is the failure mode this project exists to avoid.
 
-## [Unreleased]
+## [0.3.0]
+
+The watcher's default behaviour changes: it now waits before recording an edit,
+so anyone relying on it indexing immediately should read the entry below and set
+`--claim-window 0` if they really want the old behaviour.
 
 ### Fixed
 
