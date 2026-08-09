@@ -8,6 +8,34 @@ Entries describe what was wrong and how it was found, not only what changed.
 Most of these were silent — the tool returned a confident answer that happened
 to be wrong — which is the failure mode this project exists to avoid.
 
+## [Unreleased]
+
+### Fixed
+
+- **The watcher stole the change it was meant to back up.** Indexing an edit is
+  destructive to authorship: once the file matches the index, the agent's own
+  refresh finds nothing left to record. So a watcher that polled first took the
+  change, credited it to `unknown`, and — recording no request, because it
+  cannot know one — left `progress` reporting `NO_PRIOR_ATTEMPTS` for work that
+  had just happened. Running the watcher therefore *disabled repeat detection*,
+  the thing this project exists to provide, while appearing to be a harmless
+  safety net.
+
+  The watcher now holds back edits made within `--claim-window` seconds
+  (default 90) and records only what nobody claimed, saying so plainly:
+
+  ```text
+  1 recent edit(s) pending — leaving them for their author to claim.
+  Recorded UNCLAIMED change #1: login.py
+    Nobody reported these within 90s, so they are attributed to 'unknown'.
+  ```
+
+  An agent reporting its own work never waits — only the watcher does. With the
+  watcher running, a Claude edit now keeps `HIGH` confidence, keeps the symbol
+  credited to `claude-code`, and keeps `progress` returning `PROGRESSING`
+  instead of `NO_PRIOR_ATTEMPTS`. Deletions are still recorded immediately, as
+  a removed file has no mtime left to age.
+
 ## [0.2.0]
 
 Released with the version number bumped for a reason worth recording: it had

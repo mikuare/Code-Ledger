@@ -385,7 +385,18 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             self.db.rollback()
             raise
 
-    def _refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False, observed: bool = False, only: set[str] | None = None) -> dict[str, int | str | None | list[str] | dict]:
+    def _refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False, observed: bool = False, only: set[str] | None = None, settle_seconds: float = 0.0) -> dict[str, int | str | None | list[str] | dict]:
+        """Index what changed.
+
+        `settle_seconds` holds back files edited within the last few moments, so
+        that whoever made the edit still has time to report it themselves. It
+        exists because indexing is destructive to attribution: once a file
+        matches the index, the agent's own refresh finds nothing left to record,
+        and the edit is credited to `unknown` with no request attached — which
+        also strips the request text `progress` needs to spot a repeated attempt.
+        Only `watch` sets this; an agent reporting its own work must never wait.
+        """
+        pending = 0
         started = time.perf_counter(); statuses = git_status(self.root) if include_git_status and (self.root / ".git").exists() and analyze else {}
         actor, attribution = self._attribute(agent, observed)
         attribution_note = attribution["reason"] if attribution["confidence"] != "HIGH" else ""
@@ -407,6 +418,14 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # A targeted re-analysis looks at a named handful of files. It is a
         # partial view of the tree, so it must not also decide what was deleted.
         if only is not None: discovered = [item for item in discovered if item[1] in only]
+        # `settle_seconds` leaves freshly-edited files alone so the agent that
+        # made them can still claim its own work. Only `watch` sets it; see the
+        # note on its parameter for why recording an edit early is destructive.
+        if settle_seconds > 0:
+            cutoff_ns = scan_started_ns - int(settle_seconds * 1_000_000_000)
+            settled = [item for item in discovered if item[3] <= cutoff_ns]
+            pending = len(discovered) - len(settled)
+            discovered = settled
         discovery_seconds = time.perf_counter() - discovery_started
         metrics = discovered[-1][4] if discovered else self._last_discovery_metrics; hash_seconds = 0.0; parse_seconds = 0.0
         for rel, size, mtime_ns in metrics.large_files:
@@ -533,7 +552,9 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             "files_checked": metrics.files_stat, "files_changed": len(changed_paths),
             "files_analyzed": added + modified, "directories_visited": metrics.directories_visited,
             "directories_pruned": metrics.directories_skipped, "stat_mode": metrics.stat_mode,
-            "traversal": "targeted" if only is not None else "full"}, "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
+            "traversal": "targeted" if only is not None else "full",
+            # Edited too recently to touch: still the author's to claim.
+            "files_awaiting_claim": pending}, "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
         if attribution_note:
             result["attribution_note"] = attribution_note
         if changed_paths:

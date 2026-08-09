@@ -241,6 +241,8 @@ def build_parser():
     add_agent_flags(watch)
     watch.add_argument("--interval", type=float, default=2.0, help="Seconds between scans while changes are arriving")
     watch.add_argument("--max-interval", type=float, default=30.0, help="Longest idle backoff; 0 disables backoff")
+    watch.add_argument("--claim-window", type=float, default=90.0,
+                       help="Seconds to leave a fresh edit for its author to report before recording it as unclaimed. 0 records immediately, which costs the agent its attribution.")
 
     run = add("run", "Run an agent command with automatic CodeLedger lifecycle", json=False)
     run.add_argument("--agent", default="unknown")
@@ -282,21 +284,35 @@ def main(argv=None):
         # back to --interval the moment a change lands, so an active session
         # stays responsive without burning a core while nothing is happening.
         base = max(0.25, args.interval); ceiling = max(base, args.max_interval); delay = base
+        print(f"Leaving edits unclaimed for {args.claim_window:g}s so agents can report their own work.", flush=True)
+        waiting = 0
         with closing_session(ledger, session if not args.session else "", "watch stopped"):
             while True:
-                result = ledger.refresh(True, args.agent, session, args.request, observed=True)
+                # Recording an edit is destructive to attribution: afterwards the
+                # agent's own refresh finds nothing to report, so its work ends up
+                # credited to `unknown` with no request attached. The watcher
+                # therefore holds back anything edited within the claim window and
+                # only records what nobody claimed — a safety net rather than a
+                # competitor for the same change.
+                result = ledger.refresh(True, args.agent, session, args.request,
+                                        observed=True, settle_seconds=args.claim_window)
                 # The heartbeat is what lets a later run tell "this watcher is
                 # alive and nothing is happening" from "this watcher is gone".
                 ledger.touch_session(session, heartbeat=True)
+                unclaimed = result["scan"]["files_awaiting_claim"]
+                if unclaimed != waiting:
+                    waiting = unclaimed
+                    if unclaimed: print(f"{unclaimed} recent edit(s) pending — leaving them for their author to claim.", flush=True)
                 if result["change_id"] is not None:
-                    message = f"Recorded change #{result['change_id']}: {', '.join(result['files'])}"
+                    message = (f"Recorded UNCLAIMED change #{result['change_id']}: {', '.join(result['files'])}\n"
+                               f"  Nobody reported these within {args.claim_window:g}s, so they are attributed to "
+                               f"'unknown'. If an agent made them, have it call refresh itself next time.")
                     if result.get("scope", {}).get("status") == "WARNING": message += f"\nSCOPE WARNING: {result['scope']['unexpected_files']}"
-                    if result.get("attribution_note"): message += f"\nATTRIBUTION: {result['attribution_note']}"
                     if result.get("conflicts"): message += f"\n{result['conflicts']['message']}"
                     print(json.dumps(result) if args.as_json else message, flush=True)
                     delay = base
                 else:
-                    delay = min(ceiling, delay * 1.5)
+                    delay = base if unclaimed else min(ceiling, delay * 1.5)
                 time.sleep(delay)
         return 0
     if args.command == "run":

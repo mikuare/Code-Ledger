@@ -361,18 +361,126 @@ CodeLedger — every file check is a round-trip to the Windows filesystem driver
 ### About the watcher
 
 `codeledger watch` costs a full scan per poll, and everything it records is
-`unknown` at `LOW` confidence anyway. **Prefer letting each agent call `refresh`
-itself** — cheaper and more trustworthy.
+`unknown` at `LOW` confidence. **Letting each agent call `refresh` itself is
+both cheaper and more trustworthy** — that is the main path.
 
-If you do want it running on `/mnt/c`, slow it down so polls do not overlap:
+The watcher is the safety net for what nobody reports: an agent that crashed
+before refreshing, a formatter, a `git checkout`, your own edits in another
+editor.
+
+**It waits before claiming anything.** Recording an edit is destructive to
+authorship — once a file matches the index, the author's own refresh finds
+nothing left to report, so the work would be credited to `unknown` with no
+request attached, which also strips the request text that `progress` needs to
+detect a repeated attempt. So the watcher leaves fresh edits alone for
+`--claim-window` seconds (default 90) and records only what nobody claimed:
+
+```text
+1 recent edit(s) pending — leaving them for their author to claim.
+
+Recorded UNCLAIMED change #1: login.py
+  Nobody reported these within 90s, so they are attributed to 'unknown'.
+  If an agent made them, have it call refresh itself next time.
+```
+
+That message is a useful signal in itself: if you keep seeing "UNCLAIMED" for
+work an agent did, that agent is not calling `refresh` and you are losing
+attribution and repeat detection.
+
+On `/mnt/c`, slow the polling so scans do not overlap:
 
 ```bash
 codeledger watch --agent codex --interval 15 --max-interval 60
 ```
 
+Set `--claim-window 0` only if you want the old behaviour of recording
+immediately, and accept that agents lose credit for their own work.
+
 ---
 
-## 10. Known limits
+## 10. Cheat sheet
+
+Each project gets **its own** virtual environment. Do not activate a shared venv
+living inside the CodeLedger source folder — every project would then run
+whichever version that one environment happens to hold, and you could not
+upgrade projects independently.
+
+```text
+FIRST TIME (once per project)
+─────────────────────────────
+cd /path/to/project
+python3 -m venv .venv
+.venv/bin/pip install "code-ledger[languages] @ git+https://github.com/mikuare/Code-Ledger.git"
+.venv/bin/codeledger init
+.venv/bin/codeledger setup-agent claude-code      # and/or codex
+.venv/bin/codeledger doctor
+
+
+EVERY DAY
+─────────
+cd /path/to/project
+.venv/bin/codeledger refresh --changed     # catch up on edits made while away
+
+Then open Claude / Codex and work normally.
+The agents query and refresh themselves over MCP.
+
+
+TWO AGENTS AT ONCE
+──────────────────
+.venv/bin/codeledger session start --agent claude-code --request "today's task"
+.venv/bin/codeledger session start --agent codex --request "their task"
+
+Required for conflict warnings — MCP has no session tool, so without this
+`active_agents` stays empty and overlaps are never reported.
+
+
+AFTER YOU EDIT FILES YOURSELF
+─────────────────────────────
+.venv/bin/codeledger refresh --changed
+
+
+AFTER A CRASH, OR CLOSING WSL
+─────────────────────────────
+.venv/bin/codeledger doctor
+.venv/bin/codeledger refresh --changed
+
+
+AFTER UPGRADING CODELEDGER
+──────────────────────────
+.venv/bin/pip install --upgrade "code-ledger[languages] @ git+https://github.com/mikuare/Code-Ledger.git"
+.venv/bin/codeledger --version      # confirm the number actually moved
+.venv/bin/codeledger init           # refresh the agent protocol files
+
+The database migrates itself on the first command. History is preserved.
+`init` overwrites CLAUDE.md / AGENTS.md / CODEX.md — back them up if edited.
+
+
+WATCHER — optional safety net, not the main path
+────────────────────────────────────────────────
+Normally: don't run it. Agents refreshing themselves is cheaper and gives
+HIGH-confidence attribution.
+
+Run it when something edits files without reporting — a crash-prone agent,
+a formatter, a teammate:
+
+.venv/bin/codeledger watch --agent codex --interval 15 --max-interval 60
+
+It holds fresh edits for 90s (--claim-window) so their author can claim them,
+then records only what nobody did, as `unknown` / LOW.
+```
+
+If you prefer not to type `.venv/bin/` every time, activate it for the shell
+session instead — but activate the **project's** environment, not CodeLedger's:
+
+```bash
+cd /path/to/project
+source .venv/bin/activate
+codeledger doctor
+```
+
+---
+
+## 11. Known limits
 
 - **No session tool over MCP.** Agents must be registered with
   `codeledger session start` for conflict detection to work (see section 5).
@@ -381,7 +489,11 @@ codeledger watch --agent codex --interval 15 --max-interval 60
 - **Comment detection needs grammars.** Without `[languages]`, non-Python files
   report a comment edit as a code change, flagged `LOW confidence`.
 - **The watcher is a foreground process.** It dies with its terminal, and cannot
-  be attributed. It is a safety net, not the main path.
+  attribute what it sees. It is a safety net, not the main path.
+- **The watcher records deletions immediately**, without waiting out the claim
+  window — a deleted file has no mtime to age. So if an agent deletes a file and
+  the watcher polls before the agent reports, that deletion is credited to
+  `unknown`. Edits, which are the common case, are held for their author.
 - **`--json` must come after the subcommand.** `codeledger status --json` works;
   `codeledger --json status` is silently ignored.
 - **Not yet proven in long-running real-world use.** The test suite is thorough

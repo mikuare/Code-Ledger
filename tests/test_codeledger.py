@@ -265,6 +265,62 @@ class EffectClassificationTests(unittest.TestCase):
             self.assertEqual(owner, "codex", "a comment must not transfer credit for the code")
 
 
+class WatcherClaimWindowTests(unittest.TestCase):
+    """The watcher is a safety net, not a competitor for the same change.
+
+    Indexing an edit is destructive to attribution: once the file matches the
+    index, the author's own refresh finds nothing left to record. A watcher that
+    polled first therefore took the change, credited it to `unknown`, and — with
+    no request text attached — left `progress` reporting NO_PRIOR_ATTEMPTS for
+    work that had just happened, disabling repeat detection entirely.
+    """
+
+    def _edited(self, directory):
+        root=Path(directory); source=root/"login.py"
+        source.write_text("def login(u):\n    return u\n")
+        ledger=Ledger(root); ledger.init()
+        ledger.start_session("claude-code", "fix login timeout")
+        source.write_text("def login(u):\n    return u is not None\n")
+        return root, ledger
+
+    def test_the_watcher_leaves_a_fresh_edit_for_its_author_to_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, ledger = self._edited(directory)
+            watched = ledger.refresh(changed_only=True, agent="codex", session="w",
+                                     observed=True, settle_seconds=90)
+            self.assertIsNone(watched["change_id"], "a fresh edit must not be recorded yet")
+            self.assertEqual(watched["scan"]["files_awaiting_claim"], 1)
+
+            claimed = ledger.refresh(changed_only=True, agent="claude-code", request="fix login timeout")
+            self.assertEqual(claimed["agent"], "claude-code")
+            self.assertEqual(claimed["attribution"]["confidence"], "HIGH")
+            self.assertEqual(ledger.db.execute("SELECT last_modified_by FROM symbols WHERE name='login'").fetchone()[0],
+                             "claude-code")
+            # The part that actually matters: repeat detection still works.
+            self.assertEqual(ledger.progress("fix login timeout")["status"], "PROGRESSING")
+
+    def test_an_edit_nobody_claims_is_still_recorded_eventually(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, ledger = self._edited(directory)
+            # Nothing reported it, and the window has passed.
+            old = time.time() - 600
+            os.utime(root/"login.py", (old, old))
+            result = ledger.refresh(changed_only=True, agent="codex", session="w",
+                                    observed=True, settle_seconds=90)
+            self.assertIsNotNone(result["change_id"], "the safety net must still catch it")
+            self.assertEqual(result["agent"], "unknown")
+            self.assertEqual(result["attribution"]["confidence"], "LOW")
+            self.assertEqual(result["scan"]["files_awaiting_claim"], 0)
+
+    def test_an_agent_refresh_never_waits(self):
+        """Only the watcher holds back. An agent reporting its own work must not."""
+        with tempfile.TemporaryDirectory() as directory:
+            root, ledger = self._edited(directory)
+            result = ledger.refresh(changed_only=True, agent="claude-code", request="fix login timeout")
+            self.assertIsNotNone(result["change_id"])
+            self.assertEqual(result["scan"]["files_awaiting_claim"], 0)
+
+
 class ConflictTests(unittest.TestCase):
     def test_the_same_symbol_outranks_merely_the_same_file(self):
         with tempfile.TemporaryDirectory() as directory:
