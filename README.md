@@ -20,7 +20,9 @@ Its one design rule: **never assert what it cannot back up.** Unknown authorship
 
 CodeLedger is a local-first, SQLite-backed project memory and change-intelligence CLI for coding agents and human developers. It indexes file hashes and symbols incrementally, preserving deleted symbols as historical evidence instead of inventing authorship or intent.
 
-For the complete installation and daily workflow, see [docs/SETUP_AND_WORKFLOW.md](docs/SETUP_AND_WORKFLOW.md).
+**New here? Start with [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** — first setup, the daily loop, and what to do when WSL, your IDE, or an agent closes unexpectedly.
+
+For the command-level reference, see [docs/SETUP_AND_WORKFLOW.md](docs/SETUP_AND_WORKFLOW.md).
 
 ## Quick start
 
