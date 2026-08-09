@@ -22,6 +22,10 @@ class Config:
     # IDLE still counts as a live session; only STALE stops counting.
     session_idle_seconds: int = 900
     session_stale_seconds: int = 3600
+    # Advice only. When a runtime reports its context usage and it passes this,
+    # `session_state` says a checkpoint is recommended; CodeLedger never acts on
+    # it by itself and never interrupts an agent mid-task.
+    checkpoint_threshold_pct: int = 80
 
     @classmethod
     def load(cls, root: Path) -> "Config":

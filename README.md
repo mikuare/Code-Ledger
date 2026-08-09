@@ -311,7 +311,130 @@ CodeLedger includes a local stdio MCP server. Configure an MCP-capable agent to 
 codeledger mcp --root /path/to/project
 ```
 
-Available tools include context retrieval, symbol lookup, impact analysis, history, issues, decisions, and incremental refresh. The server never sends source code over the network.
+Available tools include context retrieval, symbol lookup, impact analysis, history, issues, decisions, session checkpoints, resume, and incremental refresh. The server never sends source code over the network.
+
+The MCP server starts a session when the agent connects and ends it when the agent disconnects, so checkpoints, heartbeats, and conflict detection work without the user running anything.
+
+## Continuing work across sessions
+
+A conversation is temporary. When it approaches the model's context limit, the first thing compressed away is usually the most expensive to recover: which approaches were already tried and failed. The next session then re-reads the repository, rediscovers the state, and repeats the failed attempt — because nothing recorded that it failed.
+
+A checkpoint moves that knowledge out of the conversation and into the project:
+
+```bash
+codeledger resume "Fix authentication timeout"
+```
+
+```text
+CODELEDGER SESSION RESUME
+
+Previous objective:
+   Fix authentication timeout
+
+Recorded by:
+   claude-code (provider anthropic, model UNKNOWN), confidence HIGH
+
+Completed:
+   - identified the timeout source
+
+Unresolved:
+   - production verification
+
+Failed approaches:
+   - raising the client-side timeout did nothing
+
+Recommended next action:
+   run production verification
+
+Estimated context: 313 tokens
+Files avoided: 1,284 of 1,285 — repository-wide scan NOT REQUIRED
+```
+
+Three things make this trustworthy rather than merely convenient:
+
+**Selection is by task, not by recency.** A checkpoint about dashboard CSS is not loaded for a payments task. When nothing matches, CodeLedger says `NO_RELEVANT_CHECKPOINT` and lists the open goals instead of promoting an unrelated one — unrelated context is worse than none.
+
+**A checkpoint never outranks the source.** It is an AI summary, the lowest rank in the ordering below. Every file and symbol it names is re-checked against the source at resume time; anything that no longer holds is dropped from the body and reported under `stale_items` with the reason.
+
+**CodeLedger does not write the summary itself.** It cannot see the conversation, so it assembles what it observed — changes, files, symbols, verifications — and the agent supplies the goal, the rationale, the failed attempts, and the next action. A summary invented from a file list would read exactly as confident as one an agent actually wrote. When a session ends without a checkpoint, the mechanical fallback records only what was observed, marks itself LOW confidence, and says `NOT RECORDED` where the next action should be.
+
+Agents following the protocol file do this on their own. The manual commands exist for inspection:
+
+```bash
+codeledger checkpoint list          # what has been recorded
+codeledger checkpoint state         # what this session would checkpoint
+codeledger checkpoint create --goal "..." --next-action "..."
+```
+
+## Before writing new code
+
+`plan` answers two questions the source alone does not: what a change would
+reach, and whether the project already does this.
+
+```bash
+codeledger plan "Remove the theme color"
+```
+
+```text
+Risk: HIGH
+
+SHARED DEPENDENCY — a change here reaches 6 file(s) across 6 area(s) [HIGH]
+   ThemeProvider (src/theme/ThemeProvider.tsx)
+      areas: Dashboard, Landing, Orders, Payment, Queue, SharedDrawer
+      - defined under a shared location (src/theme)
+      - named like shared infrastructure (ThemeProvider)
+
+SCOPE AMBIGUITY
+   'ThemeProvider' is shared: it affects Dashboard, Landing, Orders, Payment,
+   Queue, SharedDrawer. The request does not say which of those it applies to.
+```
+
+The dependency graph always knew this; `plan` used to report only the file the
+symbol was *defined* in. It now reports the blast radius, from indexed queries
+only — planning never scans the working tree.
+
+**Scope ambiguity is judged on five signals**, not just "more than one file":
+how many areas depend on the symbol, whether it is shared by design (location,
+name, and measured spread — conventions can lie, the measurement cannot), the
+size of the radius, whether the request already names a scope, and the intent.
+A request that names its scope is never questioned. Adding to a shared module
+is not ambiguous, because it changes nothing for existing dependents. A plain
+helper used by two areas is not ambiguous either — warning there is how a guard
+teaches agents to ignore it.
+
+**Absence of evidence is never reported as safety.** If the files behind an
+answer are analysed shallowly, confidence drops to `LOW` and a caveat says the
+dependency graph is incomplete. A small dependent list is unproven, not proof
+that a change is contained.
+
+### Reusing what already exists
+
+`handshake` compares the plan an agent proposes against what the project has:
+
+```bash
+codeledger handshake "Make this new button open the same kind of panel" \
+  --ai-plan "I will create a new CheckoutFlyout with its own slide animation and open/close state."
+```
+
+```text
+POSSIBLE DUPLICATE IMPLEMENTATION
+   Plan creates: CheckoutFlyout
+   Existing implementation to inspect or reuse:
+      OrderPanel        src/components/OrderPanel.tsx    (matches the request)
+      SharedDrawer      src/components/SharedDrawer.tsx  (used by the existing implementation)
+      useDrawerState    src/state/drawerState.ts         (used by the existing implementation)
+```
+
+It reads the dependency edges forwards one hop, so it names the whole existing
+flow rather than only its entry point — the shared drawer and shared state
+underneath are what reuse actually means. It recommends and never rejects: a new
+implementation is sometimes correct, and when it is, the agent should say why.
+
+### Agent, provider, and model
+
+These are three separate facts and are recorded separately. An agent name says which program is running, not which model it is driving today, so the model is stored only when the runtime actually reports it and is `UNKNOWN` otherwise — never inferred from the agent name. An agent CodeLedger does not recognise is recorded as itself with a `generic` provider. Nothing in CodeLedger branches on which vendor an agent belongs to.
+
+If a runtime reports its context usage, pass `context_window` and `context_used` and CodeLedger will recommend a checkpoint past a configurable threshold (default 80%). Most runtimes report neither; the feature works identically without them, and CodeLedger never interrupts an agent mid-task.
 
 For Codex, initialize the integration once from the project directory:
 

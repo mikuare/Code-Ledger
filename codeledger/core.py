@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import uuid
@@ -11,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
-from .agents import identify
+from .agents import UNKNOWN, identify, resolve_model
 from .config import Config
 from .db import connect
 from .git import commit_files, commits, head, status as git_status
@@ -41,6 +42,32 @@ RACE_WINDOW_NS = 2_000_000_000
 # minutes — so both count when deciding who is working on the project. The rest
 # are terminal, and are kept rather than deleted: history is the product.
 LIVE = ("active", "idle")
+# What a checkpoint may hold. The first four are the agent's own words; the rest
+# point at rows that already exist, so a checkpoint never becomes a second copy
+# of the ledger that can disagree with it.
+CHECKPOINT_KINDS = ("accomplished", "unresolved", "failed_attempt", "question",
+                    "decision", "issue", "verification", "file", "symbol")
+# Directories that hold siblings rather than being an area themselves. A change
+# affecting `pages/Landing` and `pages/Payment` affects two areas, not one — so
+# under these the file is the area, and everywhere else the directory is.
+CONTAINER_DIRS = {"pages", "routes", "views", "screens", "components", "modules", "features",
+                  "apps", "packages", "services", "controllers", "handlers", "widgets", "containers"}
+# Where code that is shared on purpose tends to live, and what it tends to be
+# called. Only ever a signal — never sufficient on its own to warn, because a
+# path is not evidence of anything by itself.
+SHARED_PATH_HINTS = {"shared", "common", "core", "global", "theme", "themes", "styles", "design-system",
+                     "providers", "provider", "context", "contexts", "store", "stores", "state",
+                     "hooks", "lib", "libs", "util", "utils", "config", "ui"}
+SHARED_NAME_HINTS = ("provider", "context", "theme", "store", "config", "global", "shared", "registry", "layout")
+# Thresholds for calling a request ambiguous. Deliberately conservative: a
+# warning that fires on ordinary local work trains an agent to ignore warnings.
+AMBIGUITY_MIN_AREAS = 2
+AMBIGUITY_LONE_AREAS = 3
+AMBIGUITY_LONE_FILES = 5
+# Roughly four characters per token. Deliberately crude: CodeLedger takes no
+# tokenizer dependency, and every figure derived from this is labelled an
+# estimate rather than presented as a measurement.
+CHARS_PER_TOKEN = 4
 # 'completed' and 'failed' predate this vocabulary and still exist in older
 # databases. They mean the same as 'ended' and are never rewritten.
 ENDED = ("ended", "completed", "failed")
@@ -113,6 +140,24 @@ class Ledger:
 
 Before changing code, analyze the user request (CLI: `codeledger prompt \"<task>\"`; MCP: `codeledger_analyze_prompt`), then query CodeLedger pre-change intelligence (CLI: `codeledger plan \"<task>\"`; MCP: `codeledger_get_plan`) and context (MCP: `codeledger_get_context`). Review relevant symbols, history, issues, decisions, impact, risk, constraints, acceptance criteria, and suggested tests before inspecting broad source areas. State your proposed files, implementation, and tests, then submit it for alignment (CLI: `codeledger handshake \"<task>\" --ai-plan \"<plan>\"`; MCP: `codeledger_task_handshake`). If the handshake warns, revise the plan before editing. Prefer targeted inspection; avoid repository-wide scans when CodeLedger says they are unnecessary. After changing code, refresh/record changed files (CLI: `codeledger refresh --changed`; MCP: `codeledger_refresh`), review any scope `WARNING`, run affected tests, and record verification evidence. If verification fails after a previous pass, query regressions (MCP: `codeledger_get_regressions`).
 
+## Before writing new code: what already exists, and what a change would reach
+
+`plan` answers two questions the source alone does not, and both change what you should do next.
+
+**`shared_dependencies` / `blast_radius`** — the symbol you are about to change is used elsewhere. The report names the files and the areas a change reaches. Read them before editing. Do not treat a small or empty dependent list as proof a change is contained: check `blast_radius.confidence` and `coverage_caveat` first, because a shallowly analysed file records its edges conservatively and `LOW` confidence means the evidence is incomplete, not that the change is safe.
+
+**`scope_ambiguity`** — the request touches something shared and never says how widely it should apply. Ask the user which scope they meant, offering the affected areas. Do not silently pick one, and do not change all of them on the assumption that wider is safer. When the request already names a scope, no question is raised and none should be invented.
+
+`handshake` adds a third: **`duplicate_implementation`** means your plan creates something this project appears to already have, and lists the existing symbols to inspect. Read them and reuse or extend them if they fit. It is a recommendation, not a rejection — a new implementation is sometimes right, and when it is, say why rather than proceeding silently.
+
+## Continuing work from a previous session
+
+Your context window is temporary; this project's memory is not. At the **start** of a session, before reading source files, ask whether this task has been worked on before (CLI: `codeledger resume \"<task>\"`; MCP: `codeledger_get_resume` with the user's request as `task`). Selection is by relevance, so an unrelated previous task is never loaded — a `NO_RELEVANT_CHECKPOINT` answer means start fresh. When a checkpoint is returned, read `next_action` first, then `failed_attempts`: those are approaches already known not to work, and repeating them is the specific waste this exists to prevent. Everything in a resume package has been re-checked against the current source; anything that no longer holds is listed under `stale_items` and must not be trusted.
+
+Before a session **ends**, or when your context is running low, record a checkpoint (MCP: `codeledger_get_session_state`, then `codeledger_record_checkpoint`). CodeLedger assembles what it observed — changes, files, symbols, verifications — but it cannot see your conversation, so you must supply `goal`, `current_state`, what was accomplished, what failed, what is unresolved, and the single `next_action` that would most help whoever continues. If your runtime reports context usage, pass `context_window` and `context_used`; if it does not, omit them and everything still works.
+
+A checkpoint is a summary, and summaries rank below source code, the filesystem, tests, and recorded changes. Never let one override what the code currently says.
+
 ## Working alongside another agent
 
 More than one agent may be editing this project. At the start of a turn, ask what changed while you were not looking (CLI: `codeledger since --agent <your name>`; MCP: `codeledger_get_changes_since` with your own agent name). It reports the files and symbols another agent changed since you last recorded anything, so you do not overwrite work you cannot see. If another agent is live, check for overlap before editing (MCP: `codeledger_check_conflicts` with your name and the files/symbols you intend to touch). A shared symbol is a stronger warning than a shared file: re-read that symbol before changing it.
@@ -138,7 +183,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 path.write_text(text, encoding="utf-8")
         integration = self.root / ".ai" / "codeledger" / "agent-integration.md"
         integration.parent.mkdir(parents=True, exist_ok=True)
-        integration.write_text("# CodeLedger Agent Integration\n\n## One-time Codex setup\n\nRun `codeledger setup-codex` from this project. It registers the local MCP server with Codex using the absolute project path. Start a new Codex session after setup if Codex was already running.\n\n## Persistent workflow\n\nRun `codeledger watch --agent codex` in a second terminal and leave it running while Codex works. The watcher records changed files and symbols without requiring `status` or `changes` after every task.\n\n## MCP tools\n\nCodex can call `codeledger_get_context`, `codeledger_find_symbol`, `codeledger_get_impact`, `codeledger_get_history`, `codeledger_get_recent_changes`, `codeledger_get_issues`, `codeledger_get_decisions`, `codeledger_record_change`, and `codeledger_mark_verified` during an ongoing conversation.\n", encoding="utf-8")
+        integration.write_text("# CodeLedger Agent Integration\n\n## One-time Codex setup\n\nRun `codeledger setup-codex` from this project. It registers the local MCP server with Codex using the absolute project path. Start a new Codex session after setup if Codex was already running.\n\n## Persistent workflow\n\nRun `codeledger watch --agent codex` in a second terminal and leave it running while Codex works. The watcher records changed files and symbols without requiring `status` or `changes` after every task.\n\n## MCP tools\n\nCodex can call `codeledger_get_resume`, `codeledger_get_context`, `codeledger_find_symbol`, `codeledger_get_impact`, `codeledger_get_history`, `codeledger_get_recent_changes`, `codeledger_get_issues`, `codeledger_get_decisions`, `codeledger_record_change`, `codeledger_mark_verified`, `codeledger_get_session_state`, and `codeledger_record_checkpoint` during an ongoing conversation.\n\n## Continuing across sessions\n\nCall `codeledger_get_resume` at the start of a session and `codeledger_record_checkpoint` before it ends. The MCP server starts and ends its own session, so no setup is needed for this to work.\n", encoding="utf-8")
 
     def _stat_all(self, candidates: list[tuple[str, str]], metrics: DiscoveryMetrics):
         """Stat every candidate file, in parallel only where that actually helps.
@@ -314,14 +359,22 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if reconcile: self.reconcile_sessions()
         return sorted({row["agent"] for row in self._session_rows(LIVE) if row["agent"]})
 
-    def touch_session(self, session_id: str, heartbeat: bool = False) -> None:
+    def touch_session(self, session_id: str, heartbeat: bool = False, revive: bool = False) -> None:
         """Record that a session is still alive. Cheap enough to call per poll."""
         if not session_id: return
         column = "last_heartbeat_at" if heartbeat else "last_activity_at"
         # A heartbeat is also activity; recording both keeps a session that only
         # ever heartbeats from ageing into STALE while its process is healthy.
-        self.db.execute(f"UPDATE sessions SET {column}=?, last_activity_at=? WHERE session_id=? AND status IN ({','.join('?' * len(LIVE))})",
-                        (NOW(), NOW(), session_id, *LIVE))
+        cursor = self.db.execute(f"UPDATE sessions SET {column}=?, last_activity_at=? WHERE session_id=? AND status IN ({','.join('?' * len(LIVE))})",
+                                 (NOW(), NOW(), session_id, *LIVE))
+        # A long-lived server that goes quiet for longer than the stale limit —
+        # a user away from the keyboard — is reconciled to STALE, and the update
+        # above then matches nothing, leaving it dead for the rest of the
+        # process's life. Work arriving on it is the strongest possible evidence
+        # it is alive, so the caller that owns the process can say so.
+        if revive and not cursor.rowcount:
+            self.db.execute("UPDATE sessions SET status='active',status_reason=?,end_time=NULL,last_activity_at=?,last_heartbeat_at=? WHERE session_id=?",
+                            ("activity resumed on a session that had been reconciled as inactive", NOW(), NOW(), session_id))
         self.db.commit()
 
     def _begin_immediate(self) -> None:
@@ -767,9 +820,144 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                       "files_avoided": max(0, total - len(paths)), "symbols_returned": len(matches[:20]),
                       "changes_returned": len(recent), "full_scan_required": not bool(matches or features),
                       "stale_records_reanalyzed": stale}
-        return {"query": query, "task_analysis": self.analyze_prompt(query), "features": features, "symbols": matches[:20], "files": paths[:20], "recent_changes": recent, "known_issues": issues, "decisions": decisions, "scan_required": not bool(matches or features), "efficiency": efficiency}
+        # The matches are already computed; handing them over keeps the scope
+        # analysis from repeating the symbol search on every context call.
+        return {"query": query, "task_analysis": self.analyze_prompt(query, symbols=matches), "features": features, "symbols": matches[:20], "files": paths[:20], "recent_changes": recent, "known_issues": issues, "decisions": decisions, "scan_required": not bool(matches or features), "efficiency": efficiency}
 
-    def analyze_prompt(self, prompt: str) -> dict:
+    def _area_for_path(self, rel: str) -> str:
+        """The part of the system a file belongs to, for reporting blast radius.
+
+        Naming the directory would collapse `pages/Landing` and `pages/Payment`
+        into one "pages", which is exactly the distinction a user needs when
+        deciding how widely a shared change should apply. Under a container
+        directory the file is the area; elsewhere the directory is.
+        """
+        parts = Path(rel).parts
+        if len(parts) >= 2 and parts[-2].lower() in CONTAINER_DIRS:
+            return Path(rel).stem
+        if len(parts) >= 2:
+            return parts[-2]
+        return Path(rel).stem
+
+    def _areas(self, paths) -> list[str]:
+        return sorted({self._area_for_path(path) for path in paths})
+
+    def _shared_signals(self, symbol: dict, areas: list[str]) -> tuple[bool, list[str]]:
+        """Is this symbol shared on purpose, rather than merely used twice?
+
+        Three independent signals, because none is sufficient alone: where it
+        lives, what it is called, and how widely it is actually depended on.
+        Path and name are conventions and can lie; the dependency count is
+        measured. A symbol is called shared when the measurement agrees with at
+        least one convention, or when the measurement alone is emphatic.
+        """
+        reasons = []
+        lowered_path = (symbol.get("path") or "").lower()
+        if any(part in SHARED_PATH_HINTS for part in Path(lowered_path).parts):
+            reasons.append(f"defined under a shared location ({Path(lowered_path).parent.as_posix()})")
+        name = (symbol.get("name") or "").lower()
+        if any(hint in name for hint in SHARED_NAME_HINTS):
+            reasons.append(f"named like shared infrastructure ({symbol.get('name')})")
+        if len(areas) >= AMBIGUITY_LONE_AREAS:
+            reasons.append(f"depended on from {len(areas)} distinct areas")
+        return bool(reasons), reasons
+
+    def shared_dependencies(self, symbols: list[dict], limit: int = 5) -> dict:
+        """Which of these symbols are shared, and what would a change to them reach?
+
+        Uses the indexed dependency graph only (`fallback=False`). The scanning
+        fallback in `impact` reads the whole working tree, which is the right
+        trade when an agent has explicitly asked about one symbol and the wrong
+        one on every planning call. The cost of that choice is that absence of
+        evidence gets weaker here, which is why coverage travels with the answer
+        instead of being dropped.
+        """
+        entries, reached, defining = [], set(), []
+        for symbol in symbols[:limit]:
+            name, path = symbol.get("name"), symbol.get("path")
+            if not name: continue
+            defining.append(path)
+            referencing = [item for item in self.impact(name, fallback=False)["referencing_files"] if item != path]
+            if not referencing: continue
+            areas = self._areas(referencing)
+            shared, reasons = self._shared_signals(symbol, areas)
+            reached.update(referencing)
+            entries.append({"symbol": name, "defined_in": path, "shared": shared, "why_shared": reasons,
+                            "dependent_files": referencing, "areas": areas,
+                            "dependent_count": len(referencing), "area_count": len(areas)})
+        # Coverage decides how much an empty answer is worth. A shallowly parsed
+        # file had its edges recorded conservatively, so "nothing depends on
+        # this" from such a file is not a finding — it is a gap.
+        shallow = [row["path"] for row in self.db.execute(
+            f"SELECT path,coverage FROM files WHERE path IN ({','.join('?' * len(defining))})", defining)
+            if (row["coverage"] or SHALLOW) != FULL] if defining else []
+        confidence = "UNKNOWN" if not symbols else "LOW" if shallow else "HIGH"
+        caveat = None
+        if shallow:
+            caveat = (f"{len(shallow)} of the defining file(s) are analysed shallowly, so the dependency graph for "
+                      f"them is incomplete: {', '.join(sorted(shallow)[:5])}. Treat an empty or small dependent list "
+                      f"as unproven rather than as evidence that a change is contained. "
+                      f"{capabilities()['install_hint']}")
+        elif not symbols:
+            caveat = "No indexed symbol matched this request, so no dependency evidence exists either way."
+        entries.sort(key=lambda item: (-item["area_count"], -item["dependent_count"], item["symbol"]))
+        return {"shared_dependencies": entries,
+                "blast_radius": {"files": sorted(reached), "areas": self._areas(reached),
+                                 "file_count": len(reached), "area_count": len(self._areas(reached)),
+                                 "confidence": confidence},
+                "coverage_caveat": caveat}
+
+    def _scope_ambiguity(self, analysis: dict, shared: dict) -> dict | None:
+        """Does this request fail to say how widely it should apply?
+
+        Ambiguity is not "more than one file changed" — that is most work. It is
+        a request that touches something deliberately shared, spans parts of the
+        system the user did not mention, and never says which of them it meant.
+        Any one of those alone is ordinary; together they mean the agent is about
+        to pick a scope on the user's behalf and be confidently wrong.
+
+        A request that names its own scope is never ambiguous, however wide it
+        reaches: the user already answered the question.
+        """
+        entries = shared["shared_dependencies"]
+        if not entries: return None
+        radius = shared["blast_radius"]
+        areas = radius["areas"]
+        if len(areas) < AMBIGUITY_MIN_AREAS: return None
+        # The user naming an affected area, or any path, settles it.
+        text = analysis["normalized"].lower()
+        named = [area for area in areas if re.search(r"\b" + re.escape(area.lower()) + r"\b", text)]
+        if named or analysis["paths"]:
+            return None
+        explicitly_shared = [item for item in entries if item["shared"]]
+        # Two areas alone is weak evidence — plenty of local helpers are used
+        # twice. It needs a second signal: something shared by design, or a
+        # radius wide enough to speak for itself.
+        if not (explicitly_shared or len(areas) >= AMBIGUITY_LONE_AREAS or radius["file_count"] >= AMBIGUITY_LONE_FILES):
+            return None
+        # Adding to a shared module does not change what its existing dependents
+        # already do, so there is usually no scope to settle: "add a helper to
+        # drawerState" needs no interrogation. Only a genuinely wide radius
+        # overrides that, since a broad addition can still be a broad decision.
+        if analysis["intent"] == "feature" and radius["file_count"] < AMBIGUITY_LONE_FILES:
+            return None
+        subject = explicitly_shared[0] if explicitly_shared else entries[0]
+        reasons = list(subject["why_shared"]) or [f"used across {len(areas)} areas"]
+        return {
+            "status": "SCOPE_AMBIGUOUS", "subject": subject["symbol"], "defined_in": subject["defined_in"],
+            "affected_areas": areas, "affected_files": radius["files"],
+            "evidence": reasons, "confidence": radius["confidence"],
+            "question": (f"'{subject['symbol']}' is shared: it affects {', '.join(areas)}. "
+                         f"The request does not say which of those it should apply to."),
+            # Never nominate one area as the default: the alphabetically first
+            # affected area is not a guess worth putting in the user's mouth.
+            "options": [f"one area only — ask which of: {', '.join(areas)}", "all affected areas",
+                        "a specific subset the user names"],
+            "guidance": ("Ask the user which scope is intended before editing. Do not choose one silently, and do "
+                         "not change every area on the assumption that wider is safer."),
+        }
+
+    def analyze_prompt(self, prompt: str, scope: bool = True, symbols: list[dict] | None = None) -> dict:
         text = " ".join(prompt.strip().split()); lower = text.lower()
         first = re.match(r"(?:please\s+)?([a-z]+)", lower)
         verb = first.group(1) if first else "investigate"
@@ -789,7 +977,20 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if intent == "feature" and not acceptance: questions.append("Confirm how success should be verified and which existing UI/API should be extended.")
         if intent == "recovery" and not data_sources: questions.append("Which source of truth should be used: project files, Git history, database, or browser/runtime storage?")
         if data_sources and intent == "recovery": questions.append("Is the requested runtime data backed up or exported, or should the system create a new persistence path?")
-        return {"original": prompt, "normalized": text, "intent": intent, "verb": verb, "areas": areas, "paths": paths, "constraints": constraints, "preservation_constraints": preservation, "data_sources": data_sources, "acceptance_criteria": acceptance, "risk": risk, "clarifying_questions": questions}
+        result = {"original": prompt, "normalized": text, "intent": intent, "verb": verb, "areas": areas, "paths": paths, "constraints": constraints, "preservation_constraints": preservation, "data_sources": data_sources, "acceptance_criteria": acceptance, "risk": risk, "clarifying_questions": questions}
+        # Off by default for callers that only want the text reading of a
+        # request — `record_change` derives `risk` on every refresh and must not
+        # pay for dependency queries to do it.
+        if scope:
+            matched = symbols if symbols is not None else self.search_symbols(prompt)
+            shared = self.shared_dependencies(matched)
+            result.update(shared_dependencies=shared["shared_dependencies"], blast_radius=shared["blast_radius"],
+                          coverage_caveat=shared["coverage_caveat"])
+            ambiguity = self._scope_ambiguity(result, shared)
+            result["scope_ambiguity"] = ambiguity
+            if ambiguity:
+                questions.append(ambiguity["question"] + " Ask which scope is intended before editing.")
+        return result
 
     def scope_check(self, request: str, changed_files: list[str], changed_symbols: list[str] | None = None) -> dict:
         """Conservative post-change scope check; missing evidence is never SAFE."""
@@ -837,10 +1038,30 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         context = self.context(request); symbols = context["symbols"][:20]; impact_files = set(context["files"])
         for symbol in symbols:
             impact_files.update(row["path"] for row in self.lookup(symbol["name"]))
-        risk = "UNKNOWN" if context["scan_required"] else "HIGH" if len(impact_files) > 10 else "MEDIUM" if len(impact_files) > 3 else "LOW"
-        recommendation = "Inspect the existing implementation before adding new code." if symbols else "Use targeted discovery; CodeLedger has no exact symbol match yet."
         analysis = context["task_analysis"]
-        return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols, "recent_changes": context["recent_changes"], "known_issues": context["known_issues"], "decisions": context["decisions"], "risk": "HIGH" if analysis["risk"] == "HIGH" else risk, "recommendation": recommendation, "full_scan_required": context["scan_required"], "suggested_tests": self.suggest_tests(sorted(impact_files), [symbol["name"] for symbol in symbols])}
+        # `lookup` above returns where each symbol is *defined*. What a change to
+        # it would reach is a different question, and the dependency graph has
+        # always been able to answer it — it simply was not asked here, so a plan
+        # for a shared symbol listed one file while the ledger knew of six.
+        radius = analysis.get("blast_radius") or {"files": [], "areas": [], "file_count": 0, "area_count": 0, "confidence": "UNKNOWN"}
+        shared = analysis.get("shared_dependencies") or []
+        impact_files.update(radius["files"])
+        risk = "UNKNOWN" if context["scan_required"] else "HIGH" if len(impact_files) > 10 else "MEDIUM" if len(impact_files) > 3 else "LOW"
+        if shared and radius["area_count"] >= AMBIGUITY_MIN_AREAS and risk in ("LOW", "MEDIUM"):
+            risk = "HIGH" if radius["area_count"] >= AMBIGUITY_LONE_AREAS else "MEDIUM"
+        if not symbols:
+            recommendation = "Use targeted discovery; CodeLedger has no exact symbol match yet."
+        elif shared:
+            names = ", ".join(item["symbol"] for item in shared[:3])
+            recommendation = (f"{names} {'are' if len(shared) > 1 else 'is'} shared: a change reaches {radius['file_count']} file(s) across "
+                              f"{', '.join(radius['areas'][:6])}. Read those before editing, and extend the existing "
+                              f"implementation rather than adding a parallel one.")
+        else:
+            recommendation = "Inspect the existing implementation before adding new code."
+        return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols,
+                "shared_dependencies": shared, "blast_radius": radius, "coverage_caveat": analysis.get("coverage_caveat"),
+                "scope_ambiguity": analysis.get("scope_ambiguity"),
+                "recent_changes": context["recent_changes"], "known_issues": context["known_issues"], "decisions": context["decisions"], "risk": "HIGH" if analysis["risk"] == "HIGH" else risk, "recommendation": recommendation, "full_scan_required": context["scan_required"], "suggested_tests": self.suggest_tests(sorted(impact_files), [symbol["name"] for symbol in symbols])}
 
     def since(self, marker: str = "", agent: str = "", limit: int = 50) -> dict:
         """What has changed since a point in time, and who did it.
@@ -936,6 +1157,22 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
     def _salient(self, text: str) -> set[str]:
         return {word.lower() for word in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text or "") if word.lower() not in STOPWORDS}
 
+    def _relevance(self, wanted: set[str], other: set[str]) -> tuple[float, list[str]]:
+        """Do two pieces of text describe the same task? 0.0 means no.
+
+        One shared word is not the same task: "fix the login timeout" and
+        "change the login button colour" would otherwise count as the same work.
+        A missed match is honest — it merely reports nothing found; a false one
+        tells an agent about work it never did. Both repeat detection and
+        checkpoint selection ask this question, and must answer it the same way.
+        """
+        overlap = wanted & other
+        smaller = min(len(wanted), len(other)) if wanted and other else 0
+        score = len(overlap) / smaller if smaller else 0.0
+        if score < 0.5 or (len(overlap) < 2 and smaller > 1):
+            return 0.0, sorted(overlap)
+        return score, sorted(overlap)
+
     def progress(self, request: str, limit: int = 20) -> dict:
         """Has work on this request actually achieved anything yet?
 
@@ -949,22 +1186,14 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         wanted = self._salient(request)
         attempts = []
         for row in self.db.execute("SELECT * FROM changes WHERE user_request IS NOT NULL AND user_request!='' ORDER BY id DESC LIMIT 200"):
-            other = self._salient(row["user_request"])
-            overlap = wanted & other
-            # One shared word is not the same task: "fix the login timeout" and
-            # "change the login button colour" would otherwise be counted as
-            # repeated attempts and produce a false REPEATING. A missed retry
-            # merely reports NO_PRIOR_ATTEMPTS, which is honest; a false one
-            # tells an agent to stop working on something it has never tried.
-            smaller = min(len(wanted), len(other)) if wanted and other else 0
-            score = len(overlap) / smaller if smaller else 0.0
-            if score < 0.5 or (len(overlap) < 2 and smaller > 1):
+            score, overlap = self._relevance(wanted, self._salient(row["user_request"]))
+            if not score:
                 continue
             symbols = [item["name"] for item in self.db.execute("SELECT name FROM change_symbols WHERE change_id=?", (row["id"],))]
             files = [item["path"] for item in self.db.execute("SELECT path FROM change_files WHERE change_id=?", (row["id"],))]
             attempts.append({"change_id": row["id"], "timestamp": row["timestamp"], "agent": row["agent"] or "unknown",
                              "request": row["user_request"], "effect": row["effect"] or "unknown",
-                             "matched_terms": sorted(overlap), "match_score": round(score, 2), "files": files, "symbols": symbols})
+                             "matched_terms": overlap, "match_score": round(score, 2), "files": files, "symbols": symbols})
             if len(attempts) >= limit:
                 break
         attempts.reverse()
@@ -1011,16 +1240,76 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 "repeated_symbols": repeated, "subjects": subjects, "verifications": after or verifications[:3],
                 "ineffective_attempts": len(ineffective), "guidance": guidance}
 
+    def _reusable_implementation(self, symbols: list[dict], limit: int = 8) -> list[dict]:
+        """What the matched symbols are built out of, one hop forward.
+
+        `impact` walks the dependency graph backwards to find dependents. The
+        same edges read forwards answer a different question: an existing flow is
+        rarely one symbol, and recommending only the entry point tells an agent
+        nothing about the shared drawer and shared state underneath it. One hop
+        is deliberate — two would drag in most of the project.
+        """
+        found: dict[str, dict] = {}
+        for symbol in symbols[:5]:
+            found.setdefault(symbol["name"], {"symbol": symbol["name"], "path": symbol["path"], "role": "matches the request"})
+        paths = [symbol["path"] for symbol in symbols[:5]]
+        if not paths: return []
+        for row in self.db.execute(
+                f"SELECT DISTINCT d.target_name FROM dependencies d JOIN files f ON f.id=d.source_file_id "
+                f"WHERE f.path IN ({','.join('?' * len(paths))}) AND d.kind IN ('uses','calls','imports')", paths):
+            name = row["target_name"]
+            if name in found: continue
+            target = self.db.execute(
+                "SELECT s.name,f.path FROM symbols s JOIN files f ON f.id=s.file_id "
+                "WHERE s.name=? AND s.status='active' LIMIT 1", (name,)).fetchone()
+            # Only names that resolve to something this project actually defines.
+            # Everything else is a library or a module path, not a flow to reuse.
+            if target:
+                found[name] = {"symbol": target["name"], "path": target["path"], "role": "used by the existing implementation"}
+        return list(found.values())[:limit]
+
+    def _proposed_new_symbols(self, plan_text: str) -> list[str]:
+        """Names the plan says it will create that this project does not have."""
+        candidates = set(re.findall(r"\b(?:creat\w+|add\w*|new|build\w*|implement\w*|introduc\w+|writ\w+)\s+"
+                                    r"(?:a\s+|an\s+|the\s+)?(?:new\s+)?([A-Z][A-Za-z0-9_]{2,})", plan_text))
+        candidates.update(re.findall(r"\b([A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+)\b", plan_text))
+        proposed = []
+        for name in sorted(candidates):
+            if not self.db.execute("SELECT 1 FROM symbols WHERE name=? AND status='active' LIMIT 1", (name,)).fetchone():
+                proposed.append(name)
+        return proposed
+
     def handshake(self, request: str, ai_plan: str = "") -> dict:
-        analysis = self.analyze_prompt(request); plan_text = " ".join(ai_plan.split()); lower = plan_text.lower()
+        matched = self.search_symbols(request)
+        analysis = self.analyze_prompt(request, symbols=matched); plan_text = " ".join(ai_plan.split()); lower = plan_text.lower()
         if not plan_text:
             return {"status": "AWAITING_AI_PLAN", "request": request, "task_analysis": analysis, "message": "Submit the AI's proposed files, changes, and tests before editing."}
         required = set(re.findall(r"[a-z][a-z0-9_-]{3,}", analysis["normalized"].lower()))
         mentioned = set(re.findall(r"[a-z][a-z0-9_-]{3,}", lower))
         missing_constraints = [constraint for constraint in analysis["preservation_constraints"] if not any(word in lower for word in re.findall(r"[a-z][a-z0-9_-]{3,}", constraint.lower()))]
         relevant = [area for area in analysis["areas"] if area not in lower]
-        status = "WARNING" if missing_constraints or (relevant and len(relevant) > 1) else "ALIGNED"
-        return {"status": status, "request": request, "task_analysis": analysis, "ai_plan": ai_plan, "missing_preservation_constraints": missing_constraints, "unmentioned_areas": relevant, "matched_terms": sorted(required & mentioned), "message": "Revise the plan before editing." if status == "WARNING" else "The AI plan covers the known task requirements."}
+        # Building a second implementation of something the project already has
+        # is the most expensive mistake an agent makes here, and nothing was
+        # looking for it: a plan to create a parallel component with its own
+        # animation and its own state read as perfectly ALIGNED.
+        proposed = self._proposed_new_symbols(plan_text)
+        reusable = self._reusable_implementation(matched) if proposed else []
+        duplicate = None
+        if proposed and reusable:
+            duplicate = {
+                "status": "POSSIBLE_DUPLICATE", "proposed_new": proposed[:5],
+                "existing_implementation": reusable,
+                "message": (f"The plan creates {', '.join(proposed[:3])}, and this project already has an "
+                            f"implementation the request matches: {', '.join(item['symbol'] for item in reusable[:5])}."),
+                "guidance": ("Inspect those before writing a parallel version, and extend or reuse them if they fit. "
+                             "This is a recommendation, not a rejection — a genuinely new implementation is sometimes "
+                             "correct, and if it is, say why."),
+            }
+        status = "WARNING" if missing_constraints or duplicate or (relevant and len(relevant) > 1) else "ALIGNED"
+        message = "The AI plan covers the known task requirements."
+        if status == "WARNING":
+            message = duplicate["message"] + " Consider reuse before editing." if duplicate else "Revise the plan before editing."
+        return {"status": status, "request": request, "task_analysis": analysis, "ai_plan": ai_plan, "missing_preservation_constraints": missing_constraints, "unmentioned_areas": relevant, "matched_terms": sorted(required & mentioned), "duplicate_implementation": duplicate, "scope_ambiguity": analysis.get("scope_ambiguity"), "message": message}
 
     def suggest_tests(self, changed_files: list[str] | None = None, symbols: list[str] | None = None) -> list[str]:
         changed_files, symbols = changed_files or [], symbols or []
@@ -1033,12 +1322,17 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             if any(Path(item).stem.lower() in low or Path(item).stem.lower() in source.lower() for item in changed_files) or any(re.search(r"\b" + re.escape(symbol) + r"\b", source) for symbol in symbols): candidates.append(rel)
         return sorted(set(candidates))
 
-    def start_session(self, agent: str, request: str = "", session_id: str | None = None, owns_process: bool = False) -> dict:
+    def start_session(self, agent: str, request: str = "", session_id: str | None = None, owns_process: bool = False,
+                      provider: str = "", model: str = "", model_version: str = "") -> dict:
         session_id = session_id or f"session-{uuid.uuid4().hex[:10]}"
         now = NOW()
         # The adapter seam exists so an unrecognised agent is recorded as a
         # generic provider rather than inventing a vendor for it.
         identified = identify(agent); agent = identified.name
+        # Which model is behind the agent is a separate question from which
+        # agent it is, and one only the runtime can answer. Unanswered is
+        # recorded as UNKNOWN rather than deduced from the agent's name.
+        runtime = resolve_model(agent, provider, model, model_version)
         self.db.execute("INSERT OR IGNORE INTO agents(name,provider,created_at) VALUES(?,?,?)", (agent, identified.provider, now))
         agent_id = self.db.execute("SELECT id FROM agents WHERE name=?", (agent,)).fetchone()[0]
         # A PID is only evidence when the process that recorded it stays alive
@@ -1047,11 +1341,12 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # its PID would make every such session look crashed within seconds.
         # Those sessions are judged by heartbeat and timeout instead.
         pid = os.getpid() if owns_process else None
-        self.db.execute("INSERT INTO sessions(session_id,agent_id,working_directory,start_time,request,pid,host,last_activity_at,last_heartbeat_at,status) VALUES(?,?,?,?,?,?,?,?,?,'active')",
-                        (session_id, agent_id, str(self.root), now, request, pid, socket.gethostname(), now, now))
+        self.db.execute("INSERT INTO sessions(session_id,agent_id,working_directory,start_time,request,pid,host,last_activity_at,last_heartbeat_at,status,provider,model,model_version) VALUES(?,?,?,?,?,?,?,?,?,'active',?,?,?)",
+                        (session_id, agent_id, str(self.root), now, request, pid, socket.gethostname(), now, now,
+                         runtime["provider"], runtime["model"], runtime["model_version"]))
         self.db.commit()
         return {"session_id": session_id, "agent": agent, "request": request, "status": "active", "start_time": now,
-                "pid": pid, "host": socket.gethostname()}
+                "pid": pid, "host": socket.gethostname(), **runtime}
 
     def end_session(self, session_id: str, result: str = "completed") -> dict:
         """Close a session. Safe to call twice, and on a session already gone.
@@ -1072,7 +1367,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         files, symbols = files or [], symbols or []
         # `risk` is derived from the recorded request, never invented: with no
         # request there is no evidence, so it stays UNKNOWN.
-        risk = (risk or (self.analyze_prompt(request)["risk"] if request else "UNKNOWN")).upper()
+        risk = (risk or (self.analyze_prompt(request, scope=False)["risk"] if request else "UNKNOWN")).upper()
         effect = effect or ("symbols-changed" if symbols else "text-only" if files else "none")
         # A change recorded by hand carries no evidence about who made it beyond
         # the name supplied, which is exactly what MEDIUM means here.
@@ -1179,6 +1474,374 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if requests: answer = f"Last recorded request touching this symbol: {requests[0]}"
         elif recorded or changes: answer = "Changes are recorded, but no originating request was captured."
         return {"query": query, "symbols": symbols, "attribution": attribution, "changes": changes, "recorded_changes": recorded, "answer": answer}
+
+    # ------------------------------------------------------------------
+    # Context continuity: turning a session's working memory into something
+    # the next session can read without the conversation or the repository.
+    # ------------------------------------------------------------------
+
+    def _estimate_tokens(self, value) -> int:
+        """A deliberately crude size estimate, never presented as a measurement."""
+        if value is None: return 0
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        return len(text) // CHARS_PER_TOKEN
+
+    def _session_row(self, session_id: str = ""):
+        if session_id:
+            return self.db.execute("SELECT s.*,a.name AS agent FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id WHERE s.session_id=?", (session_id,)).fetchone()
+        live = self._session_rows(LIVE)
+        return live[0] if live else (self._session_rows() or [None])[0]
+
+    def context_usage(self, context_window: int | None = None, context_used: int | None = None) -> dict:
+        """What the runtime said about its own context, and what follows from it.
+
+        Most runtimes expose nothing here, so UNKNOWN is the normal answer and
+        must stay usable: a checkpoint is worth taking at the end of a session
+        whatever the numbers say, and this never reports a percentage it was not
+        given. CodeLedger only ever recommends — it does not interrupt an agent.
+        """
+        threshold = self.config.checkpoint_threshold_pct
+        if not context_window or not context_used or context_window <= 0:
+            return {"context_window": UNKNOWN, "context_used": UNKNOWN, "context_remaining": UNKNOWN,
+                    "context_used_pct": UNKNOWN, "threshold_pct": threshold,
+                    "checkpoint_recommended": False, "recommendation": "UNKNOWN_CONTEXT",
+                    "message": ("This runtime did not report its context usage, so no threshold can be applied. "
+                                "Record a checkpoint before the session ends, or whenever the task reaches a "
+                                "state another session would need to continue from.")}
+        pct = round(context_used / context_window * 100, 1)
+        recommended = pct >= threshold
+        return {"context_window": context_window, "context_used": context_used,
+                "context_remaining": max(0, context_window - context_used), "context_used_pct": pct,
+                "threshold_pct": threshold, "checkpoint_recommended": recommended,
+                "recommendation": "CHECKPOINT_RECOMMENDED" if recommended else "NOT_YET",
+                "message": (f"Estimated context usage {pct}% is at or past the {threshold}% threshold. "
+                            "Record a CodeLedger checkpoint before continuing." if recommended
+                            else f"Estimated context usage {pct}%, below the {threshold}% threshold.")}
+
+    def session_state(self, session_id: str = "", request: str = "", context_window: int | None = None,
+                      context_used: int | None = None) -> dict:
+        """Everything CodeLedger already knows about this session, ready to checkpoint.
+
+        This is the mechanical half of a checkpoint and nothing more. CodeLedger
+        never sees the conversation, so it cannot write the goal, the rationale
+        behind a decision, or what was tried and abandoned — an agent supplies
+        those to `record_checkpoint`. Inventing them here would produce a
+        confident summary with no evidence under it, which is the failure this
+        project exists to avoid.
+        """
+        row = self._session_row(session_id)
+        if row is None:
+            return {"status": "NO_SESSION", "session_id": session_id or UNKNOWN,
+                    "guidance": "No session has been recorded for this project yet. Start one with `codeledger session start --agent <name>`, or call this from an MCP session.",
+                    "context": self.context_usage(context_window, context_used)}
+        session_id = row["session_id"]
+        task = request or row["request"] or ""
+        changes = [dict(item) for item in self.db.execute(
+            "SELECT id,timestamp,agent,user_request,summary,effect,risk,result FROM changes WHERE session_id=? ORDER BY id DESC LIMIT 50", (session_id,))]
+        files, symbols = set(), set()
+        for change in changes:
+            files.update(item["path"] for item in self.db.execute("SELECT path FROM change_files WHERE change_id=?", (change["id"],)))
+            symbols.update(item["name"] for item in self.db.execute("SELECT name FROM change_symbols WHERE change_id=?", (change["id"],)))
+        verifications = [dict(item) for item in self.db.execute(
+            "SELECT id,subject_type,subject_id,kind,result,recorded_at FROM verifications WHERE recorded_at>=? ORDER BY recorded_at DESC LIMIT 20", (row["start_time"],))]
+        existing = [dict(item) for item in self.db.execute(
+            "SELECT id,created_at,goal,status,source FROM checkpoints WHERE session_id=? ORDER BY id DESC", (session_id,))]
+        return {
+            "status": "READY", "session_id": session_id, "agent": row["agent"] or "unknown",
+            "provider": row["provider"] or UNKNOWN, "model": row["model"] or UNKNOWN,
+            "model_version": row["model_version"] or UNKNOWN,
+            "session_status": row["status"], "started_at": row["start_time"], "request": task or UNKNOWN,
+            "git_commit": head(self.root),
+            "changes": changes, "files_touched": sorted(files), "symbols_touched": sorted(symbols),
+            "verifications": verifications,
+            "open_issues": [dict(item) for item in self.db.execute("SELECT key,title,severity FROM issues WHERE status='OPEN' ORDER BY updated_at DESC LIMIT 10")],
+            "active_decisions": [dict(item) for item in self.db.execute("SELECT key,title FROM decisions WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 10")],
+            "progress": self.progress(task) if task else None,
+            "context": self.context_usage(context_window, context_used),
+            "existing_checkpoints": existing,
+            "supply_to_checkpoint": ["goal", "summary", "current_state", "accomplished", "unresolved",
+                                     "failed_attempts", "next_action"],
+            "guidance": ("CodeLedger has assembled what it recorded. It cannot see the conversation, so the goal, "
+                         "what was learned, what was abandoned and what to do next must come from you. Pass them to "
+                         "`codeledger_record_checkpoint` with the file and symbol lists above."),
+        }
+
+    def _link_item(self, kind: str, value: str) -> tuple[str | None, str | None, str | None]:
+        """Point a checkpoint entry at an existing row wherever one exists.
+
+        A checkpoint that copies a decision's text becomes a second, silently
+        diverging record of it. A reference cannot diverge: it either resolves
+        to the current row or is reported as stale.
+        """
+        text = (value or "").strip()
+        if not text: return None, None, None
+        if kind == "file": return "file", text, None
+        if kind == "symbol": return "symbol", text, None
+        if kind == "decision" and self.db.execute("SELECT 1 FROM decisions WHERE key=?", (text,)).fetchone():
+            return "decision", text, None
+        if kind == "issue" and self.db.execute("SELECT 1 FROM issues WHERE key=?", (text,)).fetchone():
+            return "issue", text, None
+        if kind == "verification" and text.isdigit() and self.db.execute("SELECT 1 FROM verifications WHERE id=?", (int(text),)).fetchone():
+            return "verification", text, None
+        if text.isdigit() and self.db.execute("SELECT 1 FROM changes WHERE id=?", (int(text),)).fetchone():
+            return "change", text, None
+        return None, None, text
+
+    def record_checkpoint(self, session_id: str = "", goal: str = "", summary: str = "", current_state: str = "",
+                          next_action: str = "", accomplished: list[str] | None = None,
+                          unresolved: list[str] | None = None, failed_attempts: list[str] | None = None,
+                          questions: list[str] | None = None, decisions: list[str] | None = None,
+                          issues: list[str] | None = None, verifications: list[str] | None = None,
+                          files: list[str] | None = None, symbols: list[str] | None = None,
+                          agent: str = "", provider: str = "", model: str = "", model_version: str = "",
+                          context_window: int | None = None, context_used: int | None = None,
+                          source: str = "agent") -> dict:
+        """Store one compact, durable summary of where a task has got to."""
+        goal = (goal or "").strip()
+        if not goal:
+            # Selection is by goal. A checkpoint without one can never be matched
+            # to a later task, so it would silently never be retrieved.
+            raise ValueError("A checkpoint needs a goal: it is what a later session matches its task against.")
+        row = self._session_row(session_id)
+        session_id = session_id or (row["session_id"] if row else f"session-{uuid.uuid4().hex[:10]}")
+        agent = agent or (row["agent"] if row else "") or "unknown"
+        runtime = resolve_model(agent, provider or (row["provider"] if row else ""),
+                                model or (row["model"] if row else ""),
+                                model_version or (row["model_version"] if row else ""))
+        confidence = {"agent": "HIGH", "cli": "MEDIUM"}.get(source, "LOW")
+        now = NOW()
+        self._begin_immediate()
+        try:
+            cursor = self.db.execute(
+                "INSERT INTO checkpoints(session_id,created_at,agent,provider,model,model_version,goal,summary,current_state,next_action,git_commit,context_window,context_used,source,confidence,status) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN')",
+                (session_id, now, agent, runtime["provider"], runtime["model"], runtime["model_version"], goal,
+                 summary, current_state, next_action, head(self.root), context_window, context_used, source, confidence))
+            checkpoint_id = cursor.lastrowid
+            for kind, values in (("accomplished", accomplished), ("unresolved", unresolved),
+                                 ("failed_attempt", failed_attempts), ("question", questions),
+                                 ("decision", decisions), ("issue", issues), ("verification", verifications),
+                                 ("file", files), ("symbol", symbols)):
+                for ordinal, value in enumerate(values or []):
+                    ref_type, ref_id, text = self._link_item(kind, value)
+                    if not (ref_type or text): continue
+                    self.db.execute("INSERT INTO checkpoint_items(checkpoint_id,kind,ref_type,ref_id,text,ordinal) VALUES(?,?,?,?,?,?)",
+                                    (checkpoint_id, kind, ref_type, ref_id, text, ordinal))
+            # Only the newest checkpoint for a session is OPEN. The older ones
+            # are kept and marked, never deleted: history is the product.
+            self.db.execute("UPDATE checkpoints SET status='SUPERSEDED',superseded_by=? WHERE session_id=? AND id!=? AND status='OPEN'",
+                            (checkpoint_id, session_id, checkpoint_id))
+            self.db.commit()
+        except Exception:
+            self.db.rollback(); raise
+        return self.checkpoint(checkpoint_id)
+
+    def _checkpoint_items(self, checkpoint_id: int) -> list[dict]:
+        return [dict(row) for row in self.db.execute(
+            "SELECT kind,ref_type,ref_id,text,ordinal FROM checkpoint_items WHERE checkpoint_id=? ORDER BY kind,ordinal", (checkpoint_id,))]
+
+    def checkpoint(self, checkpoint_id: int) -> dict:
+        row = self.db.execute("SELECT * FROM checkpoints WHERE id=?", (checkpoint_id,)).fetchone()
+        if row is None: return {"status": "NOT_FOUND", "checkpoint_id": checkpoint_id}
+        record = dict(row)
+        grouped: dict[str, list] = {}
+        for item in self._checkpoint_items(checkpoint_id):
+            grouped.setdefault(item["kind"], []).append(item["text"] if item["text"] is not None else item["ref_id"])
+        record["items"] = grouped
+        record["estimated_tokens"] = self._estimate_tokens(record)
+        return record
+
+    def checkpoints(self, status: str = "", limit: int = 20) -> list[dict]:
+        sql = "SELECT id,session_id,created_at,agent,provider,model,goal,status,source,confidence FROM checkpoints"
+        args: list = []
+        if status: sql += " WHERE status=?"; args.append(status.upper())
+        return [dict(row) for row in self.db.execute(sql + " ORDER BY id DESC LIMIT ?", (*args, limit))]
+
+    def _validate_checkpoint(self, row) -> tuple[dict, list[dict]]:
+        """Check a checkpoint against the source before believing any of it.
+
+        The ordering CodeLedger already commits to is source code, then the
+        filesystem and Git, then tests, then structured memory, then summaries.
+        A checkpoint is the last of those, so every claim it makes about a file
+        or a symbol is re-checked here and dropped from the body if the source no
+        longer supports it. Nothing is deleted — a stale entry is reported as
+        stale, which is itself useful: it says what changed underneath the work.
+        """
+        items = self._checkpoint_items(row["id"])
+        paths = {item["ref_id"] for item in items if item["kind"] == "file" and item["ref_id"]}
+        symbol_names = [item["ref_id"] for item in items if item["kind"] == "symbol" and item["ref_id"]]
+        symbol_rows: dict[str, dict] = {}
+        for name in symbol_names:
+            found = self.db.execute("SELECT s.status,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.name=? ORDER BY s.status='active' DESC LIMIT 1", (name,)).fetchone()
+            if found:
+                symbol_rows[name] = dict(found); paths.add(found["path"])
+        unreliable = {item["path"]: item["reason"] for item in self.stale_records(sorted(paths))}
+        fresh: dict[str, list] = {}
+        stale: list[dict] = []
+        for item in items:
+            kind, ref_id = item["kind"], item["ref_id"]
+            value = item["text"] if item["text"] is not None else ref_id
+            reason = None
+            if kind == "file" and ref_id in unreliable:
+                reason = unreliable[ref_id]
+            elif kind == "symbol":
+                found = symbol_rows.get(ref_id)
+                if not found:
+                    reason = "the symbol is no longer in the index"
+                elif found["status"] != "active":
+                    reason = "the symbol has been deleted since the checkpoint was written"
+                elif found["path"] in unreliable:
+                    reason = f"its file is not what was indexed: {unreliable[found['path']]}"
+            elif kind == "issue" and ref_id:
+                issue = self.db.execute("SELECT status FROM issues WHERE key=?", (ref_id,)).fetchone()
+                if issue and issue["status"] != "OPEN":
+                    reason = f"the issue is now {issue['status']}"
+            elif kind == "decision" and ref_id:
+                decision = self.db.execute("SELECT status FROM decisions WHERE key=?", (ref_id,)).fetchone()
+                if decision and decision["status"] != "ACTIVE":
+                    reason = f"the decision is now {decision['status']}"
+            if reason:
+                stale.append({"kind": kind, "value": value, "reason": reason})
+            else:
+                fresh.setdefault(kind, []).append(value)
+        return fresh, stale
+
+    def resume(self, task: str = "", limit: int = 20) -> dict:
+        """The smallest package that lets a new session continue previous work.
+
+        Selection is by task, not by recency: loading the newest checkpoint when
+        the user has moved on to something else is how an agent gets confidently
+        pointed at the wrong part of the repository. With no relevant checkpoint
+        this says so and lists what exists, rather than promoting an unrelated
+        one to fill the space.
+        """
+        candidates = self.db.execute("SELECT * FROM checkpoints WHERE status='OPEN' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        total_files = self.db.execute("SELECT count(*) FROM files WHERE status IN ('current','unindexed')").fetchone()[0]
+        if not candidates:
+            return self._resume_without_checkpoint(task, total_files)
+        selected, score, matched, basis = None, 0.0, [], ""
+        # A request made entirely of common words ("fix the code") leaves nothing
+        # distinctive to match on. Scoring it would compare two empty sets and
+        # reject every checkpoint, so relevance is declared unassessable and the
+        # basis says so — an agent can see it was not actually matched.
+        if task and not self._salient(task):
+            selected, basis = candidates[0], "most recent open checkpoint; the task had no distinctive terms, so relevance could not be assessed"
+        elif task:
+            ranked = []
+            for row in candidates:
+                found, overlap = self._relevance(self._salient(task), self._salient(f"{row['goal']} {row['summary'] or ''}"))
+                if found: ranked.append((found, row["id"], row, overlap))
+            ranked.sort(key=lambda item: (-item[0], -item[1]))
+            if ranked:
+                score, _, selected, matched = ranked[0]
+                basis = "matched against the task you supplied"
+        else:
+            selected, basis = candidates[0], "most recent open checkpoint; no task was supplied, so relevance was not assessed"
+        if selected is None:
+            return {"status": "NO_RELEVANT_CHECKPOINT", "task": task,
+                    "open_checkpoints": [{"checkpoint_id": row["id"], "goal": row["goal"], "created_at": row["created_at"],
+                                          "agent": row["agent"], "model": row["model"] or UNKNOWN} for row in candidates],
+                    "guidance": ("No recorded checkpoint describes this task. The open ones above are listed so you can "
+                                 "pick one deliberately; none was loaded, because unrelated previous work is worse than "
+                                 "no context. Proceed with `codeledger_get_plan` for a fresh task.")}
+        fresh, stale = self._validate_checkpoint(selected)
+        moved = self.since(marker=selected["created_at"], limit=20)
+        commit = head(self.root)
+        package = {
+            "status": "RESUME", "task": task or UNKNOWN,
+            "checkpoint_id": selected["id"], "created_at": selected["created_at"],
+            "selection": {"basis": basis, "match_score": round(score, 2), "matched_terms": matched,
+                          "open_checkpoints_considered": len(candidates)},
+            "recorded_by": {"agent": selected["agent"] or "unknown", "provider": selected["provider"] or UNKNOWN,
+                            "model": selected["model"] or UNKNOWN, "model_version": selected["model_version"] or UNKNOWN,
+                            "session_id": selected["session_id"], "confidence": selected["confidence"],
+                            "source": selected["source"]},
+            "goal": selected["goal"], "summary": selected["summary"] or "", "current_state": selected["current_state"] or "",
+            "accomplished": fresh.get("accomplished", []), "unresolved": fresh.get("unresolved", []),
+            "failed_attempts": fresh.get("failed_attempt", []), "open_questions": fresh.get("question", []),
+            "important_files": fresh.get("file", []), "important_symbols": fresh.get("symbol", []),
+            "decisions": [dict(item) for item in self.db.execute(
+                "SELECT key,title,rationale FROM decisions WHERE status='ACTIVE' AND key IN ({})".format(",".join("?" * len(fresh.get("decision", [])))),
+                fresh.get("decision", []))] if fresh.get("decision") else [],
+            "known_issues": [dict(item) for item in self.db.execute(
+                "SELECT key,title,severity FROM issues WHERE status='OPEN' AND key IN ({})".format(",".join("?" * len(fresh.get("issue", [])))),
+                fresh.get("issue", []))] if fresh.get("issue") else [],
+            "verification": fresh.get("verification", []),
+            "next_action": selected["next_action"] or "NOT RECORDED",
+            "stale_items": stale,
+            "changed_since_checkpoint": {"summary": moved["summary"], "files": moved["files_changed"][:20],
+                                         "symbols": moved["symbols_changed"][:20], "agents": moved["agents"]},
+            "git": {"checkpoint_commit": selected["git_commit"] or UNKNOWN, "current_commit": commit or UNKNOWN,
+                    "moved": bool(selected["git_commit"] and commit and selected["git_commit"] != commit)},
+        }
+        relevant = len(package["important_files"])
+        package["efficiency"] = {
+            "files_relevant": relevant, "files_in_repository": total_files,
+            "files_avoided": max(0, total_files - relevant),
+            "full_repository_scan_required": False,
+            "estimated_checkpoint_tokens": self._estimate_tokens({k: package[k] for k in ("goal", "summary", "current_state", "accomplished", "unresolved", "failed_attempts", "next_action")}),
+            "estimated_history_tokens": self._estimate_tokens(package["changed_since_checkpoint"]),
+            "estimated_total_tokens": self._estimate_tokens(package),
+            "note": "Token figures are estimates at roughly four characters per token, not measurements.",
+        }
+        package["guidance"] = (
+            "This is recorded engineering memory, not current truth. Anything it says about a file or symbol was "
+            "re-checked against the source just now, and whatever no longer holds is in `stale_items` rather than "
+            "above. Read `next_action` first; re-read the listed files before editing them.")
+        if stale:
+            package["guidance"] += f" {len(stale)} recorded item(s) no longer match the source and were excluded."
+        return package
+
+    def _resume_without_checkpoint(self, task: str, total_files: int) -> dict:
+        """Is there recent unfinished work, in a project that predates checkpoints?
+
+        Derived rather than recorded, and labelled as such: unverified changes
+        are evidence that something was left in the middle, not a statement that
+        it was. Projects upgrading to this version have no checkpoints at all,
+        and answering "nothing here" would be wrong.
+        """
+        recent = self.since(limit=10)
+        unverified = [item for item in recent["changes"] if item["effect"] != "none"]
+        if not unverified:
+            return {"status": "NO_CHECKPOINTS", "task": task or UNKNOWN, "recent_work": [],
+                    "guidance": "No checkpoint has been recorded for this project and nothing recent looks unfinished. Start with `codeledger_get_plan`."}
+        return {"status": "NO_CHECKPOINTS_RECENT_WORK_FOUND", "task": task or UNKNOWN,
+                "recent_work": unverified[:5], "files": recent["files_changed"][:20],
+                "symbols": recent["symbols_changed"][:20], "agents": recent["agents"],
+                "efficiency": {"files_relevant": len(recent["files_changed"]), "files_in_repository": total_files,
+                               "files_avoided": max(0, total_files - len(recent["files_changed"])),
+                               "full_repository_scan_required": False},
+                "guidance": ("No checkpoint exists, so this is inferred from recorded changes rather than recorded "
+                             "intent: it shows what was changed recently, not what anybody meant to do. Record a "
+                             "checkpoint at the end of this session so the next one does not have to guess.")}
+
+    def _mechanical_checkpoint(self, session_id: str, reason: str) -> dict | None:
+        """A last-resort checkpoint written when a session ends without one.
+
+        It is honest about being thin: nobody was asked what the work meant, so
+        it carries LOW confidence, no rationale and no next action. Its value is
+        that the files and symbols a session touched are not lost entirely.
+        """
+        if not session_id: return None
+        if self.db.execute("SELECT 1 FROM checkpoints WHERE session_id=? AND source='agent'", (session_id,)).fetchone():
+            return None
+        state = self.session_state(session_id)
+        if state.get("status") != "READY" or not state["changes"]:
+            return None
+        # A session started over MCP carries no request of its own — the agent
+        # was never asked for one. The changes it recorded do carry the request
+        # they were made for, and that is the only description of this work that
+        # exists, so a checkpoint that ignored it would be unfindable by task.
+        requests = [item["user_request"] for item in state["changes"] if item["user_request"]]
+        goal = state["request"] if state["request"] != UNKNOWN else (requests[0] if requests else f"Unlabelled work in {session_id}")
+        return self.record_checkpoint(
+            session_id=session_id, goal=goal,
+            summary=f"Recorded automatically when the session ended ({reason}). No agent summary was supplied.",
+            current_state=f"{len(state['changes'])} change(s) recorded; {len(state['symbols_touched'])} symbol(s) touched.",
+            next_action="NOT RECORDED — no agent summary was captured before the session ended.",
+            files=state["files_touched"], symbols=state["symbols_touched"],
+            agent=state["agent"], provider=state["provider"], model=state["model"],
+            model_version=state["model_version"], source="mechanical")
 
     def export(self) -> list[str]:
         target = self.root / ".ai" / "codeledger" / "exports"; target.mkdir(parents=True, exist_ok=True)

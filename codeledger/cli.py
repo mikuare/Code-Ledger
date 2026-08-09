@@ -91,6 +91,101 @@ def closing_session(ledger, session, result):
             try: signal.signal(sig, handler)
             except (ValueError, OSError): pass
 
+def emit_plan(value, as_json=False):
+    """Lead with what a change would reach, not with the file it is defined in."""
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    print(f"CODELEDGER PLAN — {value['request']}\n")
+    print(f"Risk: {value['risk']}   Full scan required: {value['full_scan_required']}")
+    print(f"\nRecommendation:\n   {value['recommendation']}")
+    if value["shared_dependencies"]:
+        radius = value["blast_radius"]
+        print(f"\nSHARED DEPENDENCY — a change here reaches {radius['file_count']} file(s) "
+              f"across {radius['area_count']} area(s) [confidence {radius['confidence']}]")
+        for item in value["shared_dependencies"][:5]:
+            print(f"   {item['symbol']} ({item['defined_in']})")
+            print(f"      areas: {', '.join(item['areas'])}")
+            for reason in item["why_shared"]: print(f"      - {reason}")
+    if value.get("scope_ambiguity"):
+        ambiguity = value["scope_ambiguity"]
+        print(f"\nSCOPE AMBIGUITY\n   {ambiguity['question']}")
+        print("   Clarify whether the change should apply to:")
+        for option in ambiguity["options"]: print(f"      - {option}")
+    if value.get("coverage_caveat"):
+        print(f"\nCoverage caveat:\n   {value['coverage_caveat']}")
+    if value["relevant_symbols"]:
+        print(f"\nRelevant symbols: {', '.join(s['name'] for s in value['relevant_symbols'][:10])}")
+    print(f"Existing files:   {', '.join(value['existing_files'][:10]) or 'none indexed'}")
+    if value["suggested_tests"]: print(f"Suggested tests:  {', '.join(value['suggested_tests'][:5])}")
+
+def emit_handshake(value, as_json=False):
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    print(f"CODELEDGER HANDSHAKE — {value['status']}\n")
+    print(f"{value['message']}\n")
+    if value.get("duplicate_implementation"):
+        duplicate = value["duplicate_implementation"]
+        print("POSSIBLE DUPLICATE IMPLEMENTATION")
+        print(f"   Plan creates: {', '.join(duplicate['proposed_new'])}")
+        print("   Existing implementation to inspect or reuse:")
+        for item in duplicate["existing_implementation"]:
+            print(f"      {item['symbol']:22} {item['path']:38} ({item['role']})")
+        print(f"   {duplicate['guidance']}")
+    if value.get("scope_ambiguity"):
+        print(f"\nSCOPE AMBIGUITY\n   {value['scope_ambiguity']['question']}")
+    if value.get("missing_preservation_constraints"):
+        print(f"\nUnaddressed constraints: {value['missing_preservation_constraints']}")
+
+def emit_resume(value, as_json=False):
+    """Print a resume package as something a person can read in one screen.
+
+    The JSON is what an agent consumes; this exists so a developer can see what
+    their agent is about to be told, which is the only way to notice that a
+    checkpoint has drifted from the work actually in progress.
+    """
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    status = value["status"]
+    if status == "NO_CHECKPOINTS":
+        print("CODELEDGER RESUME\n\nNo checkpoint recorded, and nothing recent looks unfinished."); return
+    if status == "NO_CHECKPOINTS_RECENT_WORK_FOUND":
+        print("CODELEDGER RESUME\n\nNo checkpoint exists, but recent work was found:\n")
+        for item in value["recent_work"]:
+            print(f"   #{item['change_id']} {item['timestamp']} — {item['agent']} — {item['request']}")
+        print(f"\n{value['guidance']}"); return
+    if status == "NO_RELEVANT_CHECKPOINT":
+        print(f"CODELEDGER RESUME\n\nNo checkpoint matches {value['task']!r}. Open checkpoints:\n")
+        for item in value["open_checkpoints"]:
+            print(f"   #{item['checkpoint_id']} {item['created_at']} — {item['goal']}")
+        print(f"\n{value['guidance']}"); return
+    recorded = value["recorded_by"]
+    print("CODELEDGER SESSION RESUME\n")
+    print(f"Previous objective:\n   {value['goal']}\n")
+    print(f"Recorded by:\n   {recorded['agent']} (provider {recorded['provider']}, model {recorded['model']}) "
+          f"at {value['created_at']}, confidence {recorded['confidence']}\n")
+    for label, key in (("Current state", "current_state"), ("Summary", "summary")):
+        if value.get(key): print(f"{label}:\n   {value[key]}\n")
+    for label, key in (("Completed", "accomplished"), ("Unresolved", "unresolved"),
+                       ("Failed approaches", "failed_attempts"), ("Open questions", "open_questions"),
+                       ("Important files", "important_files"), ("Important symbols", "important_symbols"),
+                       ("Verification", "verification")):
+        if value.get(key):
+            print(f"{label}:"); [print(f"   - {item}") for item in value[key]]; print()
+    for label, key, fields in (("Important decisions", "decisions", ("key", "title")),
+                               ("Known issues", "known_issues", ("key", "title"))):
+        if value.get(key):
+            print(f"{label}:"); [print("   - " + " — ".join(str(item[f]) for f in fields)) for item in value[key]]; print()
+    print(f"Recommended next action:\n   {value['next_action']}\n")
+    moved = value["changed_since_checkpoint"]
+    print(f"Changed since the checkpoint:\n   {moved['summary']}\n")
+    if value["stale_items"]:
+        print("No longer true (excluded above):")
+        for item in value["stale_items"]:
+            print(f"   - {item['kind']} {item['value']}: {item['reason']}")
+        print()
+    efficiency = value["efficiency"]
+    print(f"Estimated context: {efficiency['estimated_total_tokens']} tokens "
+          f"({efficiency['estimated_checkpoint_tokens']} checkpoint, {efficiency['estimated_history_tokens']} history)")
+    print(f"Files avoided: {efficiency['files_avoided']} of {efficiency['files_in_repository']} — "
+          f"repository-wide scan NOT REQUIRED")
+
 def emit_sessions(value, as_json=False):
     """Group sessions by what is true of them, not by row order.
 
@@ -231,7 +326,33 @@ def build_parser():
     record.add_argument("summary")
     record.add_argument("--result", default="unverified")
 
-    add("mcp", "Serve the local stdio MCP server").add_argument("--root", type=Path, dest="mcp_root")
+    mcp_cmd = add("mcp", "Serve the local stdio MCP server", json=False)
+    mcp_cmd.add_argument("--root", type=Path, dest="mcp_root")
+    mcp_cmd.add_argument("--agent", default="", help="Override the agent name from the MCP handshake")
+    mcp_cmd.add_argument("--session", default="", help="Attach to an existing session instead of starting one")
+
+    resume_cmd = add("resume", "Continuation context for previous work on a task")
+    resume_cmd.add_argument("task", nargs="?", default="", help="What you are about to work on; selection is by relevance")
+
+    checkpoint_cmd = add("checkpoint", "Inspect or record session checkpoints")
+    checkpoint_cmd.add_argument("action", nargs="?", default="list", choices=("list", "show", "state", "create"))
+    checkpoint_cmd.add_argument("--id", type=int, default=0)
+    checkpoint_cmd.add_argument("--session", default="")
+    checkpoint_cmd.add_argument("--goal", default="")
+    checkpoint_cmd.add_argument("--summary", default="")
+    checkpoint_cmd.add_argument("--current-state", default="")
+    checkpoint_cmd.add_argument("--next-action", default="")
+    checkpoint_cmd.add_argument("--accomplished", nargs="*", default=[])
+    checkpoint_cmd.add_argument("--unresolved", nargs="*", default=[])
+    checkpoint_cmd.add_argument("--failed", nargs="*", default=[], dest="failed_attempts")
+    checkpoint_cmd.add_argument("--questions", nargs="*", default=[])
+    checkpoint_cmd.add_argument("--decisions", nargs="*", default=[], help="Keys of decisions already recorded with `codeledger decision`")
+    checkpoint_cmd.add_argument("--issues", nargs="*", default=[], help="Keys of issues already recorded with `codeledger issue`")
+    checkpoint_cmd.add_argument("--verifications", nargs="*", default=[], help="Verification ids, as shown by `codeledger checkpoint state`")
+    checkpoint_cmd.add_argument("--files", nargs="*", default=[])
+    checkpoint_cmd.add_argument("--symbols", nargs="*", default=[])
+    checkpoint_cmd.add_argument("--context-window", type=int, default=None)
+    checkpoint_cmd.add_argument("--context-used", type=int, default=None)
 
     add("setup-agent", "Register CodeLedger MCP with a supported agent").add_argument("agent", choices=AGENT_CHOICES)
     add("agent-config", "Show MCP setup template for an agent").add_argument("agent")
@@ -256,7 +377,7 @@ def main(argv=None):
     args=parser.parse_args(argv); ledger=Ledger(getattr(args, "mcp_root", None) or args.root)
     if args.command == "mcp":
         from .mcp import serve
-        serve(ledger.root); return
+        serve(ledger.root, args.agent, args.session); return
     if args.command == "setup-codex":
         import shutil
         ledger._write_instructions()
@@ -321,6 +442,13 @@ def main(argv=None):
         if not command:
             parser.error("run requires a command after --, for example: codeledger run --request 'Fix login' -- codex")
         session = args.session or ledger.start_session(args.agent, args.request, owns_process=True)["session_id"]
+        # Hand the agent the previous work on this task before it starts, so it
+        # continues rather than rediscovering. Selection is by relevance, so an
+        # unrelated previous task is not loaded here either.
+        previous = ledger.resume(args.request)
+        if previous["status"] == "RESUME":
+            print("[CODELEDGER RESUME]")
+            print(json.dumps(previous, indent=2, default=str))
         context = ledger.context(args.request)
         print("[CODELEDGER CONTEXT]")
         print(json.dumps(context, indent=2, default=str))
@@ -335,10 +463,16 @@ def main(argv=None):
         with closing_session(ledger, session if not args.session else "", "interrupted"):
             completed = subprocess.run(command, cwd=ledger.root)
             refresh = ledger.refresh(True, args.agent, session, args.request)
+            # The agent has exited, so it cannot be asked what the work meant.
+            # This records what was observed, at LOW confidence, only when the
+            # agent left no checkpoint of its own — never overwriting one.
+            checkpoint = ledger._mechanical_checkpoint(session, "the agent command exited")
             # Close with the real outcome here; the guard above only fires when
             # this line is never reached, and closing is idempotent either way.
             if not args.session: ledger.end_session(session, "completed" if completed.returncode == 0 else "failed")
-        print(json.dumps({"session_id": session, "exit_code": completed.returncode, "refresh": refresh}, indent=2, default=str))
+        print(json.dumps({"session_id": session, "exit_code": completed.returncode, "refresh": refresh,
+                          "checkpoint": {"id": checkpoint["id"], "confidence": checkpoint["confidence"]} if checkpoint else None},
+                         indent=2, default=str))
         if refresh.get("conflicts"):
             print(f"\n[CODELEDGER] {refresh['conflicts']['message']}", flush=True)
         # Say plainly when an agent's turn achieved nothing. Without this the
@@ -360,11 +494,25 @@ def main(argv=None):
     elif args.command == "why": value=ledger.why(args.query)
     elif args.command == "restore-info": value={"query":args.query,"last_known_versions":ledger.lookup(args.query),"history":ledger.history(args.query),"automatic_restore":False}
     elif args.command == "scope": value=ledger.scope_check(args.request, args.files, args.symbols)
-    elif args.command == "plan": value=ledger.plan(args.request)
+    elif args.command == "plan": emit_plan(ledger.plan(args.request), args.as_json); return 0
     elif args.command == "progress": value=ledger.progress(args.request)
     elif args.command == "since": emit_since(ledger.since(args.marker, args.agent), args.as_json); return 0
+    elif args.command == "resume": emit_resume(ledger.resume(args.task), args.as_json); return 0
+    elif args.command == "checkpoint":
+        if args.action == "show": value=ledger.checkpoint(args.id)
+        elif args.action == "state": value=ledger.session_state(args.session, context_window=args.context_window, context_used=args.context_used)
+        elif args.action == "create":
+            if not args.goal: parser.error("checkpoint create requires --goal: it is what a later session matches its task against")
+            value=ledger.record_checkpoint(session_id=args.session, goal=args.goal, summary=args.summary,
+                                           current_state=args.current_state, next_action=args.next_action,
+                                           accomplished=args.accomplished, unresolved=args.unresolved,
+                                           failed_attempts=args.failed_attempts, questions=args.questions,
+                                           decisions=args.decisions, issues=args.issues, verifications=args.verifications,
+                                           files=args.files, symbols=args.symbols,
+                                           context_window=args.context_window, context_used=args.context_used, source="cli")
+        else: value=ledger.checkpoints()
     elif args.command == "prompt": value=ledger.analyze_prompt(args.request)
-    elif args.command == "handshake": value=ledger.handshake(args.request, args.ai_plan)
+    elif args.command == "handshake": emit_handshake(ledger.handshake(args.request, args.ai_plan), args.as_json); return 0
     elif args.command == "tests": value=ledger.suggest_tests(args.files, args.symbols)
     elif args.command == "changes": value=[dict(row) for row in ledger.db.execute("SELECT * FROM changes ORDER BY id DESC LIMIT 50")]
     elif args.command == "issues": value=[dict(row) for row in ledger.db.execute("SELECT * FROM issues ORDER BY updated_at DESC")]

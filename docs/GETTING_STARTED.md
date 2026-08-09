@@ -58,8 +58,15 @@ PEP 668 protecting your system Python. The virtual environment above is the fix.
 
 | Path | What it is | Commit it? |
 |---|---|---|
-| `.ai/codeledger/` | The SQLite database and config | No — already gitignored |
-| `CLAUDE.md`, `AGENTS.md`, `CODEX.md` | The agent protocol, ~500 words each | Your call; useful for teammates |
+| `.ai/codeledger/` | The SQLite database and config | No — **add it to `.gitignore` yourself** |
+| `CLAUDE.md`, `AGENTS.md`, `CODEX.md` | The agent protocol | Your call; useful for teammates |
+
+`init` does not write to your `.gitignore`. It creates exactly six files and
+modifies nothing else, so the database will be committed unless you add:
+
+```gitignore
+.ai/codeledger/
+```
 
 **Your source code is never modified.** `git diff` immediately after `init` is
 empty.
@@ -86,6 +93,23 @@ After `setup-agent`, the agent does this itself over MCP. You do not type these.
    `UNVERIFIED`, or `VERIFIED`, with guidance.
 4. **When tests run** — evidence is recorded. An agent *saying* "done" never
    marks anything verified; only a real command's exit code does.
+5. **Starting a session** — the agent asks whether this task has been worked on
+   before, and gets back the previous goal, what failed, and the next action —
+   without the old conversation or re-reading the repository.
+6. **Ending a session** — the agent records a checkpoint so the next one can
+   continue. CodeLedger cannot see the conversation, so the agent supplies the
+   meaning; if a session ends without one, a thin `LOW`-confidence record of
+   what was observed is written instead.
+
+Three things the agent is told before it edits, which are worth recognising when
+you see them:
+
+- **shared dependency / blast radius** — the symbol it is about to change is
+  used elsewhere, and here are the files and areas a change reaches.
+- **scope ambiguity** — the request touches shared code without saying how
+  widely it applies, so the agent should ask you rather than pick for you.
+- **duplicate implementation** — its plan creates something the project already
+  has, with the existing pieces named. A recommendation, not a refusal.
 
 The commands you may want by hand:
 
@@ -94,6 +118,8 @@ codeledger status                      # index counts, live agents, stale sessio
 codeledger doctor                      # full health check and what to run next
 codeledger refresh --changed           # catch the index up after outside edits
 codeledger progress "fix login timeout"  # what did previous attempts achieve?
+codeledger resume "fix login timeout"    # what a new session would be told
+codeledger plan "remove the theme color" # blast radius and scope before editing
 codeledger verify-run project project TEST -- npm test    # record real evidence
 ```
 
@@ -451,8 +477,28 @@ AFTER UPGRADING CODELEDGER
 .venv/bin/codeledger --version      # confirm the number actually moved
 .venv/bin/codeledger init           # refresh the agent protocol files
 
-The database migrates itself on the first command. History is preserved.
+The database migrates itself on the first command, additively and in one
+transaction. History is preserved; no re-index is required.
 `init` overwrites CLAUDE.md / AGENTS.md / CODEX.md — back them up if edited.
+Skipping `init` leaves your agents on the old protocol, so new abilities
+(resume, checkpoints, blast-radius warnings) never reach them.
+
+
+CONTINUING WORK ACROSS SESSIONS
+───────────────────────────────
+.venv/bin/codeledger resume "the task you are picking up"
+
+Agents do this themselves. Run it by hand to see what they will be told.
+
+
+REMOVING CODELEDGER FROM A PROJECT
+──────────────────────────────────
+<your-agent> mcp remove codeledger   # claude / codex / gemini / cursor …
+rm -rf .ai/codeledger
+rm -f CLAUDE.md AGENTS.md CODEX.md   # only if they hold nothing of your own
+.venv/bin/pip uninstall code-ledger
+
+Your source code is never touched, so there is nothing else to undo.
 
 
 WATCHER — optional safety net, not the main path
@@ -497,5 +543,66 @@ codeledger doctor
 - **`--json` must come after the subcommand.** `codeledger status --json` works;
   `codeledger --json status` is silently ignored.
 - **Not yet proven in long-running real-world use.** The test suite is thorough
-  (79 tests, and successive audits found and fixed five correctness bugs), but
+  (139 tests, and successive audits found and fixed several correctness bugs), but
   tested is not the same as lived-in. Start on a project you can experiment with.
+
+---
+
+## 12. Removing CodeLedger from a project
+
+CodeLedger is meant to be easy to walk away from. It never modifies your source
+code, so detaching is deleting what `init` created and unregistering the MCP
+server. There is no uninstall command to run and nothing to migrate back.
+
+**What `init` created — six files, and nothing else:**
+
+```text
+.ai/codeledger/codeledger.db          the history
+.ai/codeledger/config.json            ignores, extensions, thresholds
+.ai/codeledger/agent-integration.md   setup notes
+CLAUDE.md   AGENTS.md   CODEX.md      the agent protocol
+```
+
+Your files and your `.gitignore` are left exactly as they were.
+
+**To detach:**
+
+```bash
+# 1. Stop the watcher if you have one running (Ctrl+C in its terminal).
+
+# 2. Unregister the MCP server from each agent you set it up with.
+claude mcp remove codeledger      # or: codex / gemini / cursor mcp remove codeledger
+
+# 3. Delete what init created.
+rm -rf .ai/codeledger
+rm -f CLAUDE.md AGENTS.md CODEX.md
+
+# 4. Remove the package.
+pip uninstall code-ledger
+```
+
+**Before step 3, check those three protocol files.** If you added your own notes
+to `CLAUDE.md`, delete only the CodeLedger protocol section and keep the rest.
+(Worth knowing generally: `init` rewrites all three in full every time it runs,
+so anything you add to them is already at risk — keep your own instructions in a
+separate file.)
+
+If you added `.ai/codeledger/` to `.gitignore`, that line can go too.
+
+### Keeping the history without keeping the tool
+
+The database is a plain SQLite file. If you may come back, move
+`.ai/codeledger/codeledger.db` somewhere safe instead of deleting it — dropping
+it back in later restores everything, and the schema migrates itself forward on
+the first command whatever version it was written by. To read it without
+CodeLedger installed:
+
+```bash
+sqlite3 codeledger.db "SELECT timestamp, agent, user_request, summary FROM changes ORDER BY id DESC LIMIT 20;"
+```
+
+### Pausing instead of removing
+
+To stop CodeLedger participating without losing anything, just unregister the
+MCP server (step 2) and leave the rest in place. Nothing runs on its own — there
+is no daemon and no background process except the watcher, if you started one.

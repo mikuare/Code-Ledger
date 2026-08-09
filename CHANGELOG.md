@@ -8,6 +8,177 @@ Entries describe what was wrong and how it was found, not only what changed.
 Most of these were silent — the tool returned a confident answer that happened
 to be wrong — which is the failure mode this project exists to avoid.
 
+## [0.4.0]
+
+Adds a context-continuity layer: an agent's conversation is temporary, and this
+turns the engineering knowledge inside it into something the next session can
+read. The MCP server now starts and ends a session of its own, which is a
+behaviour change for anyone running more than one agent — see below.
+
+### Added
+
+- **Session checkpoints and task-aware resume.** A long conversation eventually
+  hits the model's context limit, and what gets compressed away first is the
+  expensive part: which approaches were already tried and abandoned. The next
+  session then re-reads the repository to rediscover the state, and repeats the
+  failed attempt, because nothing recorded that it failed.
+
+  `codeledger_record_checkpoint` stores a compact summary of where a task has
+  got to — goal, current state, what was accomplished, what failed, what is
+  unresolved, and the single next action. `codeledger_get_resume` retrieves it
+  in a new session. Checkpoints reference existing changes, decisions, issues
+  and verifications by id rather than copying them, so a checkpoint cannot
+  quietly disagree with the ledger it came from.
+
+  CodeLedger never sees the conversation, so it does not write the semantic half
+  itself: `codeledger_get_session_state` assembles what was observed and the
+  agent supplies the meaning. A summary invented from file lists would read
+  exactly as confident as one an agent actually wrote.
+
+- **Resume selects by task, not by recency.** Loading the most recent checkpoint
+  is wrong whenever the user has moved on: a checkpoint about dashboard CSS
+  aimed at a payments task points the agent at the wrong subsystem with full
+  confidence. Selection scores the new task against each checkpoint's goal using
+  the same overlap rule that repeat detection already uses, and when nothing
+  matches it returns `NO_RELEVANT_CHECKPOINT` with the open goals listed, rather
+  than promoting an unrelated one to fill the space.
+
+- **Checkpoints are re-checked against the source before they are believed.**
+  A checkpoint is an AI summary, the lowest rank in this project's existing
+  ordering — source code, then filesystem and Git, then tests, then structured
+  memory, then summaries. Every file and symbol it names is validated at resume
+  time: a symbol deleted since the checkpoint was written is dropped from the
+  body and reported under `stale_items` with the reason. It is never deleted,
+  because what changed underneath the work is itself worth knowing.
+
+- **Agent, provider and model recorded separately per session.** `sessions`
+  gains `provider`, `model` and `model_version`. An agent name says which
+  program is running, not which model it is driving today, so the model is
+  recorded only when the runtime actually reports it and is `UNKNOWN` otherwise.
+  Nothing is inferred from the agent name. The vendor table is data, not
+  behaviour: CodeLedger never branches on which provider an agent belongs to,
+  and an unrecognised agent is `generic` rather than guessed at.
+
+- **Context-window awareness, where a runtime offers it.** `context_window` and
+  `context_used` are accepted wherever they are available and drive a
+  recommendation past a configurable threshold (`checkpoint_threshold_pct`,
+  default 80). Most runtimes expose neither, so `UNKNOWN` is the normal answer
+  and the feature works identically without them. CodeLedger recommends; it
+  never interrupts an agent mid-task.
+
+- **`plan` now reports what a change would reach, not only where it is defined.**
+  The dependency graph could already answer "who breaks if this changes?" —
+  `impact` has walked it since the beginning — but the pre-change path never
+  asked. `plan` built its file list from `lookup`, which returns the file a
+  symbol is *defined* in, so a plan for a provider used by four pages reported
+  one file while the ledger held six. Nothing was wrong with the data; it simply
+  never reached the agent through the tool the protocol tells it to call.
+
+  `plan` gains `shared_dependencies`, `blast_radius` and `coverage_caveat`, from
+  indexed queries only (`impact(fallback=False)`). The scanning fallback stays
+  out of this path deliberately: it reads the whole working tree, which is the
+  right trade when an agent asks about one symbol and the wrong one on every
+  planning call. A test fails the build if planning ever scans.
+
+- **Scope ambiguity is reported instead of guessed at.** "Remove the theme
+  colour" does not say which of Landing, Payment, Queue and Dashboard it means,
+  and an agent that picks one silently is confidently wrong half the time.
+
+  Five signals decide this, because no single one is trustworthy: how many areas
+  depend on the symbol, whether it is shared by design (its location, its name,
+  and how widely it is actually used — conventions can lie, the measurement
+  cannot), the size of the radius, whether the request already names a scope,
+  and the intent. Adding to a shared module changes nothing for its existing
+  dependents, so `add a helper to drawerState` asks nothing. A request that
+  names its own scope is never questioned, however wide it reaches. A plain
+  helper used by two areas is not ambiguous — warning there is how a guard
+  teaches agents to ignore it.
+
+- **A plan that duplicates an existing implementation is warned about.** Asked
+  to make a button open the same kind of panel, an agent proposing "a new
+  CheckoutFlyout with its own slide animation and its own open/close state"
+  previously handshook as `ALIGNED`. Nothing was looking for the most expensive
+  mistake available.
+
+  `handshake` compares the symbols a plan says it will create against what the
+  project already has, and reads the dependency edges *forwards* one hop to name
+  the whole existing flow rather than just its entry point — the shared drawer
+  and shared state underneath are what reuse actually means. It recommends and
+  never rejects: a new implementation is sometimes correct, and when it is, the
+  agent should say why rather than proceed silently.
+
+  Areas are computed per file under container directories like `pages/` and
+  `components/`, so four sibling pages count as four areas rather than one.
+
+### Fixed
+
+- **A database from an older CodeLedger could not be opened at all.** Upgrading
+  a real project failed on `sqlite3.OperationalError: no such column: coverage`,
+  raised from `connect` before a single migration had run — so the tool could
+  not open an intact database to migrate it, and every command was dead.
+
+  The schema was applied in one script, tables and indexes together, before the
+  migrations. `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already
+  exists, whatever shape it is in — but `CREATE INDEX IF NOT EXISTS` is not: the
+  index genuinely does not exist, so SQLite tried to build
+  `idx_files_coverage ON files(coverage)` against a table whose `coverage`
+  column was added by a migration that had not run yet. Two indexes were
+  affected; `idx_dependencies_source_file` would have failed immediately after.
+
+  Tables, migrations and indexes are now three ordered steps, so every column an
+  index names is guaranteed to exist by the time the index is built. Migrations
+  additionally run in one transaction: a failure rolls the whole upgrade back
+  rather than leaving a half-migrated database that looks upgraded.
+
+  The existing migration test did not catch this because its fixture was built
+  from the *current* `SCHEMA` constant, which already contains every column —
+  making it a fresh database with some columns removed rather than an old one.
+  The regression test now uses the verbatim schema of a database found in the
+  field, and asserts the general invariant that an upgraded database ends up
+  shaped exactly like a newly created one.
+
+### Changed
+
+- **The MCP server now owns a session.** Previously it started none: an
+  MCP-connected agent had no session to heartbeat, nothing to attach a
+  checkpoint to, and no entry in `codeledger_get_active_agents` for another
+  agent's conflict check to find. It now starts a session on `initialize`,
+  records activity on every tool call, and ends it when the client disconnects.
+
+  Two consequences worth knowing. A live MCP session appears in `active_agents`,
+  so conflict checks and the watcher's attribution message will mention it —
+  authorship is unaffected, and an observed edit is still recorded as `unknown`
+  at LOW confidence, because the filesystem still cannot show which process
+  wrote a file. And a session that goes quiet past the stale limit is revived by
+  the next tool call rather than staying dead for the life of the process.
+
+- **A session that ends without a checkpoint gets a mechanical one.** When the
+  MCP client disconnects or `codeledger run` exits, the agent is already gone
+  and cannot be asked what the work meant. The fallback records only what was
+  observed — files, symbols, the request the changes were made for — at LOW
+  confidence, and says so in place of a next action. It never replaces a
+  checkpoint an agent wrote.
+
+- **`codeledger run` hands the agent its previous work before it starts**, using
+  the same relevance test, so an unrelated earlier task is not loaded.
+
+- **The MCP handshake now carries usage instructions.** An MCP server cannot put
+  anything into a model's turn — tools are pull-only — so a server that merely
+  offers `codeledger_get_resume` is relying entirely on the agent having read
+  the protocol file. The `initialize` result now also returns the standard
+  `instructions` field telling the client to resume before reading source and to
+  checkpoint before finishing. Clients may ignore it, which is why the protocol
+  file still says the same thing. `serverInfo.version` also reports the real
+  version, having been hardcoded to `0.1.0` since the server was written.
+
+### Upgrading
+
+Run `codeledger init` in existing projects after upgrading. The schema migrates
+by itself on the first command — additively, destroying nothing — but the agent
+protocol files (`CLAUDE.md`, `AGENTS.md`, `CODEX.md`) are written at `init` time,
+so without re-running it agents will not know to resume or checkpoint at all.
+Re-running `init` preserves all history and overwrites only those three files.
+
 ## [0.3.0]
 
 The watcher's default behaviour changes: it now waits before recording an edit,
