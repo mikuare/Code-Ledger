@@ -140,6 +140,70 @@ Installing or removing grammars upgrades an existing index in place — `files.a
 
 The design and its trade-offs are in [docs/LANGUAGE_SUPPORT.md](docs/LANGUAGE_SUPPORT.md).
 
+## More than one agent on the same project
+
+Claude Code and Codex can share one ledger. Set each up once, then let both query it:
+
+```bash
+codeledger setup-agent codex
+codeledger setup-agent claude-code
+```
+
+The database is WAL-mode SQLite, so several agents and a watcher can read and write concurrently. At the start of a turn an agent asks what happened while it was not looking:
+
+```bash
+codeledger since --agent claude-code    # since claude-code last recorded anything
+codeledger since 42                     # since change #42
+codeledger since session-f8e17355e4     # since a session started
+```
+
+```text
+2 change(s) by codex: 1 file(s), 2 symbol(s). 2 were made by another agent.
+   #8 by codex  ['src/auth/session.py']  symbols=['login', 'logout']  effect=symbols-changed
+   #7 by codex  ['src/auth/session.py']  symbols=['login']  effect=symbols-changed
+```
+
+Agents reach the same thing through MCP as `codeledger_get_changes_since`.
+
+When two agents are live, CodeLedger warns before they collide. Editing the same *symbol* is a stronger signal than merely touching the same file, and it is graded accordingly:
+
+```text
+POTENTIAL CONFLICT: claude-code also changed the same symbol(s): login.
+Re-read those before editing so the two agents do not undo each other.
+```
+
+### Attribution is graded, not asserted
+
+The filesystem records that a file changed. It does not record which process changed it, and no amount of watching recovers that. So every change stores how well its authorship is actually known:
+
+| Confidence | When | Recorded as |
+|---|---|---|
+| `HIGH` | The agent called `refresh` itself — it is reporting its own work | that agent |
+| `MEDIUM` | A change entered by hand via `record` | the name given |
+| `LOW` | The watcher observed an edit | `unknown`, with the live agents named as context |
+| `UNKNOWN` | A refresh was recorded with no agent name | `unknown` |
+
+The watcher never credits the name it was launched with, even when that agent is the only one running. `watch --agent codex` says who started the watcher, not who wrote the file — a developer, an editor or a formatter produces an identical filesystem event. If you want per-symbol authorship, have each agent call `refresh` itself; that is what the protocol tells them to do.
+
+For the sharpest record with two agents: run the watcher for continuous safety, and have each agent refresh on its own behalf when it finishes a task.
+
+### When a session dies without saying goodbye
+
+A watcher is an ordinary foreground process. Closing WSL, closing the IDE, a crash or `kill -9` all end it without any chance to clean up — no signal handler can cover the last two. So liveness is decided from evidence rather than from the row still saying `active`: each session records a PID, a host and a heartbeat, and any command that reports who is working reconciles them first.
+
+```bash
+codeledger session list
+```
+
+```text
+ACTIVE:
+   claude-code session-8ec7d4321e (pid=unrecorded, last activity 2026-08-09T06:15:13+00:00)
+CRASHED:
+   codex session-1a380d901c (pid=999123) — process 999123 is no longer running on this host
+```
+
+A dead PID is conclusive. A *live* PID is not, because PIDs are recycled — so a session whose heartbeat has gone quiet past `session_stale_seconds` is retired regardless. An agent may legitimately think for several minutes, so idleness is not death: `IDLE` still counts as live, only `STALE` stops counting. Nothing is ever deleted; a retired session keeps its history and gains a reason. `codeledger doctor` reports any that are left over, and `codeledger session reconcile` retires them on demand.
+
 ## Did the change actually do anything?
 
 The most expensive failure in agent-assisted work is the silent loop: you prompt, the agent edits, nothing changes, you prompt again. The agent has no memory of the last attempt, so it re-reads the repository and often tries the same thing — spending tokens to rediscover what already failed.

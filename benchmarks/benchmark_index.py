@@ -52,6 +52,14 @@ def measure(root: Path) -> None:
     changed, _ = timed("refresh --changed (1 file)", lambda: ledger.refresh(changed_only=True))
     print(f"   {len(changed['files'])} file(s), symbols: {changed['symbols'][:3]}")
 
+    # An ignored directory must cost nothing beyond the one stat that prunes it.
+    # If these files ever appear in `files_discovered`, traversal is descending
+    # into node_modules and the whole index is paying for it.
+    metrics = ledger._last_discovery_metrics.as_dict()
+    ignored_on_disk = sum(1 for _ in (root / "node_modules").rglob("*.js")) if (root / "node_modules").exists() else 0
+    print(f"  {'ignored dirs pruned':<26} {metrics['directories_skipped']:8d}   "
+          f"{ignored_on_disk} file(s) under node_modules never opened")
+
     name = next((row["name"] for row in ledger.db.execute("SELECT name FROM symbols WHERE status='active' LIMIT 1")), "helper")
     indexed, index_time = timed(f"impact {name!r} (index)", lambda: ledger.impact(name, fallback=False))
     print(f"   {len(indexed['referencing_files'])} referencing files")

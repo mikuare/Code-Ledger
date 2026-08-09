@@ -60,7 +60,6 @@ def process_alive(pid: int | None) -> bool | None:
     except OSError:
         return None
 
-
 @dataclass
 class DiscoveryMetrics:
     directories_visited: int = 0
@@ -320,7 +319,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             self.db.rollback()
             raise
 
-    def _refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False, observed: bool = False) -> dict[str, int | str | None | list[str] | dict]:
+    def _refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False, observed: bool = False, only: set[str] | None = None) -> dict[str, int | str | None | list[str] | dict]:
         started = time.perf_counter(); statuses = git_status(self.root) if include_git_status and (self.root / ".git").exists() and analyze else {}
         actor, attribution = self._attribute(agent, observed)
         attribution_note = attribution["reason"] if attribution["confidence"] != "HIGH" else ""
@@ -335,7 +334,11 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         self._begin_immediate()
         seen, changed_paths, changed_symbols = set(), [], []
         added, modified, deleted, symbols = 0, 0, 0, 0
-        discovery_started = time.perf_counter(); discovered = list(self._discover(verbose=verbose)); discovery_seconds = time.perf_counter() - discovery_started
+        discovery_started = time.perf_counter(); discovered = list(self._discover(verbose=verbose))
+        # A targeted re-analysis looks at a named handful of files. It is a
+        # partial view of the tree, so it must not also decide what was deleted.
+        if only is not None: discovered = [item for item in discovered if item[1] in only]
+        discovery_seconds = time.perf_counter() - discovery_started
         metrics = discovered[-1][4] if discovered else self._last_discovery_metrics; hash_seconds = 0.0; parse_seconds = 0.0
         for rel, size, mtime_ns in metrics.large_files:
             self.db.execute("INSERT INTO files(path,language,size,mtime,mtime_ns,status,analysis_version) VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,mtime_ns=excluded.mtime_ns,status='skipped_large_file'", (rel, language(Path(rel)), size, mtime_ns / 1_000_000_000, mtime_ns, "skipped_large_file", "metadata"))
@@ -403,7 +406,13 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # again, so `watch` logged a change every poll forever for any file that
         # had ever been removed — and never idled down, because it always
         # believed something had just changed.
-        for row in self.db.execute("SELECT id,path FROM files WHERE status!='deleted'").fetchall():
+        # A targeted pass still retires the files it was asked about — a symbol
+        # whose file was deleted is the stale record this exists to catch — but
+        # it must not judge files it never looked at.
+        candidates = (self.db.execute(f"SELECT id,path FROM files WHERE status!='deleted' AND path IN ({','.join('?' * len(only))})", tuple(only)).fetchall()
+                      if only is not None else
+                      self.db.execute("SELECT id,path FROM files WHERE status!='deleted'").fetchall()) if only != set() else []
+        for row in candidates:
             if row["path"] not in seen and not (self.root / row["path"]).exists():
                 self.db.execute("UPDATE files SET status='deleted',last_modified_by=?,last_modified_session=? WHERE id=?", (actor, session, row["id"])); deleted += 1; changed_paths.append(row["path"])
                 # The file's symbols went with it. Leaving them active let
@@ -417,6 +426,20 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # content never reaches here, so "text-only" means the bytes moved but
         # no symbol did: formatting, comments, or an edit that missed.
         effect = "symbols-changed" if changed_symbols else "text-only" if changed_paths else "none"
+        # Telling a comment from code needs a parse tree. The shallow provider
+        # matches line patterns and hashes raw text, so for those files a
+        # comment or a reindent reads as `symbols-changed`. Say so rather than
+        # reporting the same certainty the parsed languages earn.
+        shallow_changed = sorted({row["path"] for row in self.db.execute(
+            f"SELECT path,coverage FROM files WHERE path IN ({','.join('?' * len(changed_paths))})", changed_paths)
+            if (row["coverage"] or SHALLOW) != FULL}) if changed_paths else []
+        effect_confidence = {"level": "LOW" if shallow_changed and effect == "symbols-changed" else "HIGH",
+                             "shallow_files": shallow_changed}
+        if shallow_changed and effect == "symbols-changed":
+            effect_confidence["reason"] = (
+                f"{', '.join(shallow_changed[:5])} are analysed by line patterns, which cannot separate comments and "
+                "formatting from code, so this may not be a real code change. Install grammars for an exact answer: "
+                "pip install 'code-ledger[languages]'.")
         # The index update and the change record are one fact and are committed
         # once. Committing the index first left a window where a crash produced
         # files marked changed with no change row to explain them, so `since`
@@ -424,7 +447,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if record and changed_paths:
             change_id = self.record_change(actor, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN", effect=effect, attribution=attribution, commit=False)
         self.db.commit(); db_seconds = time.perf_counter() - db_started; total = time.perf_counter() - started
-        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "agent": actor, "attribution": attribution, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
+        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "effect_confidence": effect_confidence, "agent": actor, "attribution": attribution, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
         if attribution_note:
             result["attribution_note"] = attribution_note
         if changed_paths:
@@ -598,13 +621,46 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         ranked = sorted(found.values(), key=lambda item: (-item[1], item[0]["status"] != "active", item[0]["name"]))
         return [row for row, _score in ranked][:limit]
 
+    def stale_records(self, paths: list[str]) -> list[dict]:
+        """Which of these indexed files no longer match what is on disk?
+
+        Cheap: one stat per file, no reading and no parsing. The ledger is a
+        cache of the source, and the source always wins — reporting a symbol
+        from a file that has since been edited is how an agent is told a
+        function exists that somebody already deleted.
+        """
+        stale = []
+        for row in self.db.execute(f"SELECT path,size,mtime_ns FROM files WHERE path IN ({','.join('?' * len(paths))})", paths) if paths else []:
+            full = self.root / row["path"]
+            try:
+                stat = full.stat()
+            except OSError:
+                stale.append({"path": row["path"], "reason": "the file no longer exists"}); continue
+            if stat.st_size != row["size"] or stat.st_mtime_ns != row["mtime_ns"]:
+                stale.append({"path": row["path"], "reason": "the file changed since it was indexed"})
+        return stale
+
     def context(self, query: str) -> dict:
         matches = self.search_symbols(query); paths = sorted({r["path"] for r in matches})
+        # Never answer from memory that the filesystem has already contradicted.
+        # Re-analysing only the handful of files behind this answer keeps the
+        # query cheap while making it truthful.
+        stale = self.stale_records(paths)
+        if stale:
+            self.refresh(changed_only=True, only={item["path"] for item in stale}, record=False)
+            matches = self.search_symbols(query); paths = sorted({r["path"] for r in matches})
         recent = [dict(r) for r in self.db.execute("SELECT id,timestamp,agent,summary,risk FROM changes ORDER BY id DESC LIMIT 5")]
         issues = [dict(r) for r in self.db.execute("SELECT key,title,severity FROM issues WHERE status='OPEN' ORDER BY updated_at DESC LIMIT 10")]
         decisions = [dict(r) for r in self.db.execute("SELECT key,title,rationale FROM decisions WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 10")]
         features = [dict(r) for r in self.db.execute("SELECT name,description,status,last_verified FROM features WHERE name LIKE ? ESCAPE '\\' ORDER BY name LIMIT 10", (f"%{query.translate(LIKE_ESCAPE)}%",))]
-        return {"query": query, "task_analysis": self.analyze_prompt(query), "features": features, "symbols": matches[:20], "files": paths[:20], "recent_changes": recent, "known_issues": issues, "decisions": decisions, "scan_required": not bool(matches or features)}
+        # What this answer cost, in the terms that matter: files the agent did
+        # not have to open. The whole point of the ledger is the third number.
+        total = self.db.execute("SELECT count(*) FROM files WHERE status IN ('current','unindexed')").fetchone()[0]
+        efficiency = {"files_relevant": len(paths), "files_in_repository": total,
+                      "files_avoided": max(0, total - len(paths)), "symbols_returned": len(matches[:20]),
+                      "changes_returned": len(recent), "full_scan_required": not bool(matches or features),
+                      "stale_records_reanalyzed": stale}
+        return {"query": query, "task_analysis": self.analyze_prompt(query), "features": features, "symbols": matches[:20], "files": paths[:20], "recent_changes": recent, "known_issues": issues, "decisions": decisions, "scan_required": not bool(matches or features), "efficiency": efficiency}
 
     def analyze_prompt(self, prompt: str) -> dict:
         text = " ".join(prompt.strip().split()); lower = text.lower()

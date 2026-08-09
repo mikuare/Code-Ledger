@@ -10,8 +10,116 @@ to be wrong — which is the failure mode this project exists to avoid.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Phantom sessions made every later edit `unknown`.** A session was only ever
+  closed by the Ctrl+C handler in `watch`. Closing WSL, closing the IDE, a
+  crash, `kill -9` or power loss left `status='active'` in the database forever.
+  That dead session then counted as a competing agent, so the watcher recorded
+  every subsequent edit as `unknown`, conflict warnings fired against an agent
+  that died days ago, and `status` reported it as working. One hard shutdown
+  degraded attribution permanently. Sessions now record a PID, host and
+  heartbeat, and `reconcile_sessions()` reclassifies them as `crashed` (the
+  process is gone), `stale` (no activity past the limit), `idle` (quiet but
+  within it) or `ended`. Both signals are required: a dead PID is conclusive,
+  but a live PID proves little because PIDs are recycled, so a stale heartbeat
+  retires the session anyway. Reconciliation runs before anything reports who is
+  active. Nothing is deleted — rows keep their history and gain a reason.
+- **A failed refresh held the write lock for the life of the process.** `refresh`
+  writes many rows before committing, so an exception part-way through left an
+  open write transaction. In `watch` or the MCP server — both long-lived — a
+  single failure blocked every other agent's write until it timed out. It now
+  rolls back and re-raises. The regression test for this went from 34s of lock
+  timeouts to passing instantly.
+- **The index and its change record committed separately.** A crash between them
+  left files marked current with no change row to explain them, so `since` and
+  `progress` silently under-reported. They are now one transaction.
+- **Comments and formatting counted as code changes.** A symbol's hash was its
+  raw source lines, so adding a comment, a docstring or a blank line reported
+  `effect=symbols-changed` — the signal an agent relies on to tell a real fix
+  from one that missed — and reassigned authorship of code the agent had not
+  touched. Python symbols now hash a docstring-stripped AST dump, and
+  tree-sitter symbols hash their parse tree with comment nodes removed, so
+  comparison is code to code. Reformatting is no longer a logic change.
+- **`context` answered from memory the filesystem had already contradicted.** A
+  file edited outside CodeLedger left the index reporting symbols that no longer
+  existed. `context` now stats the files behind its answer and re-analyses only
+  those that drifted, which keeps the query cheap while making it truthful.
+- **`doctor` was an undocumented alias for `status`.** It was registered, printed
+  index counts, and was referenced in the docs as a diagnostic. It now checks the
+  database, WAL, foreign keys, schema, migrations, sessions, file and symbol
+  indexes, git, analysis coverage, agent protocols, config and storage, and
+  prints the commands to run.
+
+- **The watcher credited the name it was launched with.** With one agent live,
+  an observed edit was recorded as that agent's work. But `watch --agent codex`
+  says who started the watcher, not who wrote the file — a developer, an editor
+  or a formatter produces an identical filesystem event. Observed edits are now
+  always `unknown` at `LOW` confidence, with the live agents named as context
+  rather than credited.
+- **Concurrent refreshes each claimed the same edit.** Reads inside a refresh
+  used a snapshot taken when its transaction began, so an agent could not see an
+  edit another agent had already recorded and indexed it again. Four agents
+  refreshing together produced four `HIGH`-confidence change records for one
+  edit — fabricated authorship for three of them, and inflated attempt counts
+  that `progress` would later read as a repeat. Refresh now takes the write lock
+  before reading anything it decides on (`BEGIN IMMEDIATE`), so each sees
+  committed state. Readers are unaffected: WAL keeps `context`, `since` and
+  `impact` fast while writers take turns. Verified with eight concurrent
+  writers; no duplicates, no losses, no lock timeouts, and no measured cost.
+- **Docstrings escaped the tree-sitter code hash.** A docstring is a bare string
+  statement, not a comment node, so with grammars installed a documentation edit
+  read as a code change — meaning the same file classified differently depending
+  on whether an optional package happened to be present. Bodies now drop their
+  leading string literal. The rule is scoped to block nodes, because the first
+  named child of an argument list is often a string too, and dropping that would
+  make `f("a")` and `f("b")` hash identically.
+
 ### Added
 
+- **Attribution confidence.** Every change records how well its authorship is
+  actually known, not just a name: `HIGH` (the agent called `refresh` itself),
+  `MEDIUM` (entered by hand), `LOW` (the watcher observed it, so authorship is
+  `unknown`), `UNKNOWN` (no agent named). Stored on `changes` and returned by
+  `refresh`.
+- **Effect confidence.** Telling a comment from code needs a parse tree. The
+  no-dependency line-pattern provider cannot, so for those files `effect` is
+  reported at `LOW` confidence naming the shallow files and the install hint,
+  instead of asserting a code change it cannot distinguish from a reindent.
+- **Cross-agent conflict detection.** `conflicts()` (MCP:
+  `codeledger_check_conflicts`) reports when another *live* agent recently
+  changed the same code, and grades it: a shared symbol is `HIGH`, a shared file
+  only `MEDIUM`. Surfaced automatically by `refresh`, `since`, `watch` and `run`.
+  A reconciled-away session cannot raise a conflict.
+- **Session management.** `codeledger session list | reconcile | status`, grouped
+  by real status rather than a flat dump of rows all reading `active`. `status`
+  reports `active_agents` and `stale_sessions`. Configurable via
+  `session_idle_seconds` (900) and `session_stale_seconds` (3600) — an agent may
+  legitimately think for minutes, so idle is not death.
+- **Centralized, idempotent session cleanup.** One context manager closes the
+  session on normal exit, `SIGINT`, `SIGTERM` and `SIGHUP`, then re-raises so the
+  process still dies of the signal it was sent. It cannot cover `SIGKILL` or a
+  WSL shutdown and does not pretend to — that is what reconciliation is for.
+  Closing twice never rewrites how a session really finished.
+- **Token-efficiency metrics on `context`**: files relevant, files in repository,
+  files avoided, symbols and changes returned, whether a full scan was required.
+- **Multi-agent handoff, and attribution that refuses to guess.**
+  `codeledger since [<change id>|<session>|<timestamp>]` (MCP:
+  `codeledger_get_changes_since`) answers "what changed while I was not
+  looking"; with `--agent <name>` and no marker it means *since that agent last
+  recorded anything*, which is what an agent needs at the start of a turn to
+  avoid overwriting work it cannot see. The database is WAL-mode SQLite, so
+  several agents and a watcher can read and write concurrently.
+
+  The subtler half is who gets credited. An agent calling `refresh` on its own
+  behalf is reporting its own work and is authoritative. The `watch` process is
+  not — it observes the filesystem, which cannot show which agent wrote a file.
+  Previously it credited every observed edit to whichever `--agent` name it was
+  started with, so a ledger watched as `codex` silently attributed Claude
+  Code's edits to codex, and `why <symbol>` then reported that invented
+  authorship as fact. Observed refreshes now record authorship as `unknown`
+  while more than one agent holds an active session, and say why. With a single
+  agent working the inference is fair, so it still attributes normally.
 - **Effect tracking and loop detection.** Every refresh reports whether an edit
   changed real code (`symbols-changed`), only text (`text-only`), or nothing
   (`none`), stored on `changes.effect`. `codeledger progress "<request>"` (MCP:

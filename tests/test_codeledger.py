@@ -19,8 +19,6 @@ def dead_pid() -> int:
             return candidate
     raise unittest.SkipTest("no free PID available to simulate a dead process")
 
-
-
 class SessionLifecycleTests(unittest.TestCase):
     """A session that dies without cleaning up must not stay active forever."""
 
@@ -162,6 +160,107 @@ class AttributionTests(unittest.TestCase):
             self.assertEqual(result["agent"], "unknown")
             self.assertEqual(result["attribution"]["confidence"], "LOW")
             self.assertIn("no agent session active", result["attribution"]["reason"])
+
+
+class EffectClassificationTests(unittest.TestCase):
+    """Only a change to what the code *does* counts as a symbol change."""
+
+    def _effects(self, root, ledger, versions):
+        seen = []
+        for source in versions:
+            (root/"a.py").write_text(source)
+            result = ledger.refresh(changed_only=True, agent="claude-code", request="edit login")
+            seen.append((result["effect"], result["symbols"]))
+        return seen
+
+    def test_comments_docstrings_and_formatting_are_text_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def login(user):\n    return user is not None\n")
+            ledger=Ledger(root); ledger.init()
+            effects=self._effects(root, ledger, [
+                "def login(user):\n    # improved comment\n    return user is not None\n",
+                'def login(user):\n    """Explain the check."""\n    return user is not None\n',
+                "def login(user):\n\n\n        return user is not None\n",
+            ])
+            self.assertEqual([effect for effect, _ in effects], ["text-only"] * 3, effects)
+            self.assertEqual([symbols for _, symbols in effects], [[]] * 3)
+
+    def test_effect_does_not_depend_on_whether_tree_sitter_is_installed(self):
+        """The same edit must classify the same way under either provider.
+
+        A docstring is a bare string statement, not a comment node, so the
+        tree-sitter path saw documentation as code while the AST path did not —
+        the same file classified differently depending on an optional install.
+        """
+        from codeledger.providers import provider_for, TreeSitterProvider
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def login(user):\n    return user is not None\n")
+            ledger=Ledger(root); ledger.init()
+            if not isinstance(provider_for(source), TreeSitterProvider):
+                self.skipTest("tree-sitter grammars are not installed")
+            for edit in ('def login(user):\n    """Explain the check."""\n    return user is not None\n',
+                         'def login(user):\n    """A different explanation."""\n    return user is not None\n'):
+                source.write_text(edit)
+                self.assertEqual(ledger.refresh(changed_only=True, agent="a", request="doc")["effect"], "text-only")
+
+    def test_shallow_languages_report_effect_at_low_confidence(self):
+        """Line patterns cannot separate a comment from code; that must be said."""
+        from codeledger.providers import provider_for, TreeSitterProvider
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.go"
+            source.write_text("func F(u int) int {\n\treturn u\n}\n")
+            ledger=Ledger(root); ledger.init()
+            source.write_text("func F(u int) int {\n\t// a comment\n\treturn u\n}\n")
+            result=ledger.refresh(changed_only=True, agent="a", request="doc")
+            if isinstance(provider_for(source), TreeSitterProvider):
+                self.assertEqual(result["effect"], "text-only")
+                self.assertEqual(result["effect_confidence"]["level"], "HIGH")
+            else:
+                # Without grammars the comment reads as a code change, so the
+                # answer must be marked untrustworthy rather than asserted.
+                self.assertEqual(result["effect"], "symbols-changed")
+                self.assertEqual(result["effect_confidence"]["level"], "LOW")
+                self.assertIn("a.go", result["effect_confidence"]["shallow_files"])
+                self.assertIn("cannot separate comments", result["effect_confidence"]["reason"])
+
+    def test_python_effect_is_reported_at_high_confidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def f(u):\n    return u\n")
+            ledger=Ledger(root); ledger.init()
+            source.write_text("def f(u):\n    return u is not None\n")
+            result=ledger.refresh(changed_only=True, agent="a", request="fix")
+            self.assertEqual(result["effect"], "symbols-changed")
+            self.assertEqual(result["effect_confidence"]["level"], "HIGH")
+
+    def test_a_real_logic_change_is_still_detected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def login(user):\n    return user is not None\n")
+            ledger=Ledger(root); ledger.init()
+            [(effect, symbols)]=self._effects(root, ledger, ["def login(user):\n    return user is not None and user.active\n"])
+            self.assertEqual((effect, symbols), ("symbols-changed", ["login"]))
+
+    def test_rewriting_a_file_with_identical_bytes_has_no_effect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def login(user):\n    return user is not None\n")
+            ledger=Ledger(root); ledger.init()
+            os.utime(source, (0, 0))   # touched, but the content is unchanged
+            result=ledger.refresh(changed_only=True, agent="claude-code", request="edit login")
+            self.assertEqual(result["effect"], "none"); self.assertIsNone(result["change_id"])
+
+    def test_a_comment_edit_does_not_reassign_authorship_of_the_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def login(user):\n    return user is not None\n")
+            ledger=Ledger(root); ledger.init()
+            source.write_text("def login(user):\n    return user is not None and user.active\n")
+            ledger.refresh(changed_only=True, agent="codex", request="fix login")
+            source.write_text("def login(user):\n    # a later note from another agent\n    return user is not None and user.active\n")
+            ledger.refresh(changed_only=True, agent="claude-code", request="document login")
+            owner=ledger.db.execute("SELECT last_modified_by FROM symbols WHERE name='login'").fetchone()[0]
+            self.assertEqual(owner, "codex", "a comment must not transfer credit for the code")
 
 
 class ConflictTests(unittest.TestCase):
@@ -354,6 +453,81 @@ class MigrationTests(unittest.TestCase):
             path.write_text(json.dumps({"project_name": "p", "root": str(root), "ignores": [],
                                         "from_a_newer_version": {"unknown": True}}))
             self.assertEqual(Ledger(root).config.project_name, "p")
+
+
+class StaleMemoryTests(unittest.TestCase):
+    """The source always outranks the ledger's memory of it."""
+
+    def test_context_reanalyses_a_file_that_changed_behind_its_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"service.py"
+            source.write_text("def authenticateUser():\n    return True\n")
+            ledger=Ledger(root); ledger.init()
+            self.assertEqual(ledger.lookup("authenticateUser")[0]["status"], "active")
+
+            # Edited outside CodeLedger — no refresh, exactly what happens when a
+            # developer or another tool writes to the tree.
+            source.write_text("def login():\n    return True\n")
+            context=ledger.context("authenticateUser")
+            self.assertTrue(context["efficiency"]["stale_records_reanalyzed"])
+            self.assertEqual(ledger.lookup("authenticateUser")[0]["status"], "deleted",
+                             "a symbol that no longer exists must not be reported as active")
+
+    def test_context_retires_symbols_whose_file_was_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"service.py"
+            source.write_text("def authenticateUser():\n    return True\n")
+            ledger=Ledger(root); ledger.init()
+            source.unlink()
+            ledger.context("authenticateUser")
+            self.assertEqual(ledger.lookup("authenticateUser")[0]["status"], "deleted")
+
+    def test_context_reports_what_it_avoided_reading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for i in range(30): (root/f"m{i}.py").write_text(f"def helper{i}():\n    return {i}\n")
+            (root/"auth.py").write_text("def authenticateUser():\n    return True\n")
+            ledger=Ledger(root); ledger.init()
+            efficiency=ledger.context("authenticateUser")["efficiency"]
+            self.assertEqual(efficiency["files_relevant"], 1)
+            self.assertEqual(efficiency["files_in_repository"], 31)
+            self.assertEqual(efficiency["files_avoided"], 30)
+            self.assertFalse(efficiency["full_scan_required"])
+
+    def test_a_targeted_reanalysis_does_not_retire_files_it_never_looked_at(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/"a.py").write_text("def alpha():\n    return 1\n")
+            (root/"b.py").write_text("def beta():\n    return 2\n")
+            ledger=Ledger(root); ledger.init()
+            (root/"a.py").write_text("def alpha():\n    return 99\n")
+            ledger.refresh(changed_only=True, only={"a.py"}, record=False)
+            self.assertEqual(ledger.lookup("beta")[0]["status"], "active")
+
+
+class PathAndSecretTests(unittest.TestCase):
+    def test_spaces_parentheses_and_unicode_in_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)/"HD anti gravity"/"clever-ticket (94-96)"
+            (root/"src"/"café").mkdir(parents=True)
+            (root/"src"/"café"/"módulo.py").write_text('def naïve_señor():\n    return "ok"\n', encoding="utf-8")
+            ledger=Ledger(root); result=ledger.init()
+            self.assertEqual(result["files_added"], 1)
+            self.assertEqual(ledger.lookup("naïve_señor")[0]["path"], "src/café/módulo.py")
+
+    def test_secrets_are_never_indexed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/"app.py").write_text("def run():\n    return 1\n")
+            (root/".env").write_text("API_KEY=sk-live-do-not-index\n")
+            (root/".env.production").write_text("DB_PASSWORD=hunter2\n")
+            (root/"id_rsa").write_text("-----BEGIN PRIVATE KEY-----\n")
+            ledger=Ledger(root); ledger.init()
+            indexed={row["path"] for row in ledger.db.execute("SELECT path FROM files")}
+            self.assertEqual(indexed, {"app.py"})
+            # And no secret value reaches the database in any column.
+            blob=" ".join(str(value) for row in ledger.db.execute("SELECT * FROM files") for value in row)
+            self.assertNotIn("sk-live", blob); self.assertNotIn("hunter2", blob)
 
 
 class CodeLedgerTests(unittest.TestCase):

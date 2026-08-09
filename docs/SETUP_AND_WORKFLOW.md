@@ -25,7 +25,7 @@ Without it, only Python is fully analysed and every other language is indexed
 with line patterns. CodeLedger reports which, rather than guessing:
 
 ```bash
-codeledger doctor      # tree_sitter_installed, shallow_languages, next action
+codeledger doctor      # database, schema, migrations, sessions, index, coverage, protocols
 ```
 
 Installing the extra later upgrades an existing project index automatically on

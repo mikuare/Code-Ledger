@@ -21,6 +21,20 @@ FULL = "full"        # real parse tree; ranges and call edges are trustworthy
 SHALLOW = "shallow"  # line patterns; imports mostly, calls approximate
 NONE = "none"        # indexed by hash only
 
+# Only the first statement of a *body* can be a docstring. The check is scoped
+# to these node types because the first named child of, say, an argument list is
+# often a string too — dropping that would make f("a") and f("b") identical.
+BODY_TYPES = {"block", "module", "program", "source_file", "statement_block", "class_body", "declaration_list"}
+
+def _is_docstring(parent, node) -> bool:
+    """A body's leading bare string literal — documentation, not code."""
+    if not (parent.type in BODY_TYPES or parent.type.endswith("_body")):
+        return False
+    if node.type == "expression_statement":
+        children = node.named_children
+        return len(children) == 1 and "string" in children[0].type
+    return "string" in node.type
+
 class PythonAstProvider:
     name = "ast"
     coverage = FULL
@@ -132,6 +146,39 @@ class TreeSitterProvider:
                 return kind
         return "function"
 
+    @staticmethod
+    def _code_digest(node) -> str:
+        """Hash a symbol's code with its comments removed.
+
+        Every grammar names its comment nodes with "comment" in the type, so the
+        parse tree identifies them exactly — no regex has to guess whether a `#`
+        is a comment or part of a string. Whitespace is collapsed for the same
+        reason the Python path dumps an AST: reformatting is not a code change.
+        """
+        pieces = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if "comment" in current.type:
+                continue
+            if not current.named_children:
+                pieces.append((current.start_byte, current.text.decode("utf-8", errors="replace")))
+                continue
+            children = list(current.named_children)
+            # A docstring is a bare string statement, not a comment node, so
+            # nothing above catches it. Dropping the leading string of a body
+            # keeps documentation out of the code hash, and makes this path agree
+            # with the Python AST path — which strips docstrings by construction.
+            # Without it the same file classified differently depending on
+            # whether an optional grammar package happened to be installed.
+            if children and _is_docstring(current, children[0]):
+                children = children[1:]
+            stack.extend(children)
+        # Leaf text is kept verbatim — collapsing it would erase real differences
+        # inside string literals. Joining leaves with a single space is what
+        # normalizes the indentation and line breaks between them.
+        return digest(" ".join(token for _, token in sorted(pieces)))
+
     def symbols(self, path: Path, text: str) -> list[SymbolData]:
         lines = text.splitlines(); found: list[SymbolData] = []
         stack = [(self._tree(text).root_node, [])]
@@ -144,8 +191,7 @@ class TreeSitterProvider:
                     start, end = node.start_point[0] + 1, node.end_point[0] + 1
                     signature = lines[start - 1].strip() if start <= len(lines) else name
                     qualified = ".".join(scope + [name])
-                    body = "\n".join(lines[start - 1:end])
-                    found.append(SymbolData(name, self._kind(node), start, end, signature, digest(body), qualified))
+                    found.append(SymbolData(name, self._kind(node), start, end, signature, self._code_digest(node), qualified))
                     child_scope = scope + [name]
             for child in node.named_children:
                 stack.append((child, child_scope))

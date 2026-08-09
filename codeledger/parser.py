@@ -50,10 +50,33 @@ def digest_bytes(raw: bytes) -> str:
     """
     return hashlib.sha256(raw).hexdigest()
 
+def strip_docstrings(tree: ast.AST) -> ast.AST:
+    """Remove docstrings so documentation edits do not read as code changes."""
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or not body:
+            continue
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+            node.body = body[1:]
+    return tree
+
+def code_digest(node: ast.AST) -> str:
+    """Hash what a symbol *does*, ignoring how it is written or explained.
+
+    Hashing the raw source lines made every comment, blank line and reindent
+    look like a logic change, so `effect` reported `symbols-changed` for edits
+    that changed no behaviour at all — the exact signal an agent relies on to
+    tell a real fix from one that missed. The AST contains no comments and no
+    formatting, so dumping it compares code to code. Attributes are excluded so
+    that moving a function down a file is not a change to it.
+    """
+    return digest(ast.dump(node, include_attributes=False))
+
 def ast_symbols(text: str) -> list[SymbolData] | None:
     """Python symbols via the AST. None when the source does not parse."""
     try:
-        tree = ast.parse(text)
+        tree = strip_docstrings(ast.parse(text))
     except SyntaxError:
         return None
     lines = text.splitlines(); result = []
@@ -68,7 +91,7 @@ def ast_symbols(text: str) -> list[SymbolData] | None:
             kind = "class" if isinstance(node, ast.ClassDef) else "function"
             signature = lines[start - 1].strip() if start <= len(lines) else node.name
             qualified = ".".join(scopes.get(id(node), []) + [node.name])
-            result.append(SymbolData(node.name, kind, start, end, signature, digest("\n".join(lines[start-1:end])), qualified))
+            result.append(SymbolData(node.name, kind, start, end, signature, code_digest(node), qualified))
     return sorted(result, key=lambda x: (x.start, x.name))
 
 def parse_file(path: Path, text: str) -> list[SymbolData]:
