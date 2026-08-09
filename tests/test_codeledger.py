@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import tempfile
 import threading
@@ -707,6 +708,40 @@ class IncrementalRefreshTests(unittest.TestCase):
                 core.SLOW_FS_SECONDS = original
             self.assertEqual(serial, parallel)
             self.assertTrue(serial)
+
+
+class ReleaseTests(unittest.TestCase):
+    """Guard the packaging mistake that has already shipped twice.
+
+    The version stayed still while the code moved, so `pip install --upgrade`
+    found the requirement satisfied and did nothing: the command succeeded,
+    reported the old version, and left the old code running. Nothing looked
+    wrong, which is why it happened again. A released version must therefore be
+    declared in exactly one place as far as anyone can tell, and must be written
+    down in the changelog.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _declared_version(self) -> str:
+        text = (self.ROOT/"pyproject.toml").read_text(encoding="utf-8")
+        # tomllib is 3.11+, and this must run on 3.10 too.
+        match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+        self.assertIsNotNone(match, "pyproject.toml declares no version")
+        return match.group(1)
+
+    def test_the_package_and_the_module_agree_on_the_version(self):
+        from codeledger import __version__
+        self.assertEqual(self._declared_version(), __version__,
+                         "pyproject.toml and codeledger/__init__.py disagree; "
+                         "an upgrade would install one and report the other")
+
+    def test_the_released_version_is_written_down(self):
+        version = self._declared_version()
+        changelog = (self.ROOT/"CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{version}]", changelog,
+                      f"CHANGELOG.md has no section for {version}. Move the entry out of "
+                      "[Unreleased] when releasing, or nobody can tell what they upgraded into")
 
 
 class PathAndSecretTests(unittest.TestCase):
