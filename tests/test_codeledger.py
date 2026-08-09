@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 import os
 import sys
@@ -86,6 +87,96 @@ class SessionLifecycleTests(unittest.TestCase):
 
 class ConcurrencyAndRecoveryTests(unittest.TestCase):
     """Two agents and a watcher share one database; nothing may be lost."""
+
+    def test_concurrent_refreshes_from_separate_connections_lose_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for i in range(8): (root/f"m{i}.py").write_text(f"def f{i}():\n    return {i}\n")
+            Ledger(root).init()
+            # Every file must genuinely differ: `return 0` and `return 0 * 100`
+            # are the same text, and a file that did not change proves nothing.
+            for i in range(8): (root/f"m{i}.py").write_text(f"def f{i}():\n    return {i} + 1\n")
+
+            errors, done = [], []
+            def worker(name):
+                try:
+                    # A separate Ledger means a separate sqlite connection, which
+                    # is what two agent processes actually have.
+                    done.append(Ledger(root).refresh(changed_only=True, agent=name, request=f"{name} work"))
+                except Exception as exc:                      # noqa: BLE001 - surfaced below
+                    errors.append(f"{name}: {exc}")
+            threads=[threading.Thread(target=worker, args=(f"agent-{i}",)) for i in range(4)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(timeout=60)
+
+            self.assertEqual(errors, [], "concurrent writers must not collide")
+            ledger=Ledger(root)
+            self.assertEqual(ledger.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            # Whichever writer got there first recorded the edits; the rest saw a
+            # clean tree. What must never happen is the edits vanishing.
+            recorded={row["path"] for row in ledger.db.execute("SELECT path FROM change_files")}
+            self.assertEqual(recorded, {f"m{i}.py" for i in range(8)})
+
+    def test_concurrent_refreshes_do_not_each_claim_the_same_edit(self):
+        """One edit must produce one change record, credited to one agent.
+
+        Reads inside a refresh used a snapshot taken when its transaction began,
+        so an agent could not see an edit another agent had already recorded and
+        would index and record it again. Four agents refreshing together
+        produced four HIGH-confidence records for the same edit — fabricated
+        authorship for three of them, and inflated attempt counts that
+        `progress` would later read as a repeat.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for i in range(8): (root/f"m{i}.py").write_text(f"def f{i}():\n    return {i}\n")
+            Ledger(root).init()
+            for i in range(8): (root/f"m{i}.py").write_text(f"def f{i}():\n    return {i} + 1\n")
+
+            errors=[]
+            def worker(name):
+                try: Ledger(root).refresh(changed_only=True, agent=name, request=f"{name} work")
+                except Exception as exc:                      # noqa: BLE001 - surfaced below
+                    errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            threads=[threading.Thread(target=worker, args=(f"agent-{i}",)) for i in range(4)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(timeout=60)
+
+            self.assertEqual(errors, [])
+            ledger=Ledger(root)
+            self.assertEqual(ledger.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            counts={row["path"]: row["c"] for row in ledger.db.execute(
+                "SELECT path,count(*) AS c FROM change_files GROUP BY path")}
+            self.assertEqual(set(counts), {f"m{i}.py" for i in range(8)}, "no edit may be lost")
+            self.assertEqual([path for path, count in counts.items() if count > 1], [],
+                             "no edit may be recorded more than once")
+
+    def test_a_change_record_and_its_index_update_commit_together(self):
+        """A crash between the two used to leave indexed files with no change row."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            before=ledger.db.execute("SELECT hash FROM files WHERE path='a.py'").fetchone()[0]
+            source.write_text("def alpha():\n    return 2\n")
+
+            real=ledger.record_change
+            def explode(*args, **kwargs):
+                real(*args, **kwargs)          # write the change rows...
+                raise RuntimeError("process killed mid-refresh")
+            ledger.record_change=explode
+            with self.assertRaises(RuntimeError): ledger.refresh(changed_only=True, agent="codex", request="fix alpha")
+
+            # The interrupted transaction must roll back whole. A fresh
+            # connection sees either all of it or none of it — never a file
+            # marked current with no change row explaining it.
+            fresh=Ledger(root)
+            self.assertEqual(fresh.db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(fresh.db.execute("SELECT count(*) FROM changes").fetchone()[0], 0)
+            self.assertEqual(fresh.db.execute("SELECT hash FROM files WHERE path='a.py'").fetchone()[0], before,
+                             "the index update must roll back with the change record")
+            # And the edit is still pending, so the next refresh picks it up.
+            self.assertEqual(fresh.refresh(changed_only=True, agent="codex", request="fix alpha")["effect"], "symbols-changed")
 
     def test_status_survives_a_shutdown_that_killed_every_session(self):
         with tempfile.TemporaryDirectory() as directory:

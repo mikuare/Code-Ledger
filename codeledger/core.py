@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import uuid
 import os
 import socket
@@ -252,10 +253,46 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                         (NOW(), NOW(), session_id, *LIVE))
         self.db.commit()
 
-    def refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False) -> dict[str, int | str | None | list[str] | dict]:
+    def _begin_immediate(self) -> None:
+        """Acquire the write lock now, so subsequent reads see committed state.
+
+        `busy_timeout` makes this wait for another agent rather than fail. If a
+        transaction is somehow already open the existing one is kept — starting
+        a nested transaction is an error, and the caller's work still commits.
+        """
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if "within a transaction" not in str(exc):
+                raise
+
+    def refresh(self, *args, **kwargs) -> dict[str, int | str | None | list[str] | dict]:
+        """Index changed files as one transaction, releasing the lock on failure.
+
+        A refresh writes many rows before committing, so an exception part-way
+        through leaves an open write transaction. SQLite allows one writer, and
+        `watch` and the MCP server are long-lived: without this rollback a single
+        failed refresh would hold the write lock for the rest of the process's
+        life, and every other agent's write would block until it timed out.
+        """
+        try:
+            return self._refresh(*args, **kwargs)
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def _refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False) -> dict[str, int | str | None | list[str] | dict]:
         started = time.perf_counter(); statuses = git_status(self.root) if include_git_status and (self.root / ".git").exists() and analyze else {}
         actor = agent or "unknown"   # attribution is recorded as given; it is never guessed
         if session: self.touch_session(session)
+        # Take the write lock before reading anything the indexing pass decides
+        # on. A deferred transaction begins at the *first write*, so every read
+        # before that saw a snapshot which another agent's commit had already
+        # superseded: two agents refreshing together each re-indexed the same
+        # edit and each recorded a change for it, inventing authorship for one
+        # of them. Readers are never blocked by this — WAL keeps `context`,
+        # `since` and `impact` fast while writers take turns.
+        self._begin_immediate()
         seen, changed_paths, changed_symbols = set(), [], []
         added, modified, deleted, symbols = 0, 0, 0, 0
         discovery_started = time.perf_counter(); discovered = list(self._discover(verbose=verbose)); discovery_seconds = time.perf_counter() - discovery_started
@@ -334,14 +371,19 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 for symbol in self.db.execute("SELECT name FROM symbols WHERE file_id=? AND status='active'", (row["id"],)).fetchall():
                     changed_symbols.append(symbol["name"])
                 self.db.execute("UPDATE symbols SET status='deleted',deleted_at=?,updated_at=?,last_modified_by=?,last_modified_session=? WHERE file_id=? AND status='active'", (NOW(), NOW(), actor, session, row["id"]))
-        db_started = time.perf_counter(); self.db.commit(); db_seconds = time.perf_counter() - db_started; total = time.perf_counter() - started
+        db_started = time.perf_counter()
         change_id = None
         # Did the edit actually do anything? A file rewritten with identical
         # content never reaches here, so "text-only" means the bytes moved but
         # no symbol did: formatting, comments, or an edit that missed.
         effect = "symbols-changed" if changed_symbols else "text-only" if changed_paths else "none"
+        # The index update and the change record are one fact and are committed
+        # once. Committing the index first left a window where a crash produced
+        # files marked changed with no change row to explain them, so `since`
+        # and `progress` silently under-reported.
         if record and changed_paths:
-            change_id = self.record_change(agent, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN", effect=effect)
+            change_id = self.record_change(agent, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN", effect=effect, commit=False)
+        self.db.commit(); db_seconds = time.perf_counter() - db_started; total = time.perf_counter() - started
         result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
         if request:
             result["scope"] = self.scope_check(request, changed_paths, changed_symbols)
@@ -727,7 +769,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         row = self.db.execute("SELECT s.*,a.name AS agent FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id WHERE s.session_id=?", (session_id,)).fetchone()
         return dict(row) if row else {"session_id": session_id, "status": "not_found"}
 
-    def record_change(self, agent: str, session: str, request: str, summary: str, result: str = "unverified", files: list[str] | None = None, symbols: list[str] | None = None, added: int = 0, modified: int = 0, deleted: int = 0, risk: str | None = None, effect: str | None = None) -> int:
+    def record_change(self, agent: str, session: str, request: str, summary: str, result: str = "unverified", files: list[str] | None = None, symbols: list[str] | None = None, added: int = 0, modified: int = 0, deleted: int = 0, risk: str | None = None, effect: str | None = None, commit: bool = True) -> int:
         files, symbols = files or [], symbols or []
         # `risk` is derived from the recorded request, never invented: with no
         # request there is no evidence, so it stays UNKNOWN.
@@ -741,7 +783,8 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         for name in symbols:
             symbol_row = self.db.execute("SELECT id FROM symbols WHERE name=? ORDER BY status='active' DESC LIMIT 1", (name,)).fetchone()
             self.db.execute("INSERT OR IGNORE INTO change_symbols(change_id,symbol_id,name,status) VALUES(?,?,?,?)", (change_id, symbol_row[0] if symbol_row else None, name, "changed"))
-        self.db.commit(); return change_id
+        if commit: self.db.commit()
+        return change_id
 
     def verify(self, subject_type: str, subject_id: str, kind: str, result: str, evidence: str = "") -> dict:
         now = NOW()
