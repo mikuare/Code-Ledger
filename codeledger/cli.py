@@ -16,6 +16,28 @@ def emit(value, as_json=False):
         for item in value: print(item if isinstance(item, str) else json.dumps(item, default=str))
     else: print(value)
 
+def emit_refresh(value, as_json=False):
+    """Show what the refresh cost and what it actually looked at."""
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    scan, timing = value["scan"], value["timing"]
+    print("CODELEDGER REFRESH\n")
+    for label, key in (("Discovery", "discovery_seconds"), ("Hashing", "hashing_seconds"),
+                       ("Parsing", "parsing_seconds"), ("Database", "database_seconds")):
+        print(f"  {label:<10} {timing[key]:8.3f}s")
+    print(f"  {'Total':<10} {timing['total_seconds']:8.3f}s\n")
+    print(f"  Files checked   {scan['files_checked']}  ({scan['stat_mode']} stat)")
+    print(f"  Files changed   {scan['files_changed']}")
+    if scan["files_changed"]:
+        print(f"  Files analyzed  {scan['files_analyzed']}")
+        print(f"  Symbols changed {len(value['symbols'])}")
+    print(f"  Directories     {scan['directories_visited']} visited, {scan['directories_pruned']} pruned")
+    print(f"  Traversal       {scan['traversal']}")
+    print(f"\n  Effect: {value['effect']}" + (f" ({value['effect_confidence']['level']} confidence)"
+                                              if value.get("effect_confidence", {}).get("level") == "LOW" else ""))
+    if value.get("change_id"): print(f"  Recorded change #{value['change_id']} as {value['agent']} ({value['attribution']['confidence']} confidence)")
+    if value.get("conflicts"): print(f"\n  {value['conflicts']['message']}")
+    if value.get("scope", {}).get("status") == "WARNING": print(f"\n  SCOPE WARNING: {value['scope']['unexpected_files']}")
+
 def emit_since(value, as_json=False):
     """A handoff answer is read by a human or pasted into an agent's context.
 
@@ -314,7 +336,7 @@ def main(argv=None):
     if args.command == "doctor": emit_doctor(ledger.doctor(), args.as_json); return 0
     if args.command == "init": value=ledger.init(args.quick, args.verbose); value["root"]=str(ledger.root)
     elif args.command == "status": value=ledger.status()
-    elif args.command == "refresh": value=ledger.refresh(args.changed, args.agent, args.session, args.request, verbose=args.verbose)
+    elif args.command == "refresh": emit_refresh(ledger.refresh(args.changed, args.agent, args.session, args.request, verbose=args.verbose), args.as_json); return 0
     elif args.command == "lookup": value=ledger.lookup(args.query)
     elif args.command == "impact": value=ledger.impact(args.query, scan=args.scan)
     elif args.command == "context": value=ledger.context(args.query)

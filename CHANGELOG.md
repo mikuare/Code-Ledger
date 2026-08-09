@@ -10,6 +10,40 @@ to be wrong — which is the failure mode this project exists to avoid.
 
 ## [Unreleased]
 
+### Changed
+
+- **Incremental refresh made ~3x cheaper on WSL `/mnt/c`.** Profiling an 800-file
+  project put 94–99% of a no-op refresh in discovery, and 70% of discovery in a
+  single call: `DirEntry.stat`. Nothing was being hashed or parsed — the whole
+  cost was proving that 800 files had *not* changed. A stat costs about 2µs on a
+  local ext4 volume and about 1ms across `/mnt/c`, where each one is a round-trip
+  to the Windows filesystem driver.
+
+  Discovery now separates the walk from the stat: the walk decides which files
+  matter using only what `readdir` already returned, so nothing is stat-ed until
+  the surviving set is known and a pruned directory costs nothing. Those stats
+  are then issued in parallel — `os.stat` releases the GIL, and the round-trips
+  overlap almost perfectly, turning 1.84s of waiting into 0.17s on a sample of
+  800 files.
+
+  Threading is chosen by measurement, not by guessing the filesystem: a sample is
+  stat-ed serially and timed, and the pool is used only if this volume is
+  genuinely slow. That matters because on ext4 the pool is a large *pessimisation*
+  — 1.4ms of work becomes 25ms of scheduling — so a naive "always parallel" would
+  have made native Linux projects 18x slower. The hot path also no longer builds
+  a `Path` per entry to take it apart again.
+
+  Measured on identical cold fixtures, 800 source files plus 4,000 ignored, on
+  `/mnt/c`: no-op refresh 2.03s → 0.68s, one-file refresh 1.86s → 0.49s. On ext4
+  the same project answers a no-op in 17ms, and 5,000 files in 146ms.
+
+  A full traversal still happens, and still stats every source file. That is
+  deliberate: nothing cheaper can prove a file's contents did not change —
+  directory mtime does not move when a file is edited — so skipping it would mean
+  reporting "no changes" without knowing. `refresh` now reports what it cost:
+  files checked, files changed, files analysed, directories pruned, whether stats
+  ran serially or in parallel, and whether the traversal was full or targeted.
+
 ### Fixed
 
 - **Phantom sessions made every later edit `unknown`.** A session was only ever

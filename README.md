@@ -55,6 +55,39 @@ codeledger refresh --changed --verbose
 
 `--quick` discovers source files, records size/mtime/hash metadata, and skips semantic parsing. The following `refresh --changed` parses only files that still need analysis. Normal refreshes use `os.scandir()` with directory pruning, avoid symlinks, skip non-source files and files larger than the configured limit, and reuse size/mtime metadata before hashing. Configure `source_extensions`, `max_file_size`, `ignores`, and `follow_symlinks` in `.ai/codeledger/config.json`.
 
+### What an incremental refresh costs
+
+`refresh` reports its own price, so a slow project can be diagnosed rather than guessed at:
+
+```text
+CODELEDGER REFRESH
+
+  Discovery      0.331s
+  Hashing        0.000s
+  Parsing        0.000s
+  Database       0.001s
+  Total          0.334s
+
+  Files checked   800  (parallel stat)
+  Files changed   0
+  Directories     19 visited, 2 pruned
+  Traversal       full
+```
+
+Proving that nothing changed means asking every source file for its size and mtime — a directory's timestamp does not move when a file inside it is edited, so there is no cheaper way to be sure, and CodeLedger will not report "no changes" on a guess. What it avoids is the expensive part: nothing is read, hashed, or parsed unless its metadata moved, and ignored directories are pruned before they are entered.
+
+That one `stat` per file is the whole cost, and its price varies enormously — roughly 2µs on a local Linux volume against 1ms across `/mnt/c`, where every call is a round-trip to the Windows filesystem driver. Those round-trips are issued in parallel when, and only when, a timed sample shows the volume is slow enough to be worth it; on a fast volume the thread pool would cost far more than the work.
+
+Measured on 800 source files plus 4,000 ignored files, cold:
+
+| | `/mnt/c` (WSL) | native Linux volume |
+|---|---|---|
+| no-op refresh | 0.68s | 0.017s |
+| one-file refresh | 0.49s | 0.026s |
+| 5,000 files, no-op | 3.8s | 0.15s |
+
+**If your project can live on the Linux filesystem rather than under `/mnt/c`, put it there.** It is roughly 25× faster here, and that is a property of the WSL filesystem boundary, not of CodeLedger.
+
 ## Agent workflow
 
 Start a session before an agent edits the project, then refresh afterward. Refresh only reparses changed files and automatically records the agent, session, changed files, and changed symbols.

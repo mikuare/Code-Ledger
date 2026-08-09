@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import fnmatch
+import os
 from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 
@@ -59,14 +60,24 @@ class Config:
         return list(dict.fromkeys(patterns))
 
     def is_ignored(self, path: Path, root: Path, patterns: list[str] | None = None) -> bool:
-        rel = path.relative_to(root).as_posix() if path.is_absolute() else path.as_posix(); name = path.name
+        rel = path.relative_to(root).as_posix() if path.is_absolute() else path.as_posix()
+        return self.is_ignored_rel(rel, path.name, patterns or self.ignore_patterns(root))
+
+    def is_ignored_rel(self, rel: str, name: str, patterns: list[str]) -> bool:
+        """The same decision as `is_ignored`, on strings the walk already has.
+
+        Discovery asks this once per entry, so building a `Path` here to take it
+        apart again was a measurable share of a no-op refresh on a large tree.
+        Callers that already know the relative path and the name skip that.
+        """
         if name in SECRET_NAMES or name.startswith(".env."):
             return True
-        for item in patterns or self.ignore_patterns(root):
+        for item in patterns:
             item = item.rstrip("/")
             if rel == item or rel.startswith(item + "/") or name == item or fnmatch.fnmatch(rel, item):
                 return True
         return False
 
     def is_source_file(self, name: str) -> bool:
-        return Path(name).suffix.lower() in (self.source_extensions or DEFAULT_SOURCE_EXTENSIONS)
+        # os.path.splitext matches Path().suffix here and costs far less.
+        return os.path.splitext(name)[1].lower() in (self.source_extensions or DEFAULT_SOURCE_EXTENSIONS)

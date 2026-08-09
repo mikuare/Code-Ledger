@@ -7,6 +7,7 @@ import os
 import socket
 import time
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,18 @@ LIKE_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 STOPWORDS = {"add", "also", "and", "any", "app", "back", "been", "code", "create", "change", "changes", "current", "delete", "each", "file", "files", "fix", "from", "have", "into", "make", "more", "must", "need", "new", "not", "only", "page", "please", "remove", "should", "some", "that", "the", "them", "then", "there", "this", "update", "use", "using", "when", "where", "which", "with", "without", "work"}
 
 NOW = lambda: datetime.now(timezone.utc).isoformat()
+
+# How discovery decides whether this filesystem is slow enough to be worth
+# threading. The gap it separates is enormous — microseconds on a local volume
+# against milliseconds across /mnt/c — so the exact threshold is not delicate.
+SLOW_FS_SAMPLE = 48
+SLOW_FS_SECONDS = 0.0001
+STAT_WORKERS = 16
+# How recently a file must have been modified for its size and mtime to be
+# treated as insufficient evidence. It only has to exceed the filesystem's
+# timestamp granularity; a couple of seconds is far past any of them and costs
+# nothing, because a file this recent is one an agent just wrote.
+RACE_WINDOW_NS = 2_000_000_000
 
 # A session is only "live" while something is still happening in it. ACTIVE and
 # IDLE both mean the agent is still there — an agent can legitimately think for
@@ -70,11 +83,13 @@ class DiscoveryMetrics:
     files_skipped_type: int = 0
     permission_errors: int = 0
     broken_symlinks: int = 0
+    files_stat: int = 0
+    stat_mode: str = "serial"
     paths: list[str] = field(default_factory=list)
     large_files: list[tuple[str, int, int]] = field(default_factory=list)
 
     def as_dict(self):
-        return {"directories_visited": self.directories_visited, "directories_skipped": self.directories_skipped, "files_discovered": self.files_discovered, "files_ignored": self.files_ignored, "files_skipped_large": self.files_skipped_large, "files_skipped_type": self.files_skipped_type, "permission_errors": self.permission_errors, "broken_symlinks": self.broken_symlinks}
+        return {"directories_visited": self.directories_visited, "directories_skipped": self.directories_skipped, "files_discovered": self.files_discovered, "files_ignored": self.files_ignored, "files_skipped_large": self.files_skipped_large, "files_skipped_type": self.files_skipped_type, "permission_errors": self.permission_errors, "broken_symlinks": self.broken_symlinks, "files_stat": self.files_stat, "stat_mode": self.stat_mode}
 
 class Ledger:
     def __init__(self, root: Path):
@@ -125,9 +140,60 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         integration.parent.mkdir(parents=True, exist_ok=True)
         integration.write_text("# CodeLedger Agent Integration\n\n## One-time Codex setup\n\nRun `codeledger setup-codex` from this project. It registers the local MCP server with Codex using the absolute project path. Start a new Codex session after setup if Codex was already running.\n\n## Persistent workflow\n\nRun `codeledger watch --agent codex` in a second terminal and leave it running while Codex works. The watcher records changed files and symbols without requiring `status` or `changes` after every task.\n\n## MCP tools\n\nCodex can call `codeledger_get_context`, `codeledger_find_symbol`, `codeledger_get_impact`, `codeledger_get_history`, `codeledger_get_recent_changes`, `codeledger_get_issues`, `codeledger_get_decisions`, `codeledger_record_change`, and `codeledger_mark_verified` during an ongoing conversation.\n", encoding="utf-8")
 
+    def _stat_all(self, candidates: list[tuple[str, str]], metrics: DiscoveryMetrics):
+        """Stat every candidate file, in parallel only where that actually helps.
+
+        `stat` is the whole cost of discovery on a large tree, and its price
+        varies by three orders of magnitude: about 2us on a local ext4 volume,
+        about 1ms across the WSL /mnt/c boundary, where every call is a
+        round-trip to the Windows filesystem driver. Those round-trips overlap
+        almost perfectly, so a thread pool turns a second of waiting into a
+        tenth of one — but on a fast volume the pool costs far more than the
+        work, turning 1.4ms into 25ms.
+
+        So the choice is measured rather than guessed: stat a sample serially,
+        time it, and only spread the rest across threads if this filesystem is
+        actually slow enough to pay for them. No filesystem detection, no
+        configuration, and it adapts to volumes this code has never seen.
+        """
+        results: list[tuple[str, str, os.stat_result]] = []
+
+        def record(path: str, rel: str):
+            try:
+                return (path, rel, os.stat(path, follow_symlinks=False))
+            except (OSError, ValueError):
+                metrics.permission_errors += 1
+                return None
+
+        metrics.files_stat = len(candidates)
+        sample = candidates[:SLOW_FS_SAMPLE]
+        started = time.perf_counter()
+        results.extend(item for item in (record(path, rel) for path, rel in sample) if item)
+        rest = candidates[len(sample):]
+        if not rest:
+            return results
+        per_file = (time.perf_counter() - started) / max(1, len(sample))
+        if per_file < SLOW_FS_SECONDS:
+            results.extend(item for item in (record(path, rel) for path, rel in rest) if item)
+            return results
+        # A slow volume: overlap the waiting. Threads only, no processes and no
+        # daemon — `os.stat` releases the GIL, which is the entire reason this
+        # works and the reason nothing here needs to be shared or locked.
+        metrics.stat_mode = "parallel"
+        with ThreadPoolExecutor(max_workers=STAT_WORKERS) as pool:
+            results.extend(item for item in pool.map(lambda pair: record(*pair), rest, chunksize=32) if item)
+        return results
+
     def _discover(self, verbose: bool = False):
-        """Discover source files without descending into ignored directories."""
+        """Discover source files without descending into ignored directories.
+
+        The walk decides *which* files matter using only what `readdir` already
+        returned; nothing is stat-ed until the set is known, so the expensive
+        call is made once per surviving file and never for a pruned directory.
+        """
         metrics = DiscoveryMetrics(); patterns = self.config.ignore_patterns(self.root)
+        prefix = len(str(self.root)) + 1
+        candidates: list[tuple[str, str]] = []
         stack = [self.root]
         while stack:
             directory = stack.pop(); metrics.directories_visited += 1
@@ -138,8 +204,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 continue
             try:
                 for entry in entries:
-                    rel = Path(entry.path).relative_to(self.root).as_posix()
-                    rel_path = Path(rel)
+                    rel = entry.path[prefix:].replace(os.sep, "/")
                     try:
                         if entry.is_symlink():
                             if not self.config.follow_symlinks:
@@ -148,30 +213,31 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                                 if verbose: print(f"Skipping symlink: {rel}")
                                 continue
                         if entry.is_dir(follow_symlinks=self.config.follow_symlinks):
-                            if self.config.is_ignored(rel_path, self.root, patterns):
+                            if self.config.is_ignored_rel(rel, entry.name, patterns):
                                 metrics.directories_skipped += 1
                                 if verbose: print(f"Skipping directory: {rel}/")
                             else:
                                 stack.append(Path(entry.path))
                             continue
-                        if self.config.is_ignored(rel_path, self.root, patterns):
+                        if self.config.is_ignored_rel(rel, entry.name, patterns):
                             metrics.files_ignored += 1
                             continue
                         if not self.config.is_source_file(entry.name):
                             metrics.files_skipped_type += 1
                             continue
-                        stat = entry.stat(follow_symlinks=False)
-                        if stat.st_size > self.config.max_file_size:
-                            metrics.files_skipped_large += 1
-                            metrics.large_files.append((rel, stat.st_size, stat.st_mtime_ns))
-                            if verbose: print(f"Skipping large file: {rel} ({stat.st_size} bytes)")
-                            continue
-                        metrics.files_discovered += 1; metrics.paths.append(rel)
-                        yield Path(entry.path), rel, stat.st_size, stat.st_mtime_ns, metrics
+                        candidates.append((entry.path, rel))
                     except (OSError, PermissionError):
                         metrics.permission_errors += 1
             finally:
                 entries.close()
+        for path, rel, stat in self._stat_all(candidates, metrics):
+            if stat.st_size > self.config.max_file_size:
+                metrics.files_skipped_large += 1
+                metrics.large_files.append((rel, stat.st_size, stat.st_mtime_ns))
+                if verbose: print(f"Skipping large file: {rel} ({stat.st_size} bytes)")
+                continue
+            metrics.files_discovered += 1; metrics.paths.append(rel)
+            yield Path(path), rel, stat.st_size, stat.st_mtime_ns, metrics
         self._last_discovery_metrics = metrics
 
     def _files(self):
@@ -334,6 +400,9 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         self._begin_immediate()
         seen, changed_paths, changed_symbols = set(), [], []
         added, modified, deleted, symbols = 0, 0, 0, 0
+        # Captured before the walk: a file whose mtime is at or after this may
+        # have been written during the scan itself, so it cannot be trusted.
+        scan_started_ns = time.time_ns()
         discovery_started = time.perf_counter(); discovered = list(self._discover(verbose=verbose))
         # A targeted re-analysis looks at a named handful of files. It is a
         # partial view of the tree, so it must not also decide what was deleted.
@@ -353,7 +422,17 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             # losing) grammars would leave stale, weaker analysis in place.
             current_version = version_for(path) if analyze else None
             fresh = bool(old) and old["status"] == "current" and old["analysis_version"] == current_version
-            if changed_only and fresh and old["size"] == size and old["mtime_ns"] == mtime_ns:
+            # Size and mtime are only proof for a file that has settled. A
+            # filesystem timestamp is granular — a few milliseconds — so a
+            # rewrite can share an mtime with the write before it, and if it also
+            # preserves the size (a digit, a comparison, a boolean) then both
+            # match what was indexed and the edit is invisible. It stays
+            # invisible until something else touches the file. So anything
+            # modified within the last moment is settled by reading it instead.
+            # Steady state pays nothing: no file has a recent mtime, so nothing
+            # is hashed. This is git's "racily clean" rule.
+            racy = mtime_ns > scan_started_ns - RACE_WINDOW_NS
+            if changed_only and fresh and not racy and old["size"] == size and old["mtime_ns"] == mtime_ns:
                 continue
             hash_started = time.perf_counter(); raw = path.read_bytes(); file_hash = digest_bytes(raw); hash_seconds += time.perf_counter() - hash_started
             if changed_only and fresh and old["hash"] == file_hash:
@@ -447,7 +526,14 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if record and changed_paths:
             change_id = self.record_change(actor, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN", effect=effect, attribution=attribution, commit=False)
         self.db.commit(); db_seconds = time.perf_counter() - db_started; total = time.perf_counter() - started
-        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "effect_confidence": effect_confidence, "agent": actor, "attribution": attribution, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
+        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "effect_confidence": effect_confidence, "agent": actor, "attribution": attribution, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "scan": {
+            # What the refresh actually had to look at. `files_checked` is the
+            # honest cost: every source file is still stat-ed to prove it did
+            # not change, because nothing cheaper can prove that.
+            "files_checked": metrics.files_stat, "files_changed": len(changed_paths),
+            "files_analyzed": added + modified, "directories_visited": metrics.directories_visited,
+            "directories_pruned": metrics.directories_skipped, "stat_mode": metrics.stat_mode,
+            "traversal": "targeted" if only is not None else "full"}, "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
         if attribution_note:
             result["attribution_note"] = attribution_note
         if changed_paths:

@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import os
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from codeledger.cli import build_parser
 from codeledger.core import Ledger, process_alive
 from codeledger.db import SCHEMA
+from codeledger.parser import digest_bytes
 from codeledger.providers import capabilities, provider_for
 
 def dead_pid() -> int:
@@ -503,6 +505,152 @@ class StaleMemoryTests(unittest.TestCase):
             (root/"a.py").write_text("def alpha():\n    return 99\n")
             ledger.refresh(changed_only=True, only={"a.py"}, record=False)
             self.assertEqual(ledger.lookup("beta")[0]["status"], "active")
+
+
+class IncrementalRefreshTests(unittest.TestCase):
+    """A refresh must look at every file, but analyse only what changed."""
+
+    def _project(self, directory, count=60, settled=True):
+        root = Path(directory)
+        for i in range(count):
+            (root/"src").mkdir(exist_ok=True)
+            (root/"src"/f"m{i}.py").write_text(f"def helper{i}():\n    return {i}\n")
+        noise = root/"node_modules"/"pkg"; noise.mkdir(parents=True)
+        for i in range(40): (noise/f"dep{i}.js").write_text("module.exports = 1;\n")
+        if settled:
+            # A real project's files were not written milliseconds ago. Age them
+            # so the racily-clean guard is not (correctly) re-reading everything.
+            old = time.time() - 3600
+            for path in root.rglob("*"):
+                if path.is_file(): os.utime(path, (old, old))
+        return root
+
+    def test_a_no_op_refresh_parses_and_hashes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); ledger=Ledger(root); ledger.init()
+            result=ledger.refresh(changed_only=True)
+            self.assertEqual(result["effect"], "none")
+            self.assertEqual(result["files"], [])
+            # Proving nothing changed costs one stat per file and no reads.
+            self.assertEqual(result["timing"]["hashing_seconds"], 0.0)
+            self.assertEqual(result["timing"]["parsing_seconds"], 0.0)
+            self.assertEqual(result["scan"]["files_checked"], 60)
+            self.assertEqual(result["scan"]["files_analyzed"], 0)
+
+    def test_ignored_directories_are_never_stat_ed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); ledger=Ledger(root); ledger.init()
+            scan=ledger.refresh(changed_only=True)["scan"]
+            self.assertEqual(scan["files_checked"], 60, "node_modules must not be stat-ed")
+            self.assertGreaterEqual(scan["directories_pruned"], 1)
+
+    def test_one_changed_file_leaves_the_rest_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); ledger=Ledger(root); ledger.init()
+            before={row["path"]: row["last_analyzed"] for row in ledger.db.execute("SELECT path,last_analyzed FROM files")}
+            (root/"src"/"m7.py").write_text("def helper7():\n    return 700\n")
+            result=ledger.refresh(changed_only=True, agent="codex", request="fix helper7")
+            self.assertEqual(result["files"], ["src/m7.py"])
+            self.assertEqual(result["scan"]["files_analyzed"], 1)
+            after={row["path"]: row["last_analyzed"] for row in ledger.db.execute("SELECT path,last_analyzed FROM files")}
+            moved=[path for path in before if before[path] != after[path]]
+            self.assertEqual(moved, ["src/m7.py"], "only the edited file may be re-analysed")
+
+    def test_a_new_file_is_indexed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); ledger=Ledger(root); ledger.init()
+            (root/"src"/"brand_new.py").write_text("def freshly_added():\n    return 1\n")
+            result=ledger.refresh(changed_only=True, agent="codex", request="add it")
+            self.assertEqual(result["files_added"], 1)
+            self.assertEqual(ledger.lookup("freshly_added")[0]["status"], "active")
+
+    def test_a_deleted_file_is_marked_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); ledger=Ledger(root); ledger.init()
+            (root/"src"/"m3.py").unlink()
+            result=ledger.refresh(changed_only=True, agent="codex", request="remove it")
+            self.assertIn("src/m3.py", result["files"])
+            self.assertEqual(ledger.db.execute("SELECT status FROM files WHERE path='src/m3.py'").fetchone()[0], "deleted")
+            # `lookup` is a substring match, so name helper3 exactly: helper30
+            # through helper39 are still very much alive.
+            self.assertEqual(ledger.db.execute("SELECT status FROM symbols WHERE name='helper3'").fetchone()[0], "deleted")
+
+    def test_a_renamed_file_retires_the_old_path_and_indexes_the_new_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); ledger=Ledger(root); ledger.init()
+            (root/"src"/"m5.py").rename(root/"src"/"renamed.py")
+            ledger.refresh(changed_only=True, agent="codex", request="rename")
+            self.assertEqual(ledger.db.execute("SELECT status FROM files WHERE path='src/m5.py'").fetchone()[0], "deleted")
+            self.assertEqual(ledger.db.execute("SELECT status FROM files WHERE path='src/renamed.py'").fetchone()[0], "current")
+
+    def test_a_reverted_file_is_detected_even_though_it_matches_the_old_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); source=root/"src"/"m2.py"
+            original=source.read_text()
+            ledger=Ledger(root); ledger.init()
+            source.write_text("def helper2():\n    return 999\n")
+            ledger.refresh(changed_only=True, agent="codex", request="change")
+            source.write_text(original)                      # reverted
+            result=ledger.refresh(changed_only=True, agent="codex", request="revert")
+            self.assertEqual(result["files"], ["src/m2.py"])
+            self.assertEqual(ledger.db.execute("SELECT hash FROM files WHERE path='src/m2.py'").fetchone()[0],
+                             digest_bytes(original.encode()))
+
+    def test_a_same_size_rewrite_within_one_timestamp_tick_is_still_detected(self):
+        """The racily-clean case: identical size, identical mtime, different bytes.
+
+        Filesystem timestamps are granular — a few milliseconds here — so two
+        writes can share an mtime. If the second one also happens to preserve the
+        file's size (changing a digit, a comparison, a boolean), then size and
+        mtime both match what was indexed and the edit is invisible. It stays
+        invisible until something else touches the file, so the ledger reports
+        "nothing changed" about code that did.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 10\n")
+            ledger=Ledger(root); ledger.init()
+            missed=0
+            for i in range(40):
+                # No sleep: land the rewrite inside the same tick as the refresh
+                # that recorded the previous one. Same length every time.
+                source.write_text(f"def alpha():\n    return {20 + i}\n")
+                if ledger.refresh(changed_only=True, agent="codex", request="edit")["change_id"] is None:
+                    missed += 1
+            self.assertEqual(missed, 0, "a same-size edit sharing an mtime must not be skipped")
+            self.assertEqual(ledger.db.execute("SELECT hash FROM files WHERE path='a.py'").fetchone()[0],
+                             digest_bytes(source.read_bytes()))
+
+    def test_a_settled_file_is_not_rehashed(self):
+        """The race guard must not cost anything once a file has stopped moving."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            old = time.time() - 3600
+            os.utime(source, (old, old))          # last touched an hour ago
+            ledger.refresh(changed_only=True)     # settle the recorded mtime
+            result = ledger.refresh(changed_only=True)
+            self.assertEqual(result["effect"], "none")
+            self.assertEqual(result["timing"]["hashing_seconds"], 0.0,
+                             "an old, unchanged file must be trusted on metadata alone")
+
+    def test_parallel_and_serial_discovery_agree_exactly(self):
+        """The fast path may only be faster — never a different answer."""
+        from codeledger import core
+        with tempfile.TemporaryDirectory() as directory:
+            root=self._project(directory); ledger=Ledger(root); ledger.init()
+            (root/"src"/"big.py").write_text("x = 1\n" * 10)
+            serial=[(rel, size, mtime) for _p, rel, size, mtime, _m in ledger._discover()]
+            original=core.SLOW_FS_SECONDS
+            try:
+                core.SLOW_FS_SECONDS = -1.0        # force every stat through the thread pool
+                parallel=[(rel, size, mtime) for _p, rel, size, mtime, _m in ledger._discover()]
+                self.assertEqual(ledger._last_discovery_metrics.stat_mode, "parallel")
+            finally:
+                core.SLOW_FS_SECONDS = original
+            self.assertEqual(serial, parallel)
+            self.assertTrue(serial)
 
 
 class PathAndSecretTests(unittest.TestCase):
