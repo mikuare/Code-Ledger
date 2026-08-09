@@ -3,9 +3,10 @@ from __future__ import annotations
 import re
 import uuid
 import os
+import socket
 import time
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 from .agents import identify
@@ -20,6 +21,44 @@ LIKE_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
 STOPWORDS = {"add", "also", "and", "any", "app", "back", "been", "code", "create", "change", "changes", "current", "delete", "each", "file", "files", "fix", "from", "have", "into", "make", "more", "must", "need", "new", "not", "only", "page", "please", "remove", "should", "some", "that", "the", "them", "then", "there", "this", "update", "use", "using", "when", "where", "which", "with", "without", "work"}
 
 NOW = lambda: datetime.now(timezone.utc).isoformat()
+
+# A session is only "live" while something is still happening in it. ACTIVE and
+# IDLE both mean the agent is still there — an agent can legitimately think for
+# minutes — so both count when deciding who is working on the project. The rest
+# are terminal, and are kept rather than deleted: history is the product.
+LIVE = ("active", "idle")
+# 'completed' and 'failed' predate this vocabulary and still exist in older
+# databases. They mean the same as 'ended' and are never rewritten.
+ENDED = ("ended", "completed", "failed")
+TERMINAL = ENDED + ("stale", "crashed")
+
+def parse_time(value: str | None) -> datetime | None:
+    if not value: return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+def process_alive(pid: int | None) -> bool | None:
+    """Is this process still running? None means the question cannot be answered.
+
+    Signal 0 performs the permission and existence checks without delivering
+    anything. A process owned by another user answers PermissionError, which
+    still proves it exists. PIDs are recycled, so a live PID is never trusted on
+    its own — `reconcile_sessions` also requires a recent heartbeat.
+    """
+    if not pid or pid <= 0: return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
 
 @dataclass
 class DiscoveryMetrics:
@@ -133,9 +172,90 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         for path, _rel, _size, _mtime_ns, _metrics in self._discover():
             yield path
 
+    def _session_rows(self, statuses: tuple[str, ...] | None = None) -> list:
+        sql = ("SELECT s.*, a.name AS agent FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id"
+               + (f" WHERE s.status IN ({','.join('?' * len(statuses))})" if statuses else "")
+               + " ORDER BY s.id DESC")
+        return self.db.execute(sql, statuses or ()).fetchall()
+
+    def reconcile_sessions(self, now: datetime | None = None) -> dict:
+        """Decide which sessions are still real, from evidence rather than hope.
+
+        A session was only ever closed by the Ctrl+C handler in `watch`. Every
+        other ending — closing WSL, closing the IDE, `kill -9`, a crash, power
+        loss — left `status='active'` in the database permanently. That phantom
+        then counted as a competing agent forever, so the watcher recorded every
+        later edit as `unknown` and the conflict warnings fired against an agent
+        that died days ago.
+
+        Two independent signals are used, because neither is sufficient alone. A
+        dead PID is strong evidence the session is gone, but PIDs are recycled,
+        so a *live* PID proves little on its own; a stale heartbeat covers that
+        case, and also covers sessions recorded on another machine where the PID
+        means nothing here. Nothing is deleted — the row keeps its history and
+        gains a status and a reason.
+        """
+        now = now or datetime.now(timezone.utc)
+        idle_after = timedelta(seconds=self.config.session_idle_seconds)
+        stale_after = timedelta(seconds=self.config.session_stale_seconds)
+        host = socket.gethostname()
+        transitions = []
+        for row in self._session_rows(LIVE):
+            seen_at = parse_time(row["last_activity_at"]) or parse_time(row["last_heartbeat_at"]) or parse_time(row["start_time"])
+            age = now - seen_at if seen_at else None
+            pid, same_host = row["pid"], (row["host"] or host) == host
+            alive = process_alive(pid) if same_host else None
+            if alive is False:
+                status, reason = "crashed", f"process {pid} is no longer running on {host}"
+            elif age is None:
+                status, reason = "unknown", "the session has no usable timestamp, so liveness cannot be determined"
+            elif age > stale_after:
+                status, reason = "stale", f"no activity for {int(age.total_seconds())}s (limit {int(stale_after.total_seconds())}s)"
+            elif age > idle_after:
+                status, reason = "idle", f"no activity for {int(age.total_seconds())}s but within the stale limit"
+            else:
+                status, reason = "active", "recent activity"
+            if status != row["status"]:
+                self.db.execute("UPDATE sessions SET status=?,status_reason=?,end_time=COALESCE(end_time,?) WHERE session_id=?",
+                                (status, reason, now.isoformat() if status in TERMINAL else None, row["session_id"]))
+                transitions.append({"session_id": row["session_id"], "agent": row["agent"] or "unknown",
+                                    "from": row["status"], "to": status, "reason": reason})
+        if transitions: self.db.commit()
+        return {"transitions": transitions, "reconciled": len(transitions)}
+
+    def sessions(self, reconcile: bool = True) -> dict:
+        """Every session grouped by what is actually true of it now."""
+        if reconcile: self.reconcile_sessions()
+        grouped: dict[str, list] = {}
+        for row in self._session_rows():
+            grouped.setdefault(row["status"], []).append({
+                "session_id": row["session_id"], "agent": row["agent"] or "unknown", "pid": row["pid"],
+                "host": row["host"], "started_at": row["start_time"],
+                "last_activity_at": row["last_activity_at"] or row["last_heartbeat_at"] or row["start_time"],
+                "ended_at": row["end_time"], "request": row["request"],
+                "working_directory": row["working_directory"], "status_reason": row["status_reason"]})
+        return {"by_status": grouped, "live": sum(len(grouped.get(name, [])) for name in LIVE),
+                "counts": {name: len(rows) for name, rows in sorted(grouped.items())}}
+
+    def active_agents(self, reconcile: bool = True) -> list[str]:
+        """Agents genuinely working here — reconciled first, never assumed."""
+        if reconcile: self.reconcile_sessions()
+        return sorted({row["agent"] for row in self._session_rows(LIVE) if row["agent"]})
+
+    def touch_session(self, session_id: str, heartbeat: bool = False) -> None:
+        """Record that a session is still alive. Cheap enough to call per poll."""
+        if not session_id: return
+        column = "last_heartbeat_at" if heartbeat else "last_activity_at"
+        # A heartbeat is also activity; recording both keeps a session that only
+        # ever heartbeats from ageing into STALE while its process is healthy.
+        self.db.execute(f"UPDATE sessions SET {column}=?, last_activity_at=? WHERE session_id=? AND status IN ({','.join('?' * len(LIVE))})",
+                        (NOW(), NOW(), session_id, *LIVE))
+        self.db.commit()
+
     def refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False) -> dict[str, int | str | None | list[str] | dict]:
         started = time.perf_counter(); statuses = git_status(self.root) if include_git_status and (self.root / ".git").exists() and analyze else {}
         actor = agent or "unknown"   # attribution is recorded as given; it is never guessed
+        if session: self.touch_session(session)
         seen, changed_paths, changed_symbols = set(), [], []
         added, modified, deleted, symbols = 0, 0, 0, 0
         discovery_started = time.perf_counter(); discovered = list(self._discover(verbose=verbose)); discovery_seconds = time.perf_counter() - discovery_started
@@ -233,7 +353,54 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         result = {key: self.db.execute(sql).fetchone()[0] for key, sql in queries.items()}
         result.update(stale_files=self.db.execute("SELECT count(*) FROM files WHERE status='stale' OR hash IS NULL").fetchone()[0], project=self.config.project_name, git_commit=head(self.root))
         result["analysis"] = self.coverage_report()
+        # Reconcile before reporting. Listing a session as active because the
+        # row still says so is how a dead agent stayed "working" indefinitely.
+        sessions = self.sessions()
+        result["sessions"] = sessions["counts"]
+        result["active_agents"] = self.active_agents(reconcile=False)
+        result["stale_sessions"] = [item["session_id"] for name in ("stale", "crashed") for item in sessions["by_status"].get(name, [])]
         return result
+
+    def doctor(self) -> dict:
+        """One command that answers "is this ledger telling me the truth?"
+
+        Every check reports what it found rather than a bare OK, and anything
+        that cannot be determined says so instead of passing quietly.
+        """
+        checks: dict[str, str] = {}
+        pragmas = {name: self.db.execute(f"PRAGMA {name}").fetchone()[0] for name in ("journal_mode", "foreign_keys", "busy_timeout")}
+        checks["database"] = "OK"
+        checks["wal"] = "OK" if str(pragmas["journal_mode"]).lower() == "wal" else f"NOT WAL ({pragmas['journal_mode']}) — concurrent agents may block"
+        checks["foreign_keys"] = "OK" if pragmas["foreign_keys"] else "OFF — orphaned rows are possible"
+        tables = {row["name"] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        required = {"files", "symbols", "changes", "sessions", "agents", "verifications", "dependencies"}
+        checks["schema"] = "OK" if required <= tables else f"MISSING TABLES: {', '.join(sorted(required - tables))}"
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(sessions)")}
+        checks["migrations"] = "OK" if {"pid", "last_activity_at", "status_reason"} <= columns else "INCOMPLETE — run any command to apply pending migrations"
+
+        reconciled = self.reconcile_sessions()
+        sessions = self.sessions(reconcile=False)
+        dead = [item for name in ("stale", "crashed") for item in sessions["by_status"].get(name, [])]
+        checks["sessions"] = f"{sessions['live']} live" + (f", {len(dead)} stale/crashed" if dead else "")
+        status = self.status()
+        checks["file_index"] = "OK" if not status["stale_files"] else f"{status['stale_files']} file(s) never hashed — run `codeledger refresh --changed`"
+        orphans = self.db.execute("SELECT count(*) FROM symbols WHERE file_id NOT IN (SELECT id FROM files)").fetchone()[0]
+        checks["symbol_index"] = "OK" if not orphans else f"{orphans} symbol(s) reference a missing file"
+        checks["git"] = "OK" if (self.root / ".git").exists() else "no git repository — commit metadata is unavailable"
+        analysis = status["analysis"]
+        checks["analysis_coverage"] = "OK" if not analysis["shallow_languages"] else f"shallow: {', '.join(analysis['shallow_languages'])} — {analysis['hint']}"
+        protocols = [name for name in ("CLAUDE.md", "AGENTS.md", "CODEX.md") if (self.root / name).exists()]
+        checks["agent_protocols"] = ", ".join(protocols) if protocols else "MISSING — run `codeledger init` to write the agent protocol"
+        checks["config"] = "OK" if (self.root / ".ai" / "codeledger" / "config.json").exists() else "using defaults (no config.json)"
+        checks["storage_ignored"] = "OK" if self.config.is_ignored(Path(".ai/codeledger"), self.root) else "WARNING — CodeLedger is indexing its own database"
+
+        actions = []
+        if dead: actions.append("codeledger session reconcile")
+        if status["stale_files"]: actions.append("codeledger refresh --changed")
+        if analysis["shallow_languages"]: actions.append(analysis["hint"])
+        if not protocols: actions.append("codeledger init")
+        return {"checks": checks, "reconciled_now": reconciled["transitions"], "stale_sessions": dead,
+                "active_agents": self.active_agents(reconcile=False), "recommended_actions": actions or ["none"]}
 
     def coverage_report(self) -> dict:
         """How much of this project is actually analysed, by language.
@@ -525,7 +692,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             if any(Path(item).stem.lower() in low or Path(item).stem.lower() in source.lower() for item in changed_files) or any(re.search(r"\b" + re.escape(symbol) + r"\b", source) for symbol in symbols): candidates.append(rel)
         return sorted(set(candidates))
 
-    def start_session(self, agent: str, request: str = "", session_id: str | None = None) -> dict:
+    def start_session(self, agent: str, request: str = "", session_id: str | None = None, owns_process: bool = False) -> dict:
         session_id = session_id or f"session-{uuid.uuid4().hex[:10]}"
         now = NOW()
         # The adapter seam exists so an unrecognised agent is recorded as a
@@ -533,12 +700,30 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         identified = identify(agent); agent = identified.name
         self.db.execute("INSERT OR IGNORE INTO agents(name,provider,created_at) VALUES(?,?,?)", (agent, identified.provider, now))
         agent_id = self.db.execute("SELECT id FROM agents WHERE name=?", (agent,)).fetchone()[0]
-        self.db.execute("INSERT INTO sessions(session_id,agent_id,working_directory,start_time,request) VALUES(?,?,?,?,?)", (session_id, agent_id, str(self.root), now, request))
+        # A PID is only evidence when the process that recorded it stays alive
+        # for the session's lifetime — `watch` and `run` do. A bare
+        # `session start` is bookkeeping: the CLI exits immediately, so storing
+        # its PID would make every such session look crashed within seconds.
+        # Those sessions are judged by heartbeat and timeout instead.
+        pid = os.getpid() if owns_process else None
+        self.db.execute("INSERT INTO sessions(session_id,agent_id,working_directory,start_time,request,pid,host,last_activity_at,last_heartbeat_at,status) VALUES(?,?,?,?,?,?,?,?,?,'active')",
+                        (session_id, agent_id, str(self.root), now, request, pid, socket.gethostname(), now, now))
         self.db.commit()
-        return {"session_id": session_id, "agent": agent, "request": request, "status": "active", "start_time": now}
+        return {"session_id": session_id, "agent": agent, "request": request, "status": "active", "start_time": now,
+                "pid": pid, "host": socket.gethostname()}
 
     def end_session(self, session_id: str, result: str = "completed") -> dict:
-        now = NOW(); self.db.execute("UPDATE sessions SET end_time=?,result=?,status='completed' WHERE session_id=?", (now, result, session_id)); self.db.commit()
+        """Close a session. Safe to call twice, and on a session already gone.
+
+        Cleanup runs from a signal handler and from the normal exit path, so it
+        must be idempotent: a session that reconciliation already marked crashed
+        or stale keeps that more informative verdict rather than being rewritten
+        to a tidy 'ended' that hides how it really finished.
+        """
+        now = NOW()
+        self.db.execute("UPDATE sessions SET end_time=COALESCE(end_time,?),result=COALESCE(result,?),status='ended',status_reason=? "
+                        "WHERE session_id=? AND status IN (?,?)", (now, result, f"ended cleanly ({result})", session_id, *LIVE))
+        self.db.commit()
         row = self.db.execute("SELECT s.*,a.name AS agent FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id WHERE s.session_id=?", (session_id,)).fetchone()
         return dict(row) if row else {"session_id": session_id, "status": "not_found"}
 

@@ -36,6 +36,14 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("files", "analysis_provider", "ALTER TABLE files ADD COLUMN analysis_provider TEXT"),
     ("files", "coverage", "ALTER TABLE files ADD COLUMN coverage TEXT"),
     ("changes", "effect", "ALTER TABLE changes ADD COLUMN effect TEXT"),
+    # A session that ended by any route other than Ctrl+C used to stay 'active'
+    # forever. Liveness needs evidence that outlives the process: which process
+    # it was, on which machine, and when it was last known to be doing anything.
+    ("sessions", "pid", "ALTER TABLE sessions ADD COLUMN pid INTEGER"),
+    ("sessions", "host", "ALTER TABLE sessions ADD COLUMN host TEXT"),
+    ("sessions", "last_activity_at", "ALTER TABLE sessions ADD COLUMN last_activity_at TEXT"),
+    ("sessions", "last_heartbeat_at", "ALTER TABLE sessions ADD COLUMN last_heartbeat_at TEXT"),
+    ("sessions", "status_reason", "ALTER TABLE sessions ADD COLUMN status_reason TEXT"),
 ]
 
 def connect(root: Path) -> sqlite3.Connection:

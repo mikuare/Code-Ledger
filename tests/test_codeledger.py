@@ -1,11 +1,155 @@
+import json
+import sqlite3
 import tempfile
 import unittest
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from codeledger.cli import build_parser
-from codeledger.core import Ledger
+from codeledger.core import Ledger, process_alive
+from codeledger.db import SCHEMA
 from codeledger.providers import capabilities, provider_for
+
+def dead_pid() -> int:
+    """A PID that is certainly not running, for simulating a killed process."""
+    for candidate in range(999_000, 1_000_000):
+        if process_alive(candidate) is False:
+            return candidate
+    raise unittest.SkipTest("no free PID available to simulate a dead process")
+
+
+
+class SessionLifecycleTests(unittest.TestCase):
+    """A session that dies without cleaning up must not stay active forever."""
+
+    def test_a_session_whose_process_is_gone_is_reconciled_as_crashed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            session=ledger.start_session("codex", "work that never finished")
+            # Simulate a process killed outright: the row still says active, but
+            # the PID it recorded belongs to nothing. `kill -9`, closing WSL and
+            # power loss all leave exactly this state behind.
+            ledger.db.execute("UPDATE sessions SET pid=? WHERE session_id=?", (dead_pid(), session["session_id"]))
+            ledger.db.commit()
+            self.assertEqual([row["status"] for row in ledger._session_rows()], ["active"])
+
+            report=ledger.reconcile_sessions()
+            self.assertEqual(report["transitions"][0]["to"], "crashed")
+            self.assertEqual(ledger.active_agents(), [])
+            self.assertIn("no longer running", report["transitions"][0]["reason"])
+
+    def test_a_silent_session_ages_through_idle_into_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            session=ledger.start_session("codex", "thinking")
+            # No PID evidence — the session was recorded on another machine, so
+            # liveness rests on the heartbeat alone.
+            ledger.db.execute("UPDATE sessions SET pid=NULL, host='some-other-host' WHERE session_id=?", (session["session_id"],))
+            ledger.db.commit()
+            now=datetime.now(timezone.utc)
+
+            # An agent thinking for ten minutes is still working, not dead.
+            ledger.reconcile_sessions(now=now + timedelta(seconds=600))
+            self.assertEqual(ledger.active_agents(reconcile=False), ["codex"])
+
+            ledger.reconcile_sessions(now=now + timedelta(seconds=1000))
+            self.assertEqual([row["status"] for row in ledger._session_rows()], ["idle"])
+            self.assertEqual(ledger.active_agents(reconcile=False), ["codex"], "idle agents are still live")
+
+            ledger.reconcile_sessions(now=now + timedelta(seconds=4000))
+            self.assertEqual([row["status"] for row in ledger._session_rows()], ["stale"])
+            self.assertEqual(ledger.active_agents(reconcile=False), [])
+
+    def test_a_live_pid_with_an_ancient_heartbeat_is_still_stale(self):
+        """PIDs are recycled, so a live PID alone must not keep a session alive."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ledger.start_session("codex", "work")   # records this test's own live PID
+            ledger.reconcile_sessions(now=datetime.now(timezone.utc) + timedelta(seconds=99999))
+            self.assertEqual([row["status"] for row in ledger._session_rows()], ["stale"])
+
+    def test_ending_a_session_never_overwrites_how_it_really_finished(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            session=ledger.start_session("codex", "work")
+            ledger.db.execute("UPDATE sessions SET pid=? WHERE session_id=?", (dead_pid(), session["session_id"]))
+            ledger.db.commit(); ledger.reconcile_sessions()
+            # A late cleanup must not relabel a crash as a tidy exit.
+            ledger.end_session(session["session_id"], "watch stopped")
+            self.assertEqual(ledger._session_rows()[0]["status"], "crashed")
+
+
+class ConcurrencyAndRecoveryTests(unittest.TestCase):
+    """Two agents and a watcher share one database; nothing may be lost."""
+
+    def test_status_survives_a_shutdown_that_killed_every_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ledger.start_session("codex", "work"); ledger.start_session("claude-code", "work")
+            ledger.db.execute("UPDATE sessions SET pid=? WHERE status='active'", (dead_pid(),)); ledger.db.commit()
+
+            restarted=Ledger(root)          # a fresh process after the shutdown
+            self.assertEqual(restarted.status()["active_agents"], [])
+            self.assertEqual(restarted.status()["sessions"], {"crashed": 2})
+            # History is kept, never deleted.
+            self.assertEqual(restarted.db.execute("SELECT count(*) FROM sessions").fetchone()[0], 2)
+
+    def test_doctor_reports_stale_sessions_and_what_to_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ledger.start_session("codex", "work")
+            ledger.db.execute("UPDATE sessions SET pid=? WHERE status='active'", (dead_pid(),)); ledger.db.commit()
+            report=ledger.doctor()
+            self.assertEqual(report["checks"]["wal"], "OK")
+            self.assertEqual(report["checks"]["foreign_keys"], "OK")
+            self.assertEqual(report["checks"]["storage_ignored"], "OK")
+            self.assertIn("1 stale/crashed", report["checks"]["sessions"])
+            self.assertIn("codeledger session reconcile", report["recommended_actions"])
+
+
+class MigrationTests(unittest.TestCase):
+    def test_a_database_predating_session_tracking_upgrades_and_keeps_its_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            path=root/".ai"/"codeledger"/"codeledger.db"; path.parent.mkdir(parents=True)
+            legacy=sqlite3.connect(path)
+            legacy.executescript(SCHEMA)          # the shape before pid/attribution columns existed
+            legacy.execute("INSERT INTO agents(name,provider,created_at) VALUES('codex','openai','2020-01-01T00:00:00+00:00')")
+            legacy.execute("INSERT INTO sessions(session_id,agent_id,working_directory,start_time,request,status) "
+                           "VALUES('session-legacy',1,?,'2020-01-01T00:00:00+00:00','old work','active')", (str(root),))
+            legacy.execute("INSERT INTO changes(timestamp,agent,session_id,user_request,summary,result) "
+                           "VALUES('2020-01-01T00:00:00+00:00','codex','session-legacy','old work','Indexed 1 file','unverified')")
+            legacy.commit(); legacy.close()
+            self.assertNotIn("pid", {row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info(sessions)")})
+
+            ledger=Ledger(root)                    # connecting applies the migrations
+            columns={row["name"] for row in ledger.db.execute("PRAGMA table_info(sessions)")}
+            self.assertLessEqual({"pid", "host", "last_activity_at", "last_heartbeat_at", "status_reason"}, columns)
+            # History is never destroyed by an upgrade.
+            self.assertEqual(ledger.db.execute("SELECT count(*) FROM changes").fetchone()[0], 1)
+            self.assertEqual(ledger.db.execute("SELECT user_request FROM changes").fetchone()[0], "old work")
+
+            # A legacy session has no PID, so it is judged on age alone — and a
+            # session from 2020 is certainly not still running.
+            ledger.reconcile_sessions()
+            self.assertEqual(ledger._session_rows()[0]["status"], "stale")
+            self.assertEqual(ledger.active_agents(), [])
+
+    def test_a_config_with_unknown_keys_falls_back_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
+            path=root/".ai"/"codeledger"/"config.json"; path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"project_name": "p", "root": str(root), "ignores": [],
+                                        "from_a_newer_version": {"unknown": True}}))
+            self.assertEqual(Ledger(root).config.project_name, "p")
+
 
 class CodeLedgerTests(unittest.TestCase):
     def test_incremental_symbols_and_deletion(self):
@@ -23,7 +167,11 @@ class CodeLedgerTests(unittest.TestCase):
             source.write_text("def run():\n return 1\n", encoding="utf-8")
             result=ledger.refresh(agent="codex", session=session["session_id"], request="update run")
             self.assertIsNotNone(result["change_id"]); self.assertEqual(ledger.history("update run")[0]["agent"], "codex")
-            self.assertEqual(ledger.end_session(session["session_id"])["status"], "completed")
+            closed=ledger.end_session(session["session_id"])
+            self.assertEqual(closed["status"], "ended"); self.assertEqual(closed["result"], "completed")
+            # Closing runs from a signal handler and from the exit path, so it
+            # must survive being called twice without rewriting the outcome.
+            self.assertEqual(ledger.end_session(session["session_id"], "second call")["result"], "completed")
 
     def test_context_is_structured(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -427,7 +575,8 @@ class CodeLedgerTests(unittest.TestCase):
                ["decisions"], ["export"], ["doctor"], ["issue", "K", "T"], ["decision", "K", "T"], ["feature", "N"],
                ["features", "--infer"], ["verify", "project", "p", "TEST", "PASSED"],
                ["verify-run", "project", "p", "TEST", "--", "true"], ["regressions"], ["git-import"],
-               ["session", "start"], ["record", "summary"], ["mcp"], ["setup-agent", "codex"],
+               ["session", "start"], ["session", "list"], ["session", "reconcile"], ["session", "status"],
+               ["record", "summary"], ["mcp"], ["setup-agent", "codex"],
                ["agent-config", "codex"], ["setup-codex"], ["watch", "--max-interval", "5"],
                ["run", "--request", "task", "--", "echo"]]
         for argv in cases:

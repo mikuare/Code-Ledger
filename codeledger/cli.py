@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, sys, subprocess, time
+import argparse, contextlib, json, os, signal, sys, subprocess, time
 from pathlib import Path
 from .core import Ledger
 from . import __version__
@@ -15,6 +15,74 @@ def emit(value, as_json=False):
     elif isinstance(value, list):
         for item in value: print(item if isinstance(item, str) else json.dumps(item, default=str))
     else: print(value)
+
+@contextlib.contextmanager
+def closing_session(ledger, session, result):
+    """Close `session` however this process ends — short of being killed outright.
+
+    One cleanup path serves the normal return, Ctrl+C, and `kill`/SIGTERM, so
+    there is no second copy to drift. It cannot cover SIGKILL, a WSL shutdown or
+    power loss, and it does not pretend to: those are caught afterwards by
+    `reconcile_sessions`, which is why the heartbeat exists. Closing is
+    idempotent, so the signal path and the exit path may both run.
+    """
+    if not session:
+        yield; return
+    previous = {}
+
+    def finish(signum, _frame):
+        ledger.end_session(session, f"{result} (signal {signum})")
+        handler = previous.get(signum)
+        # Restore the default disposition and re-raise, so the caller still sees
+        # a process that died of the signal it was sent rather than exit 0.
+        signal.signal(signum, handler if callable(handler) else signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None: continue
+        try:
+            previous[sig] = signal.signal(sig, finish)
+        except (ValueError, OSError):
+            pass   # not the main thread, or unsupported on this platform
+    try:
+        yield
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ledger.end_session(session, result)
+        for sig, handler in previous.items():
+            try: signal.signal(sig, handler)
+            except (ValueError, OSError): pass
+
+def emit_sessions(value, as_json=False):
+    """Group sessions by what is true of them, not by row order.
+
+    A flat dump of rows all reading `status=active` is how a session whose
+    process died last week kept presenting itself as a working agent.
+    """
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    if not value["by_status"]: print("No sessions recorded."); return
+    for status in ("active", "idle", "stale", "crashed", "ended", "completed", "failed", "unknown"):
+        rows = value["by_status"].get(status)
+        if not rows: continue
+        print(f"{status.upper()}:")
+        for row in rows:
+            detail = f" — {row['status_reason']}" if row["status_reason"] and status not in ("active", "ended") else ""
+            print(f"   {row['agent']} {row['session_id']} (pid={row['pid'] or 'unrecorded'}, last activity {row['last_activity_at']}){detail}")
+
+def emit_doctor(value, as_json=False):
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    print("CODELEDGER DOCTOR\n")
+    width = max(len(name) for name in value["checks"])
+    for name, outcome in value["checks"].items():
+        print(f"{name.replace('_',' ').title():<{width + 2}} {outcome}")
+    if value["stale_sessions"]:
+        print("\nStale sessions:")
+        for row in value["stale_sessions"]:
+            print(f"   {row['agent']} {row['session_id']} — {row['status_reason']}")
+    print("\nRecommended:")
+    for action in value["recommended_actions"]: print(f"   {action}")
 
 AGENT_CHOICES = ("codex", "claude-code", "gemini", "aider", "cursor")
 SUBJECT_CHOICES = ("symbol", "feature", "project")
@@ -112,8 +180,8 @@ def build_parser():
 
     add("git-import", "Import commit metadata").add_argument("--limit", type=int, default=200)
 
-    session_cmd = add("session", "Start, end, or list agent sessions")
-    session_cmd.add_argument("action", choices=("start", "end", "list"))
+    session_cmd = add("session", "Start, end, list, reconcile, or summarize agent sessions")
+    session_cmd.add_argument("action", choices=("start", "end", "list", "reconcile", "status"))
     session_cmd.add_argument("--agent", default="unknown")
     session_cmd.add_argument("--request", default="")
     session_cmd.add_argument("--session-id", default="")
@@ -168,16 +236,19 @@ def main(argv=None):
             completed=subprocess.run(command,cwd=ledger.root,text=True,capture_output=True); value={"configured":completed.returncode==0,"agent":args.agent,"command":command,"stdout":completed.stdout.strip(),"stderr":completed.stderr.strip(),"config":ledger.agent_config(args.agent)}
         emit(value,args.as_json); return 0 if value["configured"] else 1
     if args.command == "watch":
-        session = args.session or ledger.start_session(args.agent, args.request)["session_id"]
-        print(f"CodeLedger watching {ledger.root} (agent={args.agent}, session={session})", flush=True)
+        session = args.session or ledger.start_session(args.agent, args.request, owns_process=True)["session_id"]
+        print(f"CodeLedger watching {ledger.root} (agent={args.agent}, session={session}, pid={os.getpid()})", flush=True)
         # Each poll walks the tree, which is expensive on large repositories and
         # on /mnt/c under WSL. Idle polls back off toward --max-interval and snap
         # back to --interval the moment a change lands, so an active session
         # stays responsive without burning a core while nothing is happening.
         base = max(0.25, args.interval); ceiling = max(base, args.max_interval); delay = base
-        try:
+        with closing_session(ledger, session if not args.session else "", "watch stopped"):
             while True:
                 result = ledger.refresh(True, args.agent, session, args.request)
+                # The heartbeat is what lets a later run tell "this watcher is
+                # alive and nothing is happening" from "this watcher is gone".
+                ledger.touch_session(session, heartbeat=True)
                 if result["change_id"] is not None:
                     message = f"Recorded change #{result['change_id']}: {', '.join(result['files'])}"
                     if result.get("scope", {}).get("status") == "WARNING": message += f"\nSCOPE WARNING: {result['scope']['unexpected_files']}"
@@ -186,15 +257,13 @@ def main(argv=None):
                 else:
                     delay = min(ceiling, delay * 1.5)
                 time.sleep(delay)
-        except KeyboardInterrupt:
-            if not args.session: ledger.end_session(session, "watch stopped")
-            return
+        return 0
     if args.command == "run":
         command = list(args.agent_command)
         if command and command[0] == "--": command = command[1:]
         if not command:
             parser.error("run requires a command after --, for example: codeledger run --request 'Fix login' -- codex")
-        session = args.session or ledger.start_session(args.agent, args.request)["session_id"]
+        session = args.session or ledger.start_session(args.agent, args.request, owns_process=True)["session_id"]
         context = ledger.context(args.request)
         print("[CODELEDGER CONTEXT]")
         print(json.dumps(context, indent=2, default=str))
@@ -204,9 +273,14 @@ def main(argv=None):
         # fully customized command by including its prompt explicitly after --.
         if not any(args.request == part for part in command[1:]):
             command.append(args.request)
-        completed = subprocess.run(command, cwd=ledger.root)
-        refresh = ledger.refresh(True, args.agent, session, args.request)
-        if not args.session: ledger.end_session(session, "completed" if completed.returncode == 0 else "failed")
+        # If this process is killed while the agent runs, the session must not be
+        # left active forever; the same cleanup path serves both outcomes.
+        with closing_session(ledger, session if not args.session else "", "interrupted"):
+            completed = subprocess.run(command, cwd=ledger.root)
+            refresh = ledger.refresh(True, args.agent, session, args.request)
+            # Close with the real outcome here; the guard above only fires when
+            # this line is never reached, and closing is idempotent either way.
+            if not args.session: ledger.end_session(session, "completed" if completed.returncode == 0 else "failed")
         print(json.dumps({"session_id": session, "exit_code": completed.returncode, "refresh": refresh}, indent=2, default=str))
         # Say plainly when an agent's turn achieved nothing. Without this the
         # only signal is an empty file list buried in the JSON, which is exactly
@@ -216,6 +290,7 @@ def main(argv=None):
             print(f"\n[CODELEDGER] NO EFFECT: this attempt {detail}.", flush=True)
             print(f"[CODELEDGER] Run `codeledger progress {args.request!r}` before retrying.", flush=True)
         return completed.returncode
+    if args.command == "doctor": emit_doctor(ledger.doctor(), args.as_json); return 0
     if args.command == "init": value=ledger.init(args.quick, args.verbose); value["root"]=str(ledger.root)
     elif args.command == "status": value=ledger.status()
     elif args.command == "refresh": value=ledger.refresh(args.changed, args.agent, args.session, args.request, verbose=args.verbose)
@@ -237,7 +312,9 @@ def main(argv=None):
     elif args.command == "session":
         if args.action == "start": value=ledger.start_session(args.agent, args.request, args.session_id or None)
         elif args.action == "end": value=ledger.end_session(args.session_id, args.result)
-        else: value=[dict(row) for row in ledger.db.execute("SELECT s.*,a.name AS agent FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id ORDER BY s.id DESC LIMIT 20")]
+        elif args.action == "reconcile": value=ledger.reconcile_sessions()
+        elif args.action == "status": value={"active_agents": ledger.active_agents(), **ledger.sessions(reconcile=False)}
+        else: emit_sessions(ledger.sessions(), args.as_json); return 0
     elif args.command == "verify": value=ledger.verify(args.subject_type,args.subject_id,args.kind,args.result,args.evidence)
     elif args.command == "verify-run":
         command = list(args.verify_command)
