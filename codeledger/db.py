@@ -44,6 +44,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("sessions", "last_activity_at", "ALTER TABLE sessions ADD COLUMN last_activity_at TEXT"),
     ("sessions", "last_heartbeat_at", "ALTER TABLE sessions ADD COLUMN last_heartbeat_at TEXT"),
     ("sessions", "status_reason", "ALTER TABLE sessions ADD COLUMN status_reason TEXT"),
+    # Who a change is credited to is worth less than how well that is known.
+    ("changes", "attribution_source", "ALTER TABLE changes ADD COLUMN attribution_source TEXT"),
+    ("changes", "attribution_confidence", "ALTER TABLE changes ADD COLUMN attribution_confidence TEXT"),
+    ("changes", "attribution_reason", "ALTER TABLE changes ADD COLUMN attribution_reason TEXT"),
 ]
 
 def connect(root: Path) -> sqlite3.Connection:

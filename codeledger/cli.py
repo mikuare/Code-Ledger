@@ -16,6 +16,20 @@ def emit(value, as_json=False):
         for item in value: print(item if isinstance(item, str) else json.dumps(item, default=str))
     else: print(value)
 
+def emit_since(value, as_json=False):
+    """A handoff answer is read by a human or pasted into an agent's context.
+
+    The generic dict dump prints each change as a raw mapping, which buries the
+    one thing the caller asked: who touched what while I was not looking.
+    """
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    print(value["summary"])
+    for change in value["changes"]:
+        print(f"   #{change['change_id']} by {change['agent']}  {change['files']}"
+              f"  symbols={change['symbols']}  effect={change['effect']}")
+    if value["active_agents"]:
+        print(f"Active sessions: {', '.join(value['active_agents'])}")
+
 @contextlib.contextmanager
 def closing_session(ledger, session, result):
     """Close `session` however this process ends — short of being killed outright.
@@ -132,6 +146,9 @@ def build_parser():
 
     add("plan", "Generate pre-change intelligence").add_argument("request")
     add("progress", "Check whether prior attempts at this request achieved anything").add_argument("request")
+    since = add("since", "What changed since a change id, session, timestamp, or an agent's last turn")
+    since.add_argument("marker", nargs="?", default="")
+    since.add_argument("--agent", default="", help="Show what changed since this agent last recorded anything")
     add("prompt", "Normalize a user request into an agent task brief").add_argument("request")
 
     handshake = add("handshake", "Compare the user request with the AI implementation plan")
@@ -245,13 +262,15 @@ def main(argv=None):
         base = max(0.25, args.interval); ceiling = max(base, args.max_interval); delay = base
         with closing_session(ledger, session if not args.session else "", "watch stopped"):
             while True:
-                result = ledger.refresh(True, args.agent, session, args.request)
+                result = ledger.refresh(True, args.agent, session, args.request, observed=True)
                 # The heartbeat is what lets a later run tell "this watcher is
                 # alive and nothing is happening" from "this watcher is gone".
                 ledger.touch_session(session, heartbeat=True)
                 if result["change_id"] is not None:
                     message = f"Recorded change #{result['change_id']}: {', '.join(result['files'])}"
                     if result.get("scope", {}).get("status") == "WARNING": message += f"\nSCOPE WARNING: {result['scope']['unexpected_files']}"
+                    if result.get("attribution_note"): message += f"\nATTRIBUTION: {result['attribution_note']}"
+                    if result.get("conflicts"): message += f"\n{result['conflicts']['message']}"
                     print(json.dumps(result) if args.as_json else message, flush=True)
                     delay = base
                 else:
@@ -282,6 +301,8 @@ def main(argv=None):
             # this line is never reached, and closing is idempotent either way.
             if not args.session: ledger.end_session(session, "completed" if completed.returncode == 0 else "failed")
         print(json.dumps({"session_id": session, "exit_code": completed.returncode, "refresh": refresh}, indent=2, default=str))
+        if refresh.get("conflicts"):
+            print(f"\n[CODELEDGER] {refresh['conflicts']['message']}", flush=True)
         # Say plainly when an agent's turn achieved nothing. Without this the
         # only signal is an empty file list buried in the JSON, which is exactly
         # how an agent ends up repeating the same edit.
@@ -303,6 +324,7 @@ def main(argv=None):
     elif args.command == "scope": value=ledger.scope_check(args.request, args.files, args.symbols)
     elif args.command == "plan": value=ledger.plan(args.request)
     elif args.command == "progress": value=ledger.progress(args.request)
+    elif args.command == "since": emit_since(ledger.since(args.marker, args.agent), args.as_json); return 0
     elif args.command == "prompt": value=ledger.analyze_prompt(args.request)
     elif args.command == "handshake": value=ledger.handshake(args.request, args.ai_plan)
     elif args.command == "tests": value=ledger.suggest_tests(args.files, args.symbols)

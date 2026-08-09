@@ -73,6 +73,31 @@ class SessionLifecycleTests(unittest.TestCase):
             ledger.reconcile_sessions(now=datetime.now(timezone.utc) + timedelta(seconds=99999))
             self.assertEqual([row["status"] for row in ledger._session_rows()], ["stale"])
 
+    def test_a_phantom_session_does_not_poison_attribution_forever(self):
+        """The end-to-end bug: one hard shutdown used to make every later edit `unknown`."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ghost=ledger.start_session("codex", "killed by closing WSL")
+            ledger.db.execute("UPDATE sessions SET pid=? WHERE session_id=?", (dead_pid(), ghost["session_id"]))
+            ledger.db.commit()
+
+            ledger.start_session("claude-code", "real work")
+            source.write_text("def alpha():\n    return 2\n")
+            observed=ledger.refresh(changed_only=True, agent="claude-code", observed=True)
+            # Observed edits are never credited to a name, but the dead codex
+            # session must not still be presented as a live competing agent.
+            self.assertNotIn("codex", observed["attribution"]["reason"])
+            self.assertIn("claude-code", observed["attribution"]["reason"])
+            self.assertEqual(ledger.status()["active_agents"], ["claude-code"])
+            self.assertEqual(len(ledger.status()["stale_sessions"]), 1)
+
+            # And an explicit refresh is unaffected by the phantom entirely.
+            source.write_text("def alpha():\n    return 3\n")
+            claimed=ledger.refresh(changed_only=True, agent="claude-code", request="real work")
+            self.assertEqual((claimed["agent"], claimed["attribution"]["confidence"]), ("claude-code", "HIGH"))
+
     def test_ending_a_session_never_overwrites_how_it_really_finished(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/"a.py").write_text("def alpha():\n    return 1\n")
@@ -83,6 +108,95 @@ class SessionLifecycleTests(unittest.TestCase):
             # A late cleanup must not relabel a crash as a tidy exit.
             ledger.end_session(session["session_id"], "watch stopped")
             self.assertEqual(ledger._session_rows()[0]["status"], "crashed")
+
+
+class AttributionTests(unittest.TestCase):
+    def test_explicit_refresh_outranks_anything_the_watcher_infers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ledger.start_session("codex", "work")
+
+            source.write_text("def alpha():\n    return 2\n")
+            claimed=ledger.refresh(changed_only=True, agent="codex", request="own work")
+            self.assertEqual(claimed["attribution"], {
+                "source": "explicit-agent-refresh", "confidence": "HIGH",
+                "reason": "codex recorded this refresh on its own behalf."})
+
+            source.write_text("def alpha():\n    return 3\n")
+            nameless=ledger.refresh(changed_only=True, agent="", observed=False)
+            self.assertEqual(nameless["attribution"]["confidence"], "UNKNOWN")
+            self.assertEqual(nameless["agent"], "unknown")
+
+            stored=ledger.db.execute("SELECT attribution_confidence FROM changes ORDER BY id").fetchall()
+            self.assertEqual([row[0] for row in stored], ["HIGH", "UNKNOWN"])
+
+    def test_a_watcher_never_credits_the_name_it_was_launched_with(self):
+        """The watcher's `--agent` flag is a label, not evidence of authorship.
+
+        Crediting the sole live agent looked reasonable, but it is exactly the
+        inference the filesystem cannot support: `watch --agent codex` records
+        an edit a developer, an editor or a formatter may have made.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ledger.start_session("codex", "watch")      # the only live agent
+            source.write_text("def alpha():\n    return 2\n")
+            result=ledger.refresh(changed_only=True, agent="codex", observed=True)
+            self.assertEqual(result["agent"], "unknown")
+            self.assertEqual(result["attribution"]["confidence"], "LOW")
+            self.assertEqual(result["attribution"]["source"], "filesystem-watcher")
+            self.assertEqual(ledger.db.execute("SELECT agent FROM changes ORDER BY id DESC").fetchone()["agent"], "unknown")
+            self.assertEqual(ledger.db.execute("SELECT last_modified_by FROM symbols WHERE name='alpha'").fetchone()[0], "unknown")
+
+    def test_an_observed_edit_with_no_agent_session_is_not_credited_to_anyone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            source.write_text("def alpha():\n    return 2\n")   # a human edit, no session
+            result=ledger.refresh(changed_only=True, agent="codex", observed=True)
+            self.assertEqual(result["agent"], "unknown")
+            self.assertEqual(result["attribution"]["confidence"], "LOW")
+            self.assertIn("no agent session active", result["attribution"]["reason"])
+
+
+class ConflictTests(unittest.TestCase):
+    def test_the_same_symbol_outranks_merely_the_same_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"session.py"
+            source.write_text("def login():\n    return 1\n\ndef logout():\n    return 2\n")
+            ledger=Ledger(root); ledger.init()
+            ledger.start_session("codex", "codex work"); ledger.start_session("claude-code", "claude work")
+            source.write_text("def login():\n    return 10\n\ndef logout():\n    return 2\n")
+            ledger.refresh(changed_only=True, agent="codex", request="rework login")
+
+            same_symbol=ledger.conflicts("claude-code", ["session.py"], ["login"])
+            self.assertEqual(same_symbol["status"], "HIGH")
+            self.assertEqual(same_symbol["conflicts"][0]["shared_symbols"], ["login"])
+            self.assertIn("POTENTIAL CONFLICT", same_symbol["message"])
+
+            same_file_only=ledger.conflicts("claude-code", ["session.py"], ["logout"])
+            self.assertEqual(same_file_only["status"], "MEDIUM")
+
+            self.assertEqual(ledger.conflicts("claude-code", ["unrelated.py"], ["other"])["status"], "NONE")
+
+    def test_a_dead_agent_cannot_raise_a_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"session.py"
+            source.write_text("def login():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ghost=ledger.start_session("codex", "work")
+            source.write_text("def login():\n    return 10\n")
+            ledger.refresh(changed_only=True, agent="codex", request="rework login")
+            self.assertEqual(ledger.conflicts("claude-code", ["session.py"], ["login"])["status"], "HIGH")
+
+            ledger.db.execute("UPDATE sessions SET pid=? WHERE session_id=?", (dead_pid(), ghost["session_id"]))
+            ledger.db.commit()
+            self.assertEqual(ledger.conflicts("claude-code", ["session.py"], ["login"])["status"], "NONE")
 
 
 class ConcurrencyAndRecoveryTests(unittest.TestCase):
@@ -517,6 +631,74 @@ class CodeLedgerTests(unittest.TestCase):
             ledger.refresh(changed_only=True, agent="codex", request="Fix the total calculation rounding")
             self.assertEqual(ledger.progress("Add dark mode to the settings page")["status"], "NO_PRIOR_ATTEMPTS")
 
+    def test_observed_edits_are_unattributed_when_two_agents_are_active(self):
+        """`watch` cannot see who wrote a file; with two agents it must not guess."""
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"a.py"
+            source.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            ledger.start_session("codex", "work")
+            source.write_text("def alpha():\n    return 10\n")
+            solo=ledger.refresh(changed_only=True, agent="codex", observed=True)
+            # Even as the only live agent, the watcher cannot claim authorship.
+            self.assertEqual(solo["attribution"]["confidence"], "LOW")
+            self.assertEqual(solo["attribution"]["source"], "filesystem-watcher")
+            self.assertEqual(ledger.db.execute("SELECT agent FROM changes ORDER BY id DESC").fetchone()["agent"], "unknown")
+
+            ledger.start_session("claude-code", "other work")
+            source.write_text("def alpha():\n    return 20\n")
+            shared=ledger.refresh(changed_only=True, agent="codex", observed=True)
+            self.assertIn("attribution_note", shared)
+            self.assertEqual(shared["attribution"]["confidence"], "LOW")
+            self.assertEqual(ledger.db.execute("SELECT agent FROM changes ORDER BY id DESC").fetchone()["agent"], "unknown")
+            self.assertEqual(ledger.db.execute("SELECT last_modified_by FROM symbols WHERE name='alpha'").fetchone()[0], "unknown")
+
+            # An agent refreshing on its own behalf is authoritative, not observed.
+            source.write_text("def alpha():\n    return 30\n")
+            ledger.refresh(changed_only=True, agent="claude-code", session="s2", request="Update alpha")
+            self.assertEqual(ledger.db.execute("SELECT agent FROM changes ORDER BY id DESC").fetchone()["agent"], "claude-code")
+
+    def test_since_reports_what_another_agent_changed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); a=root/"a.py"; b=root/"b.py"
+            a.write_text("def alpha():\n    return 1\n"); b.write_text("def beta():\n    return 2\n")
+            ledger=Ledger(root); ledger.init()
+            a.write_text("def alpha():\n    return 10\n")
+            ledger.refresh(changed_only=True, agent="codex", request="Update alpha")
+            b.write_text("def beta():\n    return 20\n")
+            ledger.refresh(changed_only=True, agent="claude-code", request="Update beta")
+
+            handoff=ledger.since(agent="codex")            # since codex last recorded anything
+            self.assertEqual(handoff["changes_by_other_agents"], 1)
+            self.assertEqual(handoff["files_changed"], ["b.py"])
+            self.assertEqual(handoff["agents"], ["claude-code"])
+            self.assertIn("claude-code", handoff["summary"])
+
+            everything=ledger.since("0")                   # since change id 0
+            self.assertEqual(len(everything["changes"]), 2)
+            self.assertEqual(ledger.since(agent="nobody-yet")["since"]["timestamp"], "NOT RECORDED")
+
+    def test_since_prints_the_handoff_in_the_documented_form(self):
+        """The generic dict dump buried the answer; README documents this shape."""
+        import io, contextlib
+        from codeledger.cli import emit_since
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); a=root/"a.py"
+            a.write_text("def alpha():\n    return 1\n")
+            ledger=Ledger(root); ledger.init()
+            a.write_text("def alpha():\n    return 10\n")
+            ledger.refresh(changed_only=True, agent="codex", request="Update alpha")
+
+            buffer=io.StringIO()
+            with contextlib.redirect_stdout(buffer): emit_since(ledger.since(agent="claude-code"))
+            lines=buffer.getvalue().splitlines()
+            self.assertEqual(lines[0], "1 change(s) by codex: 1 file(s), 1 symbol(s). 1 was made by another agent.")
+            self.assertRegex(lines[1], r"^   #1 by codex  \['a\.py'\]  symbols=\['alpha'\]  effect=symbols-changed$")
+
+            empty=io.StringIO()
+            with contextlib.redirect_stdout(empty): emit_since(ledger.since(agent="codex"))
+            self.assertEqual(empty.getvalue().strip(), "Nothing has been recorded since that point.")
+
     def test_an_unknown_agent_is_recorded_as_a_generic_provider(self):
         """Documented behaviour that the adapter seam never actually applied."""
         with tempfile.TemporaryDirectory() as directory:
@@ -667,6 +849,7 @@ class CodeLedgerTests(unittest.TestCase):
                ["features", "--infer"], ["verify", "project", "p", "TEST", "PASSED"],
                ["verify-run", "project", "p", "TEST", "--", "true"], ["regressions"], ["git-import"],
                ["session", "start"], ["session", "list"], ["session", "reconcile"], ["session", "status"],
+               ["since"], ["since", "--agent", "codex"], ["since", "42"],
                ["record", "summary"], ["mcp"], ["setup-agent", "codex"],
                ["agent-config", "codex"], ["setup-codex"], ["watch", "--max-interval", "5"],
                ["run", "--request", "task", "--", "echo"]]

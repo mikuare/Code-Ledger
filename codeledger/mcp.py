@@ -11,6 +11,7 @@ TOOLS = [
     ("codeledger_get_context", "Retrieve compact project context for a task."),
     ("codeledger_get_plan", "Generate pre-change intelligence and recommendations."),
     ("codeledger_get_progress", "Check whether previous attempts at this request changed anything or are repeating. Call before retrying a task that did not work."),
+    ("codeledger_get_changes_since", "What changed since a point in time, and which agent did it. Call at the start of a turn when more than one agent works on this project."),
     ("codeledger_analyze_prompt", "Convert a user request into an explicit task brief."),
     ("codeledger_task_handshake", "Compare the user request with the AI implementation plan before editing."),
     ("codeledger_find_symbol", "Find active or deleted symbols."),
@@ -25,6 +26,9 @@ TOOLS = [
     ("codeledger_get_regressions", "Find functionality that was verified working and later failed."),
     ("codeledger_suggest_tests", "Suggest tests affected by changed files and symbols."),
     ("codeledger_get_features", "Retrieve high-level project functionality records."),
+    ("codeledger_get_active_agents", "Which agents genuinely hold a live session here, with dead sessions reconciled first."),
+    ("codeledger_check_conflicts", "Check whether another live agent recently changed the same files or symbols. Call before editing when another agent is active."),
+    ("codeledger_doctor", "Diagnose the ledger: database, schema, sessions, index coverage, and agent protocols."),
     ("codeledger_refresh", "Incrementally refresh changed files."),
 ]
 
@@ -32,6 +36,7 @@ SCHEMAS = {
     "codeledger_get_context": {"type": "object", "properties": {"query": {"type": "string"}, "task": {"type": "string"}}},
     "codeledger_get_plan": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}}},
     "codeledger_get_progress": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}}, "required": ["request"]},
+    "codeledger_get_changes_since": {"type": "object", "properties": {"marker": {"type": "string", "description": "change id, session id, or ISO timestamp"}, "agent": {"type": "string", "description": "your own agent name; means 'since I last recorded anything'"}}},
     "codeledger_analyze_prompt": {"type": "object", "properties": {"prompt": {"type": "string"}, "task": {"type": "string"}}, "required": ["prompt"]},
     "codeledger_task_handshake": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "ai_plan": {"type": "string"}}, "required": ["ai_plan"]},
     "codeledger_find_symbol": {"type": "object", "properties": {"query": {"type": "string"}, "task": {"type": "string"}}, "required": ["query"]},
@@ -46,6 +51,9 @@ SCHEMAS = {
     "codeledger_get_regressions": {"type": "object", "properties": {"subject_type": {"type": "string"}, "subject_id": {"type": "string"}}},
     "codeledger_suggest_tests": {"type": "object", "properties": {"files": {"type": "array", "items": {"type": "string"}}, "symbols": {"type": "array", "items": {"type": "string"}}}},
     "codeledger_get_features": {"type": "object", "properties": {}},
+    "codeledger_get_active_agents": {"type": "object", "properties": {}},
+    "codeledger_check_conflicts": {"type": "object", "properties": {"agent": {"type": "string", "description": "your own agent name"}, "files": {"type": "array", "items": {"type": "string"}}, "symbols": {"type": "array", "items": {"type": "string"}}}, "required": ["agent"]},
+    "codeledger_doctor": {"type": "object", "properties": {}},
     "codeledger_refresh": {"type": "object", "properties": {"agent": {"type": "string"}, "session": {"type": "string"}, "request": {"type": "string"}, "task": {"type": "string"}}},
 }
 
@@ -71,6 +79,7 @@ def serve(root):
                 if name == "codeledger_get_context": result = _result(ledger.context(arg(args, "query", "task")))
                 elif name == "codeledger_get_plan": result = _result(ledger.plan(arg(args, "request", "task", "query")))
                 elif name == "codeledger_get_progress": result = _result(ledger.progress(arg(args, "request", "task", "query")))
+                elif name == "codeledger_get_changes_since": result = _result(ledger.since(args.get("marker", ""), args.get("agent", "")))
                 elif name == "codeledger_analyze_prompt": result = _result(ledger.analyze_prompt(arg(args, "prompt", "task", "query")))
                 elif name == "codeledger_task_handshake": result = _result(ledger.handshake(arg(args, "request", "task"), args.get("ai_plan", "")))
                 elif name == "codeledger_find_symbol": result = _result(ledger.lookup(arg(args, "query", "task")))
@@ -85,6 +94,9 @@ def serve(root):
                 elif name == "codeledger_get_regressions": result = _result(ledger.regressions(args.get("subject_type"), args.get("subject_id")))
                 elif name == "codeledger_suggest_tests": result = _result(ledger.suggest_tests(args.get("files", []), args.get("symbols", [])))
                 elif name == "codeledger_get_features": result = _result(ledger.features())
+                elif name == "codeledger_get_active_agents": result = _result({"active_agents": ledger.active_agents(), **ledger.sessions(reconcile=False)})
+                elif name == "codeledger_check_conflicts": result = _result(ledger.conflicts(args.get("agent", "unknown"), args.get("files", []), args.get("symbols", [])))
+                elif name == "codeledger_doctor": result = _result(ledger.doctor())
                 elif name == "codeledger_refresh": result = _result(ledger.refresh(True, args.get("agent", "unknown"), args.get("session", ""), arg(args, "request", "task")))
                 else: raise ValueError(f"Unknown tool: {name}")
             elif method == "notifications/initialized": continue

@@ -99,6 +99,12 @@ class Ledger:
 
 Before changing code, analyze the user request (CLI: `codeledger prompt \"<task>\"`; MCP: `codeledger_analyze_prompt`), then query CodeLedger pre-change intelligence (CLI: `codeledger plan \"<task>\"`; MCP: `codeledger_get_plan`) and context (MCP: `codeledger_get_context`). Review relevant symbols, history, issues, decisions, impact, risk, constraints, acceptance criteria, and suggested tests before inspecting broad source areas. State your proposed files, implementation, and tests, then submit it for alignment (CLI: `codeledger handshake \"<task>\" --ai-plan \"<plan>\"`; MCP: `codeledger_task_handshake`). If the handshake warns, revise the plan before editing. Prefer targeted inspection; avoid repository-wide scans when CodeLedger says they are unnecessary. After changing code, refresh/record changed files (CLI: `codeledger refresh --changed`; MCP: `codeledger_refresh`), review any scope `WARNING`, run affected tests, and record verification evidence. If verification fails after a previous pass, query regressions (MCP: `codeledger_get_regressions`).
 
+## Working alongside another agent
+
+More than one agent may be editing this project. At the start of a turn, ask what changed while you were not looking (CLI: `codeledger since --agent <your name>`; MCP: `codeledger_get_changes_since` with your own agent name). It reports the files and symbols another agent changed since you last recorded anything, so you do not overwrite work you cannot see. If another agent is live, check for overlap before editing (MCP: `codeledger_check_conflicts` with your name and the files/symbols you intend to touch). A shared symbol is a stronger warning than a shared file: re-read that symbol before changing it.
+
+Claim your own edits by calling `codeledger_refresh` (MCP) or `codeledger refresh --changed --agent <your name> --request \"<task>\"` after you finish. An agent refreshing on its own behalf is the only HIGH-confidence record of who changed what. The `watch` process observes the filesystem, which cannot show which process wrote a file, so everything it records is `unknown` at LOW confidence — never assume a LOW-confidence change was yours, and never treat one as evidence that nobody else is working.
+
 ## If a task did not work the first time
 
 Before retrying a request that produced no visible result, ask what the previous attempt actually did (CLI: `codeledger progress \"<task>\"`; MCP: `codeledger_get_progress`). Do not re-read the repository to work it out. The answer is one of:
@@ -266,6 +272,39 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             if "within a transaction" not in str(exc):
                 raise
 
+    def _attribute(self, agent: str, observed: bool) -> tuple[str, dict]:
+        """Decide who to credit for an edit, and how well that is actually known.
+
+        The filesystem records that a file changed. It does not record which
+        process changed it, and no amount of watching recovers that. So the two
+        routes into the ledger carry genuinely different evidential weight, and
+        the ledger stores which one it was rather than flattening both into a
+        name that reads equally confident.
+        """
+        actor = agent or "unknown"
+        if not observed:
+            if actor == "unknown":
+                return actor, {"source": "unattributed-refresh", "confidence": "UNKNOWN",
+                               "reason": "A refresh was recorded without an agent name, so authorship is unknown."}
+            # The agent called refresh itself: it is reporting its own work.
+            return actor, {"source": "explicit-agent-refresh", "confidence": "HIGH",
+                           "reason": f"{actor} recorded this refresh on its own behalf."}
+        # An observed edit is never credited to a name. `watch --agent codex`
+        # says who started the watcher, not who wrote the file — a developer, an
+        # editor or a formatter produces an identical filesystem event. Crediting
+        # the only live agent was still an inference the evidence cannot carry,
+        # so the live agents are reported as context and authorship stays unknown.
+        live = [name for name in self.active_agents() if name != "unknown"]
+        if live:
+            return "unknown", {"source": "filesystem-watcher", "confidence": "LOW",
+                               "reason": ("Edits were observed, not performed, while sessions were active for "
+                                          f"{', '.join(sorted(set(live)))}. The filesystem cannot show which agent wrote a "
+                                          "file, so authorship is recorded as unknown. Have each agent call "
+                                          "`codeledger_refresh` itself to claim its own edits.")}
+        return "unknown", {"source": "filesystem-watcher", "confidence": "LOW",
+                           "reason": ("An edit was observed with no agent session active. It may have been made by a "
+                                      "developer, an editor, or a tool, so authorship is recorded as unknown.")}
+
     def refresh(self, *args, **kwargs) -> dict[str, int | str | None | list[str] | dict]:
         """Index changed files as one transaction, releasing the lock on failure.
 
@@ -281,9 +320,10 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             self.db.rollback()
             raise
 
-    def _refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False) -> dict[str, int | str | None | list[str] | dict]:
+    def _refresh(self, changed_only: bool = True, agent: str = "unknown", session: str = "", request: str = "", record: bool = True, analyze: bool = True, verbose: bool = False, include_git_status: bool = False, observed: bool = False) -> dict[str, int | str | None | list[str] | dict]:
         started = time.perf_counter(); statuses = git_status(self.root) if include_git_status and (self.root / ".git").exists() and analyze else {}
-        actor = agent or "unknown"   # attribution is recorded as given; it is never guessed
+        actor, attribution = self._attribute(agent, observed)
+        attribution_note = attribution["reason"] if attribution["confidence"] != "HIGH" else ""
         if session: self.touch_session(session)
         # Take the write lock before reading anything the indexing pass decides
         # on. A deferred transaction begins at the *first write*, so every read
@@ -382,9 +422,14 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # files marked changed with no change row to explain them, so `since`
         # and `progress` silently under-reported.
         if record and changed_paths:
-            change_id = self.record_change(agent, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN", effect=effect, commit=False)
+            change_id = self.record_change(actor, session, request, f"Indexed {len(changed_paths)} changed file(s)", "unverified", changed_paths, sorted(set(changed_symbols)), added, modified, deleted, risk=self.analyze_prompt(request)["risk"] if request else "UNKNOWN", effect=effect, attribution=attribution, commit=False)
         self.db.commit(); db_seconds = time.perf_counter() - db_started; total = time.perf_counter() - started
-        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
+        result = {"files_added": added, "files_modified": modified, "files_deleted": deleted, "symbols_changed": symbols, "change_id": change_id, "effect": effect, "agent": actor, "attribution": attribution, "files": changed_paths, "symbols": sorted(set(changed_symbols)), "metrics": metrics.as_dict(), "timing": {"discovery_seconds": round(discovery_seconds, 4), "hashing_seconds": round(hash_seconds, 4), "parsing_seconds": round(parse_seconds, 4), "database_seconds": round(db_seconds, 4), "total_seconds": round(total, 4)}}
+        if attribution_note:
+            result["attribution_note"] = attribution_note
+        if changed_paths:
+            overlap = self.conflicts(actor, changed_paths, sorted(set(changed_symbols)))
+            if overlap["status"] != "NONE": result["conflicts"] = overlap
         if request:
             result["scope"] = self.scope_check(request, changed_paths, changed_symbols)
         if verbose: print(f"Discovery: {result['timing']['discovery_seconds']}s | Hashing: {result['timing']['hashing_seconds']}s | Parsing: {result['timing']['parsing_seconds']}s | Database: {result['timing']['database_seconds']}s | Total: {result['timing']['total_seconds']}s")
@@ -634,6 +679,97 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         analysis = context["task_analysis"]
         return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols, "recent_changes": context["recent_changes"], "known_issues": context["known_issues"], "decisions": context["decisions"], "risk": "HIGH" if analysis["risk"] == "HIGH" else risk, "recommendation": recommendation, "full_scan_required": context["scan_required"], "suggested_tests": self.suggest_tests(sorted(impact_files), [symbol["name"] for symbol in symbols])}
 
+    def since(self, marker: str = "", agent: str = "", limit: int = 50) -> dict:
+        """What has changed since a point in time, and who did it.
+
+        The handoff query for more than one agent on a repository. With no
+        marker and an agent name it means "since that agent last recorded
+        anything", which is what an agent needs at the start of a turn to find
+        out what the other one did while it was not looking.
+        """
+        cutoff_id = cutoff_time = None
+        if marker.isdigit():
+            cutoff_id = int(marker); resolved = {"type": "change_id", "value": cutoff_id}
+        elif marker.startswith("session-"):
+            row = self.db.execute("SELECT start_time FROM sessions WHERE session_id=?", (marker,)).fetchone()
+            cutoff_time = row["start_time"] if row else None
+            resolved = {"type": "session", "value": marker, "start_time": cutoff_time}
+        elif marker:
+            cutoff_time = marker; resolved = {"type": "timestamp", "value": marker}
+        elif agent:
+            row = self.db.execute("SELECT timestamp FROM changes WHERE agent=? ORDER BY id DESC LIMIT 1", (agent,)).fetchone()
+            cutoff_time = row["timestamp"] if row else None
+            resolved = {"type": "last change by agent", "value": agent, "timestamp": cutoff_time or "NOT RECORDED"}
+        else:
+            resolved = {"type": "most recent", "value": limit}
+
+        if cutoff_id is not None:
+            rows = self.db.execute("SELECT * FROM changes WHERE id>? ORDER BY id DESC LIMIT ?", (cutoff_id, limit)).fetchall()
+        elif cutoff_time:
+            rows = self.db.execute("SELECT * FROM changes WHERE timestamp>? ORDER BY id DESC LIMIT ?", (cutoff_time, limit)).fetchall()
+        else:
+            rows = self.db.execute("SELECT * FROM changes ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+        changes, files, symbols, agents = [], set(), set(), set()
+        for row in rows:
+            row_files = [item["path"] for item in self.db.execute("SELECT path FROM change_files WHERE change_id=?", (row["id"],))]
+            row_symbols = [item["name"] for item in self.db.execute("SELECT name FROM change_symbols WHERE change_id=?", (row["id"],))]
+            files.update(row_files); symbols.update(row_symbols); agents.add(row["agent"] or "unknown")
+            changes.append({"change_id": row["id"], "timestamp": row["timestamp"], "agent": row["agent"] or "unknown",
+                            "request": row["user_request"] or "NOT RECORDED", "effect": row["effect"] or "unknown",
+                            "risk": row["risk"], "files": row_files, "symbols": row_symbols})
+        by_others = [item for item in changes if agent and item["agent"] != agent]
+        summary = "Nothing has been recorded since that point."
+        if changes:
+            who = ", ".join(sorted(agents))
+            summary = (f"{len(changes)} change(s) by {who}: {len(files)} file(s), {len(symbols)} symbol(s)."
+                       + (f" {len(by_others)} {'was' if len(by_others) == 1 else 'were'} made by another agent." if by_others else ""))
+        result = {"since": resolved, "changes": changes, "files_changed": sorted(files),
+                  "symbols_changed": sorted(symbols), "agents": sorted(agents),
+                  "changes_by_other_agents": len(by_others), "active_agents": self.active_agents(), "summary": summary}
+        if agent and (files or symbols):
+            overlap = self.conflicts(agent, sorted(files), sorted(symbols))
+            if overlap["status"] != "NONE": result["conflicts"] = overlap
+        return result
+
+    def conflicts(self, agent: str, files: list[str], symbols: list[str] | None = None, window_seconds: int = 1800) -> dict:
+        """Is another live agent working on the same code right now?
+
+        Two agents editing the same repository is the case CodeLedger exists to
+        make safe, and the dangerous overlap is not the directory — it is the
+        symbol. Touching the same file can be coincidence; rewriting the same
+        function is one agent about to undo the other. Only agents with a live
+        session count, so a crashed session cannot raise a conflict forever.
+        """
+        symbols = symbols or []
+        live = [name for name in self.active_agents() if name not in ("unknown", agent)]
+        if not live or not (files or symbols):
+            return {"status": "NONE", "conflicts": [], "message": "No other agent holds a live session."}
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+        slots = ",".join("?" * len(live))
+        found = []
+        for row in self.db.execute(f"SELECT * FROM changes WHERE agent IN ({slots}) AND timestamp>? ORDER BY id DESC LIMIT 50", (*live, cutoff)):
+            their_files = {item["path"] for item in self.db.execute("SELECT path FROM change_files WHERE change_id=?", (row["id"],))}
+            their_symbols = {item["name"] for item in self.db.execute("SELECT name FROM change_symbols WHERE change_id=?", (row["id"],))}
+            shared_symbols, shared_files = sorted(their_symbols & set(symbols)), sorted(their_files & set(files))
+            if not shared_symbols and not shared_files:
+                continue
+            found.append({"severity": "HIGH" if shared_symbols else "MEDIUM", "agent": row["agent"],
+                          "session": row["session_id"] or "unrecorded", "change_id": row["id"], "at": row["timestamp"],
+                          "request": row["user_request"] or "NOT RECORDED",
+                          "shared_symbols": shared_symbols, "shared_files": shared_files,
+                          "attribution_confidence": row["attribution_confidence"] or "UNKNOWN"})
+        if not found:
+            return {"status": "NONE", "conflicts": [], "active_agents": live,
+                    "message": f"{', '.join(live)} also active, but not on the same files or symbols."}
+        worst = "HIGH" if any(item["severity"] == "HIGH" for item in found) else "MEDIUM"
+        overlapping = sorted({name for item in found for name in item["shared_symbols"]})
+        message = (f"POTENTIAL CONFLICT: {', '.join(sorted({item['agent'] for item in found}))} also changed "
+                   + (f"the same symbol(s): {', '.join(overlapping)}." if overlapping
+                      else f"the same file(s): {', '.join(sorted({name for item in found for name in item['shared_files']}))}.")
+                   + " Re-read those before editing so the two agents do not undo each other.")
+        return {"status": worst, "conflicts": found, "active_agents": live, "message": message}
+
     def _salient(self, text: str) -> set[str]:
         return {word.lower() for word in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text or "") if word.lower() not in STOPWORDS}
 
@@ -769,13 +905,17 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         row = self.db.execute("SELECT s.*,a.name AS agent FROM sessions s LEFT JOIN agents a ON a.id=s.agent_id WHERE s.session_id=?", (session_id,)).fetchone()
         return dict(row) if row else {"session_id": session_id, "status": "not_found"}
 
-    def record_change(self, agent: str, session: str, request: str, summary: str, result: str = "unverified", files: list[str] | None = None, symbols: list[str] | None = None, added: int = 0, modified: int = 0, deleted: int = 0, risk: str | None = None, effect: str | None = None, commit: bool = True) -> int:
+    def record_change(self, agent: str, session: str, request: str, summary: str, result: str = "unverified", files: list[str] | None = None, symbols: list[str] | None = None, added: int = 0, modified: int = 0, deleted: int = 0, risk: str | None = None, effect: str | None = None, attribution: dict | None = None, commit: bool = True) -> int:
         files, symbols = files or [], symbols or []
         # `risk` is derived from the recorded request, never invented: with no
         # request there is no evidence, so it stays UNKNOWN.
         risk = (risk or (self.analyze_prompt(request)["risk"] if request else "UNKNOWN")).upper()
         effect = effect or ("symbols-changed" if symbols else "text-only" if files else "none")
-        cur = self.db.execute("INSERT INTO changes(timestamp,agent,session_id,user_request,summary,risk,result,effect,git_commit,files_added,files_modified,files_deleted,symbols_modified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (NOW(), agent, session, request, summary, risk, result, effect, head(self.root), added, modified, deleted, len(symbols)))
+        # A change recorded by hand carries no evidence about who made it beyond
+        # the name supplied, which is exactly what MEDIUM means here.
+        attribution = attribution or {"source": "manual-record", "confidence": "MEDIUM" if agent and agent != "unknown" else "UNKNOWN",
+                                      "reason": "Recorded by hand; the ledger did not observe the edit."}
+        cur = self.db.execute("INSERT INTO changes(timestamp,agent,session_id,user_request,summary,risk,result,effect,git_commit,files_added,files_modified,files_deleted,symbols_modified,attribution_source,attribution_confidence,attribution_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (NOW(), agent, session, request, summary, risk, result, effect, head(self.root), added, modified, deleted, len(symbols), attribution["source"], attribution["confidence"], attribution["reason"]))
         change_id = cur.lastrowid
         for path in files:
             file_row = self.db.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
