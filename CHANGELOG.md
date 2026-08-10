@@ -8,6 +8,116 @@ Entries describe what was wrong and how it was found, not only what changed.
 Most of these were silent — the tool returned a confident answer that happened
 to be wrong — which is the failure mode this project exists to avoid.
 
+## [Unreleased]
+
+A reliability pass over the intelligence that already existed. Every item below
+was reproduced from a real session before it was fixed, and each has a
+regression test that fails without the fix. No new subsystem, no schema change,
+no migration: the goal was to make the existing answers trustworthy rather than
+to add more of them.
+
+### Fixed
+
+- **Language keywords and comment prose were indexed as project symbols.** The
+  shallow provider's method pattern matched any `keyword (...) {` statement, so
+  `if`, `for`, `while`, `switch` and `catch` became symbols; and because it
+  scanned raw lines, `// will type the value` produced a type named `the` and
+  `class of service` produced a class named `of`. Comment spans are now blanked
+  before matching (line numbers preserved), type declarations must sit at the
+  head of a line behind known modifiers, and a control-flow head in the method
+  slot is rejected structurally — it cannot be an identifier there, so nothing
+  real is lost. A method genuinely named `move` or `submit` is untouched.
+
+- **SQL indexed its locals and columns, and missed its functions and tables.**
+  The generic tree walker read `tree-sitter-sql` through JavaScript conventions:
+  a PL/pgSQL `DECLARE` local is a `function_declaration` in that grammar and a
+  column is a `column_definition`, both of which looked like definitions — while
+  the real definitions (`create_function`, `create_table`, `create_view`, …)
+  matched no convention at all. So `v_email`, `column_name` and `id` were
+  indexed and `check_user` and `users` were absent. SQL now has an explicit
+  definition list with the conventions switched off, covering functions, tables,
+  views, materialized views, triggers, types, indexes, policies, schemas and
+  sequences. `CREATE PROCEDURE` and `CREATE DOMAIN` are not in the grammar and
+  are reported as unparsed rather than guessed at.
+
+- **Struct fields, class properties and method receivers were project symbols.**
+  Suffix matching pulled in Go's `addr` and its `s` receiver and TypeScript's
+  `items`. These are storage slots, and are now definitions only when they bind
+  a function — which keeps `handleClick = () => {}` and drops the rest.
+
+- **A file the grammar could not parse claimed `FULL` coverage.** With no
+  symbols from the grammar and none from the line patterns, a parse error now
+  records `SHALLOW`. `impact` treats `FULL` as licence to believe an empty
+  dependent list, so claiming it there turned "not parsed" into "nothing
+  depends on this".
+
+- **Scope warnings fired on ordinary work.** `scope_check` compared every
+  changed symbol against the symbols whose *names* matched the request, so any
+  symbol not named after the request was "unexpected" — which is most of them.
+  A change to `App.jsx` for "add period navigation" was reported as an
+  unexpected file with unexpected symbols `App` and `move`. Scope is now a
+  question about files: the boundary includes the files that depend on the
+  relevant symbols (from the dependency graph, not word matching), the paths the
+  request names, and optionally the files the plan declared; and a symbol is
+  unexpected only when the file it lives in is. The boundary also no longer
+  inherits the 20-item presentation cap, which silently clipped it.
+
+- **The handshake approved plans that contradicted the request.** It required
+  more than one unmentioned area to warn and never compared the plan's paths to
+  anything, so a plan to rewrite an unrelated file — or one that violated a
+  scope the user had stated explicitly — returned `ALIGNED`. It now warns when
+  the plan names a path outside the user's stated scope or outside the indexed
+  relevant scope, and returns `INSUFFICIENT_EVIDENCE` instead of `ALIGNED` when
+  nothing connects the request to this project. A plan that names no paths is
+  not warned about for its silence.
+
+- **Deleted symbols were returned with live line numbers and signatures.** A
+  symbol marked `deleted` kept the position it had when it was removed, so
+  nothing downstream could tell a symbol that exists from one that used to.
+  Deleted symbols now present `line_start`, `line_end` and `signature` as null,
+  with the recorded values moved under `historical`; `impact` reports them
+  separately from live matches and no longer counts their files as defining
+  files.
+
+- **Recreating a symbol created a duplicate row.** Prior symbols were matched
+  with `status='active'`, so a symbol that came back missed the revive path and
+  was inserted again — leaving two rows for one name, one permanently deleted
+  and still carrying stale metadata, both returned by every lookup. The existing
+  row is now revived, keeping its id, its creation time and its change history.
+
+- **Cold start returned the whole repository.** `resume` capped its own lists at
+  20 but embedded change records whose per-change file lists were unbounded, so
+  one broad refactor returned 301 paths to say "there is no checkpoint". Change
+  records now bound their file and symbol lists and report `files_total` /
+  `files_truncated` alongside, and cold start leads with a short orienting
+  summary. Measured on a 301-file project: 6,801 → 2,229 characters, and no
+  longer grows with the repository.
+
+- **The request was lost when the ledger already knew it.** A bare
+  `codeledger refresh --changed` recorded `NOT RECORDED` even while a single
+  live session in the same database held the request text. The session and its
+  request are now inherited when exactly one live session exists. Authorship is
+  deliberately *not* inherited: a live session proves work is underway, not who
+  ran the command, so the agent stays `unknown` at `UNKNOWN` confidence and the
+  reason says both things plainly. The watcher inherits nothing, as before.
+
+- **The MCP server discarded the client name it had just established.**
+  `codeledger_refresh` and `codeledger_record_change` passed the literal
+  `"unknown"` when the argument was omitted, although the server had identified
+  the client during `initialize` and started the session under that name. They
+  now fall back to it; an explicit argument still wins.
+
+### Notes
+
+- Existing databases upgrade in place. The `files.analysis_version` stamp moves
+  to `:2`, so `refresh --changed` reparses each file once and retires symbols
+  like `if` and `v_email` — they are marked deleted, never destroyed, and all
+  change history is preserved. There is no migration to run.
+- `codeledger scope` gains optional `--plan-files` and `--plan-symbols`.
+- `since` and change records gain `files_total`, `files_truncated`,
+  `symbols_total` and `symbols_truncated`; the handshake gains
+  `scope_violations` and `plan_paths`; `impact` gains `historical_symbols`.
+
 ## [0.4.0]
 
 Adds a context-continuity layer: an agent's conversation is temporary, and this

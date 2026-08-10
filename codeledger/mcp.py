@@ -124,6 +124,11 @@ def serve(root, agent: str = "", session: str = ""):
     # all: nothing to heartbeat, nothing to hang a checkpoint on, and no entry
     # in `active_agents` for another agent's conflict check to see.
     owned = ""
+    # Who the client said it is, normalised by `start_session`. The server
+    # established this at `initialize` and then passed the literal "unknown" to
+    # every refresh that did not repeat it, throwing away attribution it already
+    # held. An argument the agent supplies still wins.
+    identity = agent or ""
     try:
         for line in sys.stdin:
             try:
@@ -131,7 +136,8 @@ def serve(root, agent: str = "", session: str = ""):
                 if method == "initialize":
                     params = request.get("params", {})
                     if not owned and not session:
-                        owned = ledger.start_session(agent or client_agent(params), owns_process=True)["session_id"]
+                        started = ledger.start_session(agent or client_agent(params), owns_process=True)
+                        owned = started["session_id"]; identity = started["agent"]
                     result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                               "serverInfo": {"name": "codeledger", "version": __version__},
                               "instructions": INSTRUCTIONS}
@@ -174,7 +180,7 @@ def serve(root, agent: str = "", session: str = ""):
                     elif name == "codeledger_get_recent_changes": result = _result([dict(row) for row in ledger.db.execute("SELECT * FROM changes ORDER BY id DESC LIMIT 10")])
                     elif name == "codeledger_get_issues": result = _result([dict(row) for row in ledger.db.execute("SELECT * FROM issues WHERE status='OPEN' ORDER BY updated_at DESC")])
                     elif name == "codeledger_get_decisions": result = _result([dict(row) for row in ledger.db.execute("SELECT * FROM decisions WHERE status='ACTIVE' ORDER BY created_at DESC")])
-                    elif name == "codeledger_record_change": result = _result({"change_id": ledger.record_change(args.get("agent", "unknown"), args.get("session", "") or current, args.get("request", ""), args.get("summary", "NOT RECORDED"), args.get("result", "unverified"), args.get("files", []), args.get("symbols", []))})
+                    elif name == "codeledger_record_change": result = _result({"change_id": ledger.record_change(args.get("agent") or identity or "unknown", args.get("session", "") or current, args.get("request", ""), args.get("summary", "NOT RECORDED"), args.get("result", "unverified"), args.get("files", []), args.get("symbols", []))})
                     elif name == "codeledger_mark_verified": result = _result(ledger.verify(args.get("subject_type", "project"), args.get("subject_id", "project"), args.get("kind", "manual"), args.get("result", "UNVERIFIED"), args.get("evidence", "")))
                     elif name == "codeledger_get_regressions": result = _result(ledger.regressions(args.get("subject_type"), args.get("subject_id")))
                     elif name == "codeledger_suggest_tests": result = _result(ledger.suggest_tests(args.get("files", []), args.get("symbols", [])))
@@ -182,7 +188,7 @@ def serve(root, agent: str = "", session: str = ""):
                     elif name == "codeledger_get_active_agents": result = _result({"active_agents": ledger.active_agents(), **ledger.sessions(reconcile=False)})
                     elif name == "codeledger_check_conflicts": result = _result(ledger.conflicts(args.get("agent", "unknown"), args.get("files", []), args.get("symbols", [])))
                     elif name == "codeledger_doctor": result = _result(ledger.doctor())
-                    elif name == "codeledger_refresh": result = _result(ledger.refresh(True, args.get("agent", "unknown"), args.get("session", "") or current, arg(args, "request", "task")))
+                    elif name == "codeledger_refresh": result = _result(ledger.refresh(True, args.get("agent") or identity or "unknown", args.get("session", "") or current, arg(args, "request", "task")))
                     else: raise ValueError(f"Unknown tool: {name}")
                 elif method == "notifications/initialized": continue
                 else: raise ValueError(f"Unsupported method: {method}")

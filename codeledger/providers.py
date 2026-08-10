@@ -79,6 +79,15 @@ FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "lambda"
 # Suffix matching alone would treat `import_specifier` and `use_declaration` as
 # definitions, inventing a symbol for every imported name.
 NON_DEFINITION = {"import_specifier", "namespace_import", "import_clause", "export_clause", "export_specifier"}
+# Storage slots, not definitions: a struct field, a class property and a
+# parameter all end in a definition-like suffix, so the conventions above
+# registered a Go method's receiver (`s`), a struct's `addr` and a TS class's
+# `items` as project symbols. They are treated like `variable_declarator` —
+# a definition only when the slot binds a function, which is what makes
+# `handleClick = () => {}` a method by another name and `items: string[] = []`
+# an implementation detail.
+FIELD_TYPES = {"field_declaration", "parameter_declaration", "public_field_definition",
+               "property_declaration", "field_definition"}
 DEFINITION_TYPES = {"function_definition", "function_declaration", "method_definition", "class_definition",
                     "class_declaration", "interface_declaration", "struct_item", "enum_item", "impl_item",
                     "type_spec", "method_declaration", "constructor_declaration", "trait_item",
@@ -93,6 +102,45 @@ IMPORT_HINTS = ("import", "use_declaration", "package_clause", "require", "inclu
 KIND_BY_TYPE = {"class": "class", "struct": "class", "interface": "interface", "trait": "interface",
                 "enum": "enum", "module": "module", "object": "class", "protocol": "interface"}
 
+# Grammars whose node vocabulary collides with the conventions above. Only a
+# grammar that actually collides gets an entry; every other language keeps the
+# generic walker, which is what makes "every installed grammar" affordable.
+#
+# `exclusive` means the conventions are switched off for this grammar and only
+# the listed types are definitions. That is the honest setting for a vocabulary
+# that disagrees with the conventions rather than merely extending them:
+# anything absent from the list is unsupported, and unsupported is a better
+# answer than a confident wrong one.
+GRAMMAR_RULES = {
+    # tree-sitter-sql names a PL/pgSQL DECLARE-block local `function_declaration`
+    # and a table column `column_definition` — both of which the conventions read
+    # as definitions, producing `v_email`, `column_name` and `id` as project
+    # symbols. Meanwhile the real definitions are `create_function`,
+    # `create_table` and friends, which match no convention at all, so the actual
+    # functions and tables were missing from the index entirely.
+    "sql": {
+        "definitions": {
+            "create_function": "function", "create_table": "table", "create_view": "view",
+            "create_materialized_view": "view", "create_trigger": "trigger", "create_type": "type",
+            "create_index": "index", "create_policy": "policy", "create_schema": "schema",
+            "create_sequence": "sequence",
+        },
+        "exclusive": True,
+        # `CREATE TABLE users` names the table on an `object_reference`, while
+        # `CREATE INDEX idx ON users` names the index on a bare `identifier` and
+        # the table on the object_reference after it. Taking the first of either
+        # in document order gets both right, and takes the trigger's own name
+        # rather than the table it fires on.
+        "name_from": ("object_reference", "identifier"),
+    },
+}
+# Deliberately absent from the SQL list, and why: CREATE EXTENSION names an
+# external dependency rather than something this project defines, and
+# CREATE DATABASE / CREATE ROLE are server administration, not code. CREATE
+# PROCEDURE and CREATE DOMAIN are not in the grammar at all — they parse to an
+# ERROR node, so there is no structural evidence to extract and `analyze`
+# reports the file as SHALLOW rather than inventing a symbol from the text.
+
 class TreeSitterProvider:
     """Parse-tree analysis for every installed grammar.
 
@@ -106,9 +154,32 @@ class TreeSitterProvider:
 
     def __init__(self, grammar: str, parser):
         self.grammar = grammar; self._parser = parser
+        self.rules = GRAMMAR_RULES.get(grammar)
 
     def _tree(self, text: str):
         return self._parser.parse(text.encode("utf-8", errors="replace"))
+
+    def parse_failed(self, text: str) -> bool:
+        """Did the grammar fail to parse this file?
+
+        Consulted only when no symbols were found, to keep a file the grammar
+        choked on from being recorded as fully analysed. `impact` treats FULL
+        coverage as licence to trust an empty dependent list, so claiming it
+        here would turn "not parsed" into "nothing depends on this".
+        """
+        try:
+            return bool(self._tree(text).root_node.has_error)
+        except Exception:
+            return True
+
+    def _named_from(self, node, types: tuple[str, ...]) -> str | None:
+        """First child of one of these types, in document order, as text."""
+        for child in node.named_children:
+            if child.type in types:
+                identifier = next((sub for sub in child.named_children if sub.type in IDENTIFIERS), None)
+                target = identifier if identifier is not None else child
+                return target.text.decode("utf-8", errors="replace")
+        return None
 
     @staticmethod
     def _name_of(node) -> str | None:
@@ -129,18 +200,29 @@ class TreeSitterProvider:
                 return child.text.decode("utf-8", errors="replace")
         return None
 
-    @staticmethod
-    def _is_definition(node) -> bool:
+    def _is_definition(self, node) -> bool:
         kind = node.type
+        if self.rules:
+            if kind in self.rules["definitions"]:
+                return True
+            # A grammar whose vocabulary disagrees with the conventions gets no
+            # fallthrough: everything outside its list is unsupported, not
+            # guessed at.
+            if self.rules.get("exclusive"):
+                return False
         if kind in NON_DEFINITION or any(hint in kind for hint in IMPORT_HINTS):
             return False
+        # Checked before DEFINITION_TYPES: a storage slot is only a definition
+        # when it binds a function, whatever else its type name suggests.
+        if kind in FIELD_TYPES or kind == "variable_declarator":
+            return any(child.type in FUNCTION_VALUES for child in node.named_children)
         if kind in DEFINITION_TYPES:
             return True
-        if kind == "variable_declarator":
-            return any(child.type in FUNCTION_VALUES for child in node.named_children)
         return kind.endswith(DEFINITION_SUFFIXES)
 
     def _kind(self, node) -> str:
+        if self.rules and node.type in self.rules["definitions"]:
+            return self.rules["definitions"][node.type]
         for token, kind in KIND_BY_TYPE.items():
             if token in node.type:
                 return kind
@@ -186,7 +268,10 @@ class TreeSitterProvider:
             node, scope = stack.pop()
             child_scope = scope
             if self._is_definition(node):
-                name = self._name_of(node)
+                name = None
+                if self.rules and self.rules.get("name_from"):
+                    name = self._named_from(node, self.rules["name_from"])
+                name = name or self._name_of(node)
                 if name:
                     start, end = node.start_point[0] + 1, node.end_point[0] + 1
                     signature = lines[start - 1].strip() if start <= len(lines) else name
@@ -265,8 +350,13 @@ def provider_for(path: Path):
 
 def version_for(path: Path) -> str:
     """Analysis stamp for a file. A change here makes `refresh --changed`
-    reparse the file, so installing grammars upgrades an index in place."""
-    return f"{provider_for(path).name}:1"
+    reparse the file, so installing grammars upgrades an index in place.
+
+    Bumped to 2 when keyword, comment and grammar-vocabulary exclusions landed:
+    an index built before them holds symbols like `if` and `v_email`, and the
+    stamp is what retires them on the next refresh without a migration.
+    """
+    return f"{provider_for(path).name}:2"
 
 def analyze(path: Path, text: str) -> tuple[list[SymbolData], list[tuple[str, str, str]], str, str]:
     """Symbols, edges, provider name, and coverage tier for one file."""
@@ -283,6 +373,13 @@ def analyze(path: Path, text: str) -> tuple[list[SymbolData], list[tuple[str, st
             fallback = _REGEX.symbols(path, text)
             if len(fallback) >= 2:
                 return fallback, _REGEX.edges(path, text, fallback), _REGEX.name, _REGEX.coverage
+            # Nothing was extracted and the line patterns found nothing either.
+            # If the grammar could not parse the file, that is not evidence the
+            # file holds no symbols — it is evidence of no coverage, and saying
+            # FULL here is what lets `impact` read an empty result as proof that
+            # nothing depends on a symbol.
+            if getattr(provider, "parse_failed", None) and provider.parse_failed(text):
+                return symbols, edges, provider.name, SHALLOW
         return symbols, edges, provider.name, provider.coverage
     except Exception:
         # A grammar that chokes on a file must not fail the refresh; fall back

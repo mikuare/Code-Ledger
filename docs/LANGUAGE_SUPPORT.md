@@ -118,6 +118,54 @@ from what the current provider would produce, it is reparsed on the next
 `refresh --changed`. Installing or removing the extra therefore upgrades an
 existing index in place — no re-init, no migration command.
 
+## What counts as a project symbol
+
+A symbol is something another part of the project can depend on: a function, a
+class, a component, a hook, a method, a table. It is deliberately *not* every
+named node a grammar produces. A method's receiver, a struct field, a PL/pgSQL
+local and a table column are all named, and all of them are implementation
+detail — indexing them pollutes relevance ranking and scope comparison with
+names nothing can depend on.
+
+Two failures made the rule explicit, both found in real use:
+
+- The line patterns matched `if (ready) {` as a method called `if`, and mined
+  `type the value` out of an English comment as a type called `the`.
+- The generic tree walker read `tree-sitter-sql`'s vocabulary through JavaScript
+  conventions: a `DECLARE`-block local is a `function_declaration` there and a
+  column is a `column_definition`, so `v_email` and `id` were indexed while
+  `create_function` and `create_table` matched nothing and the real functions
+  and tables were missing entirely.
+
+| Provider | Counts as a symbol | Excluded | Unsupported | Confidence |
+|---|---|---|---|---|
+| `PythonAstProvider` | `def`, `async def`, `class`, at any nesting | everything else: the AST is exact | — | `FULL` |
+| `TreeSitterProvider` (general) | `DEFINITION_TYPES`, `*_definition/_declaration/_item/_spec`, and a `variable_declarator` or field bound to a function | imports, `NON_DEFINITION`, and `FIELD_TYPES` (struct fields, class properties, parameters, receivers) not bound to a function | anything a grammar names unconventionally, until it gets a `GRAMMAR_RULES` entry | `FULL` |
+| `TreeSitterProvider` (`sql`) | `create_function`, `create_table`, `create_view`, `create_materialized_view`, `create_trigger`, `create_type`, `create_index`, `create_policy`, `create_schema`, `create_sequence` | PL/pgSQL locals, columns, function arguments — and the generic conventions, which are switched off for this grammar | `CREATE PROCEDURE` and `CREATE DOMAIN` are not in the grammar at all (they parse to an `ERROR` node); `CREATE EXTENSION`/`DATABASE`/`ROLE` are deliberately not project definitions | `FULL` for the listed statements |
+| `RegexProvider` | `class`/`interface`/`type` at the head of a line behind known modifiers, `function`/`def`/`fn`/`func` declarations, arrow consts, and `name(args) {` methods | comment spans, and control-flow heads in the method slot (`CONTROL_FLOW_HEADS`) | class bodies on one line, destructuring binds, anything needing a parse tree | `SHALLOW` — never claims otherwise |
+
+The keyword exclusion is structural rather than a list of names that looked
+wrong: `if`, `for` and `catch` cannot be identifiers in the slot the pattern
+captures them from, so excluding them there cannot cost a real symbol. A method
+genuinely named `move`, `start` or `submit` is untouched — those are ordinary
+methods and filtering them to quieten a warning would trade recall for nothing.
+
+Measured on a labelled corpus of JSX, TSX, SQL, Go and JS before and after:
+
+| Mode | Precision | Recall |
+|---|---|---|
+| `RegexProvider` | 78.9% → **100%** | 68.2% → 68.2% (unchanged) |
+| `TreeSitterProvider` | 66.7% → **100%** | 81.8% → **100%** |
+
+Recall rose with grammars because the SQL definitions that were missing are now
+found; it is unchanged without them. No recall was traded for precision.
+
+One further honesty rule: when a grammar yields no symbols, the line patterns
+find nothing either, *and* the parse tree reports an error, the file is recorded
+as `SHALLOW` rather than `FULL`. A file the grammar could not parse has not been
+covered, and `impact` treats `FULL` coverage as licence to believe an empty
+dependent list.
+
 ## Verified
 
 `test_every_supported_language_yields_symbols_and_a_call_graph` builds a real

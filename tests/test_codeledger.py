@@ -2309,3 +2309,822 @@ class SchemaIndexOrderingTests(unittest.TestCase):
         self.assertEqual(offenders, [])
         self.assertNotIn("CREATE INDEX", db_module.TABLES,
                          "indexes must live in INDEXES, which runs after the migrations")
+
+
+class ShallowSymbolPrecisionTests(unittest.TestCase):
+    """The line-pattern provider must not promote keywords or prose to symbols.
+
+    These exercise `regex_symbols` directly rather than `analyze`, so they run
+    identically with and without grammars. That is deliberate: the shallow
+    provider is the floor every unsupported language falls to, and the floor is
+    where the reported garbage came from.
+    """
+
+    KEYWORD_SOURCE = """
+export function save(payload) {
+  if (payload) {
+    track(payload);
+  }
+  for (const item of payload.items) {
+    visit(item);
+  }
+  while (pending) {
+    step();
+  }
+  switch (payload.mode) {
+    case 1: break;
+  }
+  try {
+    submit(payload);
+  }
+  catch (error) {
+    report(error);
+  }
+}
+"""
+
+    PROSE_SOURCE = """
+// This function will type the value into the box.
+/* It will interface Foo with bar, and the
+   class of service is decided later. */
+# type the name here
+const total = 1;
+"""
+
+    def test_control_flow_keywords_are_never_symbols(self):
+        """`if (x) {` is a statement, not a declaration."""
+        from codeledger.parser import regex_symbols
+        names = {item.name for item in regex_symbols(self.KEYWORD_SOURCE)}
+        for keyword in ("if", "for", "while", "switch", "catch", "try"):
+            self.assertNotIn(keyword, names, f"{keyword!r} was indexed as a project symbol")
+        self.assertIn("save", names, "the real function must survive the keyword guard")
+
+    def test_prose_and_comments_do_not_produce_symbols(self):
+        """English sentences mentioning `type`/`class` are not declarations."""
+        from codeledger.parser import regex_symbols
+        names = {item.name for item in regex_symbols(self.PROSE_SOURCE)}
+        for invented in ("the", "of", "Foo"):
+            self.assertNotIn(invented, names, f"{invented!r} was mined out of a comment")
+
+    def test_real_declarations_are_still_indexed(self):
+        """The recall half. Precision that costs real symbols is not a fix.
+
+        `start`, `stop`, `move` and `submit` are here on purpose: they appeared
+        in a scope warning during the reported session, but they are ordinary
+        object methods and filtering them would hide a scope bug behind a
+        parser regression.
+        """
+        from codeledger.parser import regex_symbols
+        source = """
+export function CheckoutPanel(props) { return null; }
+export const useCheckout = () => { return 1; };
+export const PaymentProvider = ({ children }) => children;
+class WidgetService {
+  start() { return 1; }
+  stop() { return 2; }
+  move(delta) { return delta; }
+  submit(event) { return event; }
+}
+export interface CheckoutProps { total: number }
+"""
+        names = {item.name for item in regex_symbols(source)}
+        for expected in ("CheckoutPanel", "useCheckout", "PaymentProvider", "WidgetService",
+                         "start", "stop", "move", "submit", "CheckoutProps"):
+            self.assertIn(expected, names, f"{expected!r} was lost to the precision fix")
+
+    def test_the_shallow_provider_stays_low_confidence(self):
+        """Precision improves; the honesty about coverage does not change."""
+        from codeledger.providers import RegexProvider, SHALLOW
+        self.assertEqual(RegexProvider.coverage, SHALLOW)
+
+
+class TreeSitterSymbolPrecisionTests(unittest.TestCase):
+    """Grammar vocabulary is not a project symbol vocabulary."""
+
+    def setUp(self):
+        if not capabilities()["tree_sitter_installed"]:
+            self.skipTest("grammars not installed: pip install 'code-ledger[languages]'")
+
+    def analyze_text(self, name, text):
+        from codeledger.providers import analyze
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / name
+            path.write_text(text)
+            symbols, _edges, provider, coverage = analyze(path, text)
+        return {item.name for item in symbols}, provider, coverage
+
+    SQL_SOURCE = """
+CREATE OR REPLACE FUNCTION check_user(p_id int) RETURNS void AS $$
+DECLARE
+  v_email text;
+  v_username text;
+  column_name text;
+  new_value text;
+BEGIN
+  SELECT email INTO v_email FROM users WHERE id = p_id;
+  UPDATE audit SET column_name = new_value WHERE id = p_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE users (
+  id serial PRIMARY KEY,
+  email text NOT NULL
+);
+
+CREATE VIEW active_users AS SELECT * FROM users;
+CREATE TRIGGER audit_users AFTER INSERT ON users
+  FOR EACH ROW EXECUTE FUNCTION check_user();
+"""
+
+    def test_plpgsql_locals_and_columns_are_not_project_symbols(self):
+        names, provider, _coverage = self.analyze_text("schema.sql", self.SQL_SOURCE)
+        self.assertEqual(provider, "tree-sitter")
+        for local in ("v_email", "v_username", "column_name", "new_value"):
+            self.assertNotIn(local, names, f"{local!r} is a PL/pgSQL local, not a project symbol")
+        for column in ("id", "email"):
+            self.assertNotIn(column, names, f"{column!r} is a table column, not a project symbol")
+
+    def test_sql_definitions_are_actually_discovered(self):
+        """The recall half of the SQL fix: the real definitions were missing."""
+        names, _provider, _coverage = self.analyze_text("schema.sql", self.SQL_SOURCE)
+        for expected in ("check_user", "users", "active_users", "audit_users"):
+            self.assertIn(expected, names, f"{expected!r} is a real SQL definition and must be indexed")
+
+    def test_a_trigger_is_named_by_itself_not_by_its_table(self):
+        names, _provider, _coverage = self.analyze_text(
+            "trig.sql", "CREATE TRIGGER audit_users AFTER INSERT ON accounts\n"
+                        "  FOR EACH ROW EXECUTE FUNCTION log_change();\n")
+        self.assertIn("audit_users", names)
+
+    def test_struct_fields_receivers_and_class_fields_are_not_symbols(self):
+        go_names, _p, _c = self.analyze_text(
+            "main.go", "package main\ntype Server struct { addr string }\n"
+                       "func (s *Server) Start() error { return nil }\n")
+        self.assertNotIn("addr", go_names, "a struct field is not a project symbol")
+        self.assertNotIn("s", go_names, "a method receiver is not a project symbol")
+        self.assertIn("Start", go_names); self.assertIn("Server", go_names)
+
+        ts_names, _p, _c = self.analyze_text(
+            "Store.ts", "export class Store {\n  private items: string[] = [];\n"
+                        "  handleClick = () => { return 1; };\n  add(item: string) { this.items.push(item); }\n}\n")
+        self.assertNotIn("items", ts_names, "a plain class field is not a project symbol")
+        # A class property bound to a function is a real method by another name.
+        self.assertIn("handleClick", ts_names)
+        self.assertIn("add", ts_names); self.assertIn("Store", ts_names)
+
+    def test_typescript_and_tsx_recall_is_unchanged(self):
+        names, _provider, coverage = self.analyze_text("Checkout.tsx", """
+import { useState } from 'react';
+export interface CheckoutProps { total: number }
+export function CheckoutPanel({ total }: CheckoutProps) {
+  const [open, setOpen] = useState(false);
+  if (total > 0) { track(total); }
+  return <div onClick={() => setOpen(!open)}>{total}</div>;
+}
+export function useCheckout() { return useState(0); }
+export const PaymentProvider = ({ children }) => children;
+export default class Store { add(item) { return item; } }
+""")
+        self.assertEqual(coverage, "full")
+        for expected in ("CheckoutProps", "CheckoutPanel", "useCheckout", "PaymentProvider", "Store", "add"):
+            self.assertIn(expected, names, f"{expected!r} was lost")
+        self.assertNotIn("if", names)
+
+    def test_an_unsupported_construct_is_not_reported_as_full_coverage(self):
+        """CREATE PROCEDURE is not in the SQL grammar; it must not read as parsed.
+
+        Honesty over recall: the grammar produces an ERROR node here, so there
+        is no structural evidence to extract. Inventing a symbol from the text
+        would be exactly the fabrication this project exists to avoid.
+        """
+        names, _provider, coverage = self.analyze_text(
+            "proc.sql", "CREATE PROCEDURE do_work(a int) LANGUAGE plpgsql AS $$ BEGIN END; $$;\n")
+        self.assertNotIn("do_work", names)
+        self.assertEqual(coverage, "shallow", "a failed parse must not claim full coverage")
+
+
+class ScopeWarningQualityTests(unittest.TestCase):
+    """A warning must mean scope risk, not lexical mismatch with the request.
+
+    The reported session produced `unexpected_symbols` for symbols the plan had
+    named, in files that were correct for the request. A guard that fires on
+    ordinary work teaches an agent to ignore it, so these tests pin both halves:
+    legitimate work stays quiet, and genuinely unrelated work still warns.
+    """
+
+    def build(self, directory):
+        root = Path(directory)
+        (root / "src" / "components").mkdir(parents=True)
+        (root / "src" / "state").mkdir(parents=True)
+        (root / "src" / "payments").mkdir(parents=True)
+        (root / "src" / "App.jsx").write_text(
+            "import { PeriodNav } from './components/PeriodNav';\n"
+            "export function App() {\n  return PeriodNav();\n}\n")
+        (root / "src" / "components" / "PeriodNav.jsx").write_text(
+            "export function PeriodNav() {\n"
+            "  function move(delta) { return delta; }\n"
+            "  function start() { return 0; }\n"
+            "  function stop() { return 1; }\n"
+            "  function submit() { return 2; }\n"
+            "  return move(1);\n}\n")
+        (root / "src" / "state" / "drawerState.js").write_text(
+            "export function openDrawer() { return true; }\n")
+        (root / "src" / "payments" / "PaymentProvider.jsx").write_text(
+            "export function PaymentProvider() { return null; }\n")
+        ledger = Ledger(root); ledger.init()
+        return ledger
+
+    def test_a_legitimate_change_to_a_dependent_file_is_not_flagged(self):
+        """The reproduced failure: App.jsx imports PeriodNav, so it is in scope.
+
+        Structural evidence, not word matching — the dependency graph already
+        knows App.jsx reaches PeriodNav, which is exactly what makes it a
+        legitimate place for 'add period navigation' to land.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.scope_check("Add period navigation",
+                                        ["src/App.jsx", "src/components/PeriodNav.jsx"],
+                                        ["App", "move", "PeriodNav"])
+            self.assertEqual(result["status"], "SAFE", result)
+            self.assertEqual(result["unexpected_files"], [])
+            self.assertEqual(result["unexpected_symbols"], [])
+
+    def test_implementation_details_inside_an_in_scope_file_are_not_violations(self):
+        """A symbol is in scope because its file is, not because it was named."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.scope_check("Add period navigation",
+                                        ["src/components/PeriodNav.jsx"],
+                                        ["move", "start", "stop", "submit", "storedLogYears"])
+            self.assertEqual(result["status"], "SAFE", result)
+            self.assertEqual(result["unexpected_symbols"], [])
+
+    def test_symbols_named_in_the_plan_are_in_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.scope_check("Add period navigation", ["src/state/drawerState.js"],
+                                        ["openDrawer"], plan_files=["src/state/drawerState.js"],
+                                        plan_symbols=["openDrawer"])
+            self.assertEqual(result["status"], "SAFE", result)
+
+    def test_a_genuinely_unrelated_file_still_warns(self):
+        """The true positive this guard exists for must survive the fix."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.scope_check("Add period navigation",
+                                        ["src/components/PeriodNav.jsx", "src/payments/PaymentProvider.jsx"],
+                                        ["PeriodNav", "PaymentProvider"])
+            self.assertEqual(result["status"], "WARNING", result)
+            self.assertIn("src/payments/PaymentProvider.jsx", result["unexpected_files"])
+            self.assertIn("PaymentProvider", result["unexpected_symbols"])
+            # The in-scope half is not swept into the warning.
+            self.assertNotIn("src/components/PeriodNav.jsx", result["unexpected_files"])
+            self.assertNotIn("PeriodNav", result["unexpected_symbols"])
+
+    def test_symbols_alone_can_never_produce_a_warning(self):
+        """With every changed file inside the boundary there is no scope risk."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.scope_check("Add period navigation", ["src/components/PeriodNav.jsx"],
+                                        ["if", "catch", "totallyUnrelatedName"])
+            self.assertEqual(result["unexpected_files"], [])
+            self.assertEqual(result["status"], "SAFE",
+                             "an empty unexpected_files must not yield WARNING")
+
+    def test_generic_request_words_do_not_manufacture_a_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.scope_check("update the code", ["src/components/PeriodNav.jsx"], ["PeriodNav"])
+            self.assertIn(result["status"], ("SAFE", "UNKNOWN"))
+            self.assertNotEqual(result["status"], "WARNING",
+                                "generic wording is missing evidence, not a scope violation")
+
+    def test_explicit_user_scope_is_respected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.scope_check("Only touch src/state/drawerState.js for this fix",
+                                        ["src/state/drawerState.js"], ["openDrawer"])
+            self.assertEqual(result["status"], "SAFE", result)
+
+    def test_the_boundary_is_not_clipped_at_twenty_matches(self):
+        """The presentation cap and the safety boundary are different numbers."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            for index in range(40):
+                (root / "src" / f"widget_{index}.py").write_text(f"def widget_handler_{index}():\n    return {index}\n")
+            ledger = Ledger(root); ledger.init()
+            changed = [f"src/widget_{index}.py" for index in range(40)]
+            result = ledger.scope_check("update widget handler", changed, [])
+            self.assertEqual(result["unexpected_files"], [],
+                             "files beyond the 20th match were dropped from the boundary")
+            self.assertGreater(len(result["allowed_files"]), 20)
+
+
+class HandshakeValidationTests(unittest.TestCase):
+    """A handshake that approves everything is worse than no handshake.
+
+    Word overlap made 'fix payment calculation' and 'change payment animation'
+    look like the same task, and a plan that contradicted an explicit user scope
+    returned ALIGNED. These pin the checks to structural evidence the ledger
+    already holds: named paths, relevant files, and the dependency graph.
+    """
+
+    def build(self, directory):
+        root = Path(directory)
+        (root / "src" / "payments").mkdir(parents=True)
+        (root / "src" / "components").mkdir(parents=True)
+        (root / "src" / "payments" / "calc.js").write_text(
+            "export function calculatePaymentTotal(items) { return items.length; }\n")
+        (root / "src" / "payments" / "anim.js").write_text(
+            "export function animatePayment(element) { return element; }\n")
+        (root / "src" / "components" / "PeriodNav.jsx").write_text(
+            "export function PeriodNav() { return null; }\n")
+        (root / "src" / "components" / "Unrelated.jsx").write_text(
+            "export function Unrelated() { return null; }\n")
+        ledger = Ledger(root); ledger.init()
+        return ledger
+
+    def test_a_plan_that_violates_an_explicit_user_scope_warns(self):
+        """The user named the file. The plan touches two others."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.handshake(
+                "Only change src/payments/calc.js. Fix payment calculation.",
+                "Modify src/components/PeriodNav.jsx and src/components/Unrelated.jsx")
+            self.assertEqual(result["status"], "WARNING", result)
+            self.assertTrue(result["scope_violations"], result)
+
+    def test_a_plan_outside_the_relevant_scope_warns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.handshake(
+                "Fix payment calculation",
+                "Rewrite the entire authentication layer in src/components/Unrelated.jsx")
+            self.assertEqual(result["status"], "WARNING", result)
+
+    def test_a_relevant_plan_is_aligned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.handshake(
+                "Fix payment calculation",
+                "Modify calculatePaymentTotal in src/payments/calc.js so it rounds correctly")
+            self.assertEqual(result["status"], "ALIGNED", result)
+            self.assertEqual(result["scope_violations"], [])
+
+    def test_a_plan_naming_no_paths_is_not_punished_for_it(self):
+        """Warn on a path the plan names and gets wrong, never on silence."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.handshake("Fix payment calculation",
+                                      "Round the total to two decimal places before returning it")
+            self.assertEqual(result["scope_violations"], [])
+            self.assertNotEqual(result["status"], "WARNING", result)
+
+    def test_no_indexed_evidence_is_not_reported_as_alignment(self):
+        """Absence of evidence must not read as agreement."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.handshake("Recalibrate the flux capacitor telemetry",
+                                      "Adjust the telemetry sampling interval")
+            self.assertEqual(result["status"], "INSUFFICIENT_EVIDENCE", result)
+            self.assertIn("evidence", result["message"].lower())
+
+    def test_the_handshake_still_scans_nothing(self):
+        """Structural checks must stay indexed-only."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            visited = []
+            original = Ledger._discover
+            try:
+                Ledger._discover = lambda self, verbose=False: (visited.append(1), original(self, verbose))[1]
+                ledger.handshake("Fix payment calculation",
+                                 "Modify calculatePaymentTotal in src/payments/calc.js")
+            finally:
+                Ledger._discover = original
+            self.assertEqual(visited, [], "handshake walked the repository")
+
+    def test_duplicate_implementation_reuse_is_still_surfaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            result = ledger.handshake(
+                "payment calculation",
+                "Create a new PaymentTotalWidget component in src/payments/calc.js")
+            self.assertIsNotNone(result["duplicate_implementation"], result)
+
+
+class HandshakeEvidenceBoundaryTests(unittest.TestCase):
+    """What the handshake still cannot do, written down rather than implied.
+
+    The audit asked for the boundary of the evidence to be named instead of
+    papered over. This test exists to record it honestly: if a later change
+    makes CodeLedger able to tell these apart, this test should be updated to
+    demand the better answer, not deleted.
+    """
+
+    def test_two_plans_over_the_same_indexed_files_cannot_be_told_apart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src" / "payments").mkdir(parents=True)
+            (root / "src" / "payments" / "calc.js").write_text(
+                "export function calculatePaymentTotal(items) { return items.length; }\n")
+            (root / "src" / "payments" / "anim.js").write_text(
+                "export function animatePayment(element) { return element; }\n")
+            ledger = Ledger(root); ledger.init()
+            result = ledger.handshake("Fix payment calculation",
+                                      "Change payment animation timing in src/payments/anim.js")
+            # Both files are indexed as relevant to "payment", and no structural
+            # evidence separates "calculation" from "animation". CodeLedger does
+            # not warn here, and must not pretend the plan was verified either.
+            self.assertEqual(result["scope_violations"], [],
+                             "anim.js is genuinely inside the indexed relevant scope")
+            self.assertIn("src/payments/anim.js", result["plan_paths"],
+                          "the path the plan named is reported so a human can judge it")
+
+
+class DeletedSymbolConsistencyTests(unittest.TestCase):
+    """One rule: a deleted symbol is a historical record, and reads like one.
+
+    The reported contradiction was a symbol carrying `status='deleted'` next to
+    a live line number and a current signature, so nothing downstream could tell
+    a symbol that exists from one that used to. The chosen behaviour is to keep
+    deleted symbols retrievable — `codeledger_find_symbol` documents that — but
+    never to present their position as current.
+    """
+
+    def build(self, directory):
+        root = Path(directory)
+        (root / "drawer.py").write_text(
+            "def openDrawer():\n    return True\n\ndef closeDrawer():\n    return False\n")
+        ledger = Ledger(root); ledger.init()
+        return ledger, root / "drawer.py"
+
+    def test_a_deleted_symbol_never_presents_a_live_position(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.build(directory)
+            live = ledger.lookup("openDrawer")[0]
+            self.assertEqual(live["status"], "active")
+            self.assertEqual(live["line_start"], 1)
+            self.assertTrue(live["signature"])
+
+            source.write_text("def closeDrawer():\n    return False\n")
+            ledger.refresh()
+
+            gone = ledger.lookup("openDrawer")[0]
+            self.assertEqual(gone["status"], "deleted")
+            self.assertIsNone(gone["line_start"], "a deleted symbol has no current line")
+            self.assertIsNone(gone["line_end"])
+            self.assertIsNone(gone["signature"], "a deleted symbol has no current signature")
+            # The record is not destroyed, only relabelled.
+            self.assertTrue(gone["deleted_at"])
+            self.assertEqual(gone["historical"]["line_start"], 1)
+            self.assertTrue(gone["historical"]["signature"])
+
+    def test_recreating_a_symbol_revives_it_instead_of_duplicating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.build(directory)
+            original_id = ledger.lookup("openDrawer")[0]["id"]
+
+            source.write_text("def closeDrawer():\n    return False\n"); ledger.refresh()
+            self.assertEqual(ledger.lookup("openDrawer")[0]["status"], "deleted")
+
+            source.write_text("def openDrawer():\n    return True\n\ndef closeDrawer():\n    return False\n")
+            ledger.refresh()
+
+            rows = ledger.lookup("openDrawer")
+            self.assertEqual(len(rows), 1, f"recreation duplicated the row: {rows}")
+            self.assertEqual(rows[0]["status"], "active")
+            self.assertEqual(rows[0]["id"], original_id, "history was re-pointed at a new row")
+            self.assertIsNone(rows[0]["deleted_at"], "stale deletion metadata leaked into a live symbol")
+            self.assertEqual(rows[0]["line_start"], 1)
+            self.assertNotIn("historical", rows[0])
+
+    def test_impact_does_not_count_a_deleted_symbol_as_live(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.build(directory)
+            source.write_text("def closeDrawer():\n    return False\n"); ledger.refresh()
+            impact = ledger.impact("openDrawer", fallback=False)
+            self.assertEqual(impact["defining_files"], [],
+                             "a deleted symbol's file was reported as a live defining file")
+            self.assertTrue(impact["historical_symbols"], "the deleted symbol should still be retrievable")
+            self.assertEqual(impact["symbols"], [])
+
+    def test_context_does_not_offer_a_deleted_symbol_as_current(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.build(directory)
+            source.write_text("def closeDrawer():\n    return False\n"); ledger.refresh()
+            context = ledger.context("openDrawer")
+            for symbol in context["symbols"]:
+                if symbol["name"] == "openDrawer":
+                    self.assertEqual(symbol["status"], "deleted")
+                    self.assertIsNone(symbol["line_start"])
+
+    def test_a_file_deletion_retires_its_symbols_the_same_way(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.build(directory)
+            source.unlink(); ledger.refresh()
+            gone = ledger.lookup("openDrawer")[0]
+            self.assertEqual(gone["status"], "deleted")
+            self.assertIsNone(gone["line_start"])
+            self.assertEqual(gone["historical"]["line_start"], 1)
+
+
+class ColdStartPayloadTests(unittest.TestCase):
+    """A cold start must cost the same on a large repository as a small one.
+
+    `_resume_without_checkpoint` capped its own file and symbol lists at 20, but
+    embedded change records from `since()` whose per-change lists were unbounded
+    — so one reindexing change carrying 300 paths was returned in full to say
+    'there is no checkpoint'.
+    """
+
+    def project(self, root: Path, modules: int):
+        (root / "src").mkdir()
+        for index in range(modules):
+            (root / "src" / f"module_{index}.py").write_text(f"def function_{index}():\n    return {index}\n")
+        ledger = Ledger(root); ledger.init()
+        # One change touching every file, which is what an initial index or a
+        # broad refactor actually produces.
+        for index in range(modules):
+            (root / "src" / f"module_{index}.py").write_text(f"def function_{index}():\n    return {index + 1}\n")
+        ledger.refresh(True, agent="claude-code", request="renumber every module")
+        return ledger
+
+    def payload(self, value) -> int:
+        return len(json.dumps(value, default=str))
+
+    def test_cold_start_does_not_return_a_repository_file_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(Path(directory), 120)
+            resumed = ledger.resume("fix function_7")
+            self.assertEqual(resumed["status"], "NO_CHECKPOINTS_RECENT_WORK_FOUND")
+            for entry in resumed["recent_work"]:
+                self.assertLessEqual(len(entry["files"]), 20,
+                                     "a change record dumped its whole file list")
+                self.assertLessEqual(len(entry["symbols"]), 20)
+            # Nothing is hidden: the totals are still reported.
+            self.assertEqual(resumed["recent_work"][0]["files_total"], 120)
+
+    def test_cold_start_payload_does_not_grow_with_the_repository(self):
+        sizes = []
+        for modules in (60, 240):
+            with tempfile.TemporaryDirectory() as directory:
+                ledger = self.project(Path(directory), modules)
+                sizes.append(self.payload(ledger.resume("fix function_7")))
+        small, large = sizes
+        self.assertLess(large, small * 1.5,
+                        f"cold start grew with repository size: {small} -> {large} chars")
+        self.assertLess(large, 6000, f"cold start payload is {large} chars")
+
+    def test_cold_start_still_says_what_recently_happened(self):
+        """Bounded is not empty. The orienting facts must survive."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(Path(directory), 120)
+            resumed = ledger.resume("fix function_7")
+            entry = resumed["recent_work"][0]
+            self.assertEqual(entry["request"], "renumber every module")
+            self.assertEqual(entry["agent"], "claude-code")
+            self.assertTrue(entry["files"], "a truncated list is not an empty one")
+            self.assertTrue(resumed["guidance"])
+            self.assertIn("files_in_repository", resumed["efficiency"])
+
+    def test_since_reports_totals_alongside_its_bounded_lists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(Path(directory), 120)
+            moved = ledger.since(limit=10)
+            change = moved["changes"][0]
+            self.assertLessEqual(len(change["files"]), 20)
+            self.assertEqual(change["files_total"], 120)
+            self.assertTrue(change["files_truncated"])
+
+    def test_a_small_change_is_not_truncated_at_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            (root / "src" / "one.py").write_text("def one():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            (root / "src" / "one.py").write_text("def one():\n    return 2\n")
+            ledger.refresh(True, agent="codex", request="bump one")
+            change = ledger.since(limit=5)["changes"][0]
+            self.assertEqual(change["files"], ["src/one.py"])
+            self.assertFalse(change["files_truncated"])
+
+
+class RequestPropagationTests(unittest.TestCase):
+    """The request is the memory. Propagate it where it is known; never invent it.
+
+    A change recorded as request 'NOT RECORDED' by agent 'unknown' while a live
+    session in the same database held both is a propagation failure, not missing
+    information. Where the information genuinely does not exist, UNKNOWN stays.
+    """
+
+    def project(self, root: Path):
+        (root / "app.py").write_text("def run():\n    return 1\n")
+        ledger = Ledger(root); ledger.init()
+        return ledger
+
+    def edit(self, root: Path, value: int):
+        (root / "app.py").write_text(f"def run():\n    return {value}\n")
+
+    def test_a_refresh_recovers_the_request_but_never_the_author(self):
+        """The task is knowable from session state. Who typed the command is not.
+
+        A live session proves work is underway, not that this process is the one
+        doing it — a developer refreshing in a second terminal looks identical.
+        So the request is attached and authorship stays UNKNOWN.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); ledger = self.project(root)
+            ledger.start_session("claude-code", "Add period navigation")
+            self.edit(root, 2)
+            result = ledger.refresh(True)          # the CLI defaults: no agent, no session, no request
+            self.assertEqual(result["agent"], "unknown", "a live session is not proof of authorship")
+            self.assertEqual(result["attribution"]["confidence"], "UNKNOWN")
+            row = ledger.db.execute("SELECT agent,user_request,session_id FROM changes WHERE id=?",
+                                    (result["change_id"],)).fetchone()
+            self.assertEqual(row["agent"], "unknown")
+            self.assertEqual(row["user_request"], "Add period navigation",
+                             "the request was recoverable and was thrown away")
+            self.assertTrue(row["session_id"], "the change was not linked to the session it happened in")
+            self.assertEqual(ledger.since(limit=1)["changes"][0]["request"], "Add period navigation")
+            # The reason must say plainly that the task was inherited and the
+            # author was not, so the two are never read as one claim.
+            self.assertIn("does not prove who ran", result["attribution"]["reason"])
+
+    def test_an_explicit_agent_always_wins_over_inheritance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); ledger = self.project(root)
+            ledger.start_session("claude-code", "Add period navigation")
+            self.edit(root, 3)
+            result = ledger.refresh(True, agent="codex", request="Fix the totals")
+            self.assertEqual(result["agent"], "codex")
+            self.assertEqual(result["attribution"]["confidence"], "HIGH")
+            row = ledger.db.execute("SELECT user_request FROM changes WHERE id=?", (result["change_id"],)).fetchone()
+            self.assertEqual(row["user_request"], "Fix the totals")
+
+    def test_two_live_sessions_leave_authorship_unknown(self):
+        """Ambiguous evidence is not evidence. Nothing is guessed."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); ledger = self.project(root)
+            ledger.start_session("claude-code", "Add period navigation")
+            ledger.start_session("codex", "Fix the totals")
+            self.edit(root, 4)
+            result = ledger.refresh(True)
+            self.assertEqual(result["agent"], "unknown")
+            self.assertEqual(result["attribution"]["confidence"], "UNKNOWN")
+            row = ledger.db.execute("SELECT user_request FROM changes WHERE id=?", (result["change_id"],)).fetchone()
+            self.assertIn(row["user_request"], (None, ""))
+
+    def test_no_live_session_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); ledger = self.project(root)
+            self.edit(root, 5)
+            result = ledger.refresh(True)
+            self.assertEqual(result["agent"], "unknown")
+            self.assertEqual(result["attribution"]["confidence"], "UNKNOWN")
+
+    def test_the_watcher_never_inherits_a_name(self):
+        """An observed edit cannot be attributed, however many sessions are live.
+
+        The filesystem records that a file changed, not which process changed
+        it. This is the rule the whole attribution model rests on.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); ledger = self.project(root)
+            ledger.start_session("claude-code", "Add period navigation")
+            self.edit(root, 6)
+            result = ledger.refresh(True, observed=True)
+            self.assertEqual(result["agent"], "unknown")
+            self.assertEqual(result["attribution"]["confidence"], "LOW")
+            self.assertEqual(result["attribution"]["source"], "filesystem-watcher")
+            row = ledger.db.execute("SELECT user_request FROM changes WHERE id=?", (result["change_id"],)).fetchone()
+            self.assertIn(row["user_request"], (None, ""))
+
+    def test_a_session_with_no_request_yields_no_request(self):
+        """Inherit what is recorded; do not manufacture the rest."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); ledger = self.project(root)
+            ledger.start_session("claude-code")          # started without a request
+            self.edit(root, 7)
+            result = ledger.refresh(True)
+            self.assertEqual(result["agent"], "unknown")
+            row = ledger.db.execute("SELECT user_request FROM changes WHERE id=?", (result["change_id"],)).fetchone()
+            self.assertIn(row["user_request"], (None, ""), "a request was invented")
+
+
+class McpAttributionTests(unittest.TestCase):
+    """The MCP server knows who it is talking to; the record should say so."""
+
+    def test_refresh_falls_back_to_the_agent_from_the_handshake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "app.py").write_text("def run():\n    return 1\n")
+            Ledger(root).init()
+            (root / "app.py").write_text("def run():\n    return 2\n")
+            requests = "\n".join(json.dumps(message) for message in [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"clientInfo": {"name": "claude-code"}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "codeledger_refresh", "arguments": {"request": "Fix the run total"}}},
+            ])
+            completed = subprocess.run([sys.executable, "-m", "codeledger.cli", "mcp", "--root", str(root)],
+                                       input=requests, text=True, capture_output=True,
+                                       cwd=Path(__file__).resolve().parent.parent)
+            payloads = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+            refresh = payloads[-1]["result"]["structuredContent"]
+            self.assertEqual(refresh["agent"], "claude-code",
+                             "the server started the session as claude-code and then recorded 'unknown'")
+            row = Ledger(root).db.execute(
+                "SELECT agent,user_request FROM changes ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertEqual(row["agent"], "claude-code")
+            self.assertEqual(row["user_request"], "Fix the run total")
+
+
+class IndexedOnlyTraversalTests(unittest.TestCase):
+    """Pre-change intelligence answers from the index, not from the disk.
+
+    Discover once, retrieve later. These pin the traversal budget of each
+    agent-facing call so a future change cannot quietly reintroduce a
+    repository walk into the hot path.
+    """
+
+    def project(self, root: Path):
+        (root / "src").mkdir()
+        for index in range(40):
+            (root / "src" / f"module_{index}.py").write_text(f"def function_{index}():\n    return {index}\n")
+        (root / "src" / "checkout.py").write_text("def CheckoutPanel():\n    return 1\n")
+        ledger = Ledger(root); ledger.init()
+        return ledger
+
+    def walks(self, ledger, call) -> int:
+        counter = []
+        original = Ledger._discover
+        try:
+            Ledger._discover = lambda self, verbose=False: (counter.append(1), original(self, verbose))[1]
+            call()
+        finally:
+            Ledger._discover = original
+        return len(counter)
+
+    def test_the_indexed_only_calls_never_walk_the_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(Path(directory))
+            for label, call in (
+                ("context", lambda: ledger.context("fix the checkout panel")),
+                ("handshake", lambda: ledger.handshake("fix the checkout panel", "edit src/checkout.py")),
+                ("resume", lambda: ledger.resume("fix the checkout panel")),
+                ("scope_check", lambda: ledger.scope_check("fix the checkout panel", ["src/checkout.py"], ["CheckoutPanel"])),
+                ("impact", lambda: ledger.impact("CheckoutPanel", fallback=False)),
+                ("since", lambda: ledger.since(limit=10)),
+            ):
+                with self.subTest(call=label):
+                    self.assertEqual(self.walks(ledger, call), 0, f"{label} walked the repository")
+
+    def test_plan_walks_the_tree_exactly_once_for_test_suggestions(self):
+        """A known, pre-existing cost, pinned rather than allowed to grow.
+
+        `suggest_tests` reads the tree to find test files. That predates this
+        work and is deliberately left alone; this test exists so the count
+        cannot climb without somebody deciding it should.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(Path(directory))
+            self.assertEqual(self.walks(ledger, lambda: ledger.plan("fix the checkout panel")), 1)
+
+
+class AnalysisUpgradeTests(unittest.TestCase):
+    """An index built before the extraction fixes upgrades itself, keeping history.
+
+    No migration and no re-init: `files.analysis_version` already drives a
+    reparse when the analyser changes, so bumping the stamp is what retires
+    symbols like `if` and `v_email` from databases in the field.
+    """
+
+    def test_a_previous_release_index_retires_its_bad_symbols_on_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.js").write_text("export function save(payload) {\n  if (payload) { go(); }\n}\n")
+            connection = db_module.connect(root)
+            connection.execute(
+                "INSERT INTO files(path,language,size,hash,mtime,mtime_ns,status,analysis_version,analysis_provider,coverage) "
+                "VALUES('app.js','javascript',1,'stale',1,1,'current','regex:1','regex','shallow')")
+            file_id = connection.execute("SELECT id FROM files WHERE path='app.js'").fetchone()[0]
+            for name in ("save", "if"):
+                connection.execute(
+                    "INSERT INTO symbols(name,qualified_name,kind,file_id,line_start,line_end,signature,hash,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?,1,1,'sig','h','active','t','t')", (name, name, "method", file_id))
+            connection.execute("INSERT INTO changes(timestamp,agent,user_request,summary,risk,result) "
+                               "VALUES('2020-01-01','codex','historical work','old change','LOW','verified')")
+            connection.commit(); connection.close()
+
+            ledger = Ledger(root)
+            self.assertEqual({row["name"] for row in ledger.db.execute("SELECT name FROM symbols WHERE status='active'")},
+                             {"save", "if"})
+            ledger.refresh(True)
+
+            active = {row["name"] for row in ledger.db.execute("SELECT name FROM symbols WHERE status='active'")}
+            self.assertEqual(active, {"save"}, "the stale keyword symbol was not retired")
+            retired = {row["name"] for row in ledger.db.execute("SELECT name FROM symbols WHERE status='deleted'")}
+            self.assertIn("if", retired, "the record was destroyed rather than retired")
+            # History is the product and survives untouched.
+            kept = ledger.db.execute("SELECT agent,user_request FROM changes WHERE user_request='historical work'").fetchone()
+            self.assertEqual(kept["agent"], "codex")
+            self.assertEqual(ledger.doctor()["checks"]["schema"], "OK")
+            self.assertEqual(ledger.doctor()["checks"]["migrations"], "OK")

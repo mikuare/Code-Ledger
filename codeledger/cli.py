@@ -36,7 +36,11 @@ def emit_refresh(value, as_json=False):
                                               if value.get("effect_confidence", {}).get("level") == "LOW" else ""))
     if value.get("change_id"): print(f"  Recorded change #{value['change_id']} as {value['agent']} ({value['attribution']['confidence']} confidence)")
     if value.get("conflicts"): print(f"\n  {value['conflicts']['message']}")
-    if value.get("scope", {}).get("status") == "WARNING": print(f"\n  SCOPE WARNING: {value['scope']['unexpected_files']}")
+    if value.get("scope", {}).get("status") == "WARNING":
+        scope = value["scope"]
+        print(f"\n  SCOPE WARNING: {', '.join(scope['unexpected_files'])} changed but is outside the task boundary")
+        if scope.get("unexpected_symbols"):
+            print(f"                 symbols there: {', '.join(scope['unexpected_symbols'])}")
 
 def emit_since(value, as_json=False):
     """A handoff answer is read by a human or pasted into an agent's context.
@@ -121,6 +125,12 @@ def emit_handshake(value, as_json=False):
     if as_json: print(json.dumps(value, indent=2, default=str)); return
     print(f"CODELEDGER HANDSHAKE — {value['status']}\n")
     print(f"{value['message']}\n")
+    if value.get("scope_violations"):
+        print("PLAN OUTSIDE THE TASK SCOPE")
+        for item in value["scope_violations"]:
+            print(f"   {item['path']}")
+            print(f"      {item['reason']} ({item['evidence']})")
+        print()
     if value.get("duplicate_implementation"):
         duplicate = value["duplicate_implementation"]
         print("POSSIBLE DUPLICATE IMPLEMENTATION")
@@ -260,6 +270,10 @@ def build_parser():
     scope.add_argument("request")
     scope.add_argument("--files", nargs="*", default=[])
     scope.add_argument("--symbols", nargs="*", default=[])
+    # What the plan said it would touch widens the boundary, so work an agent
+    # declared in advance is not reported back to it as a surprise.
+    scope.add_argument("--plan-files", nargs="*", default=[], help="Files the implementation plan said it would change")
+    scope.add_argument("--plan-symbols", nargs="*", default=[], help="Symbols the implementation plan said it would change")
 
     add("plan", "Generate pre-change intelligence").add_argument("request")
     add("progress", "Check whether prior attempts at this request achieved anything").add_argument("request")
@@ -493,7 +507,7 @@ def main(argv=None):
     elif args.command == "history": value=ledger.history(args.query)
     elif args.command == "why": value=ledger.why(args.query)
     elif args.command == "restore-info": value={"query":args.query,"last_known_versions":ledger.lookup(args.query),"history":ledger.history(args.query),"automatic_restore":False}
-    elif args.command == "scope": value=ledger.scope_check(args.request, args.files, args.symbols)
+    elif args.command == "scope": value=ledger.scope_check(args.request, args.files, args.symbols, args.plan_files, args.plan_symbols)
     elif args.command == "plan": emit_plan(ledger.plan(args.request), args.as_json); return 0
     elif args.command == "progress": value=ledger.progress(args.request)
     elif args.command == "since": emit_since(ledger.since(args.marker, args.agent), args.as_json); return 0

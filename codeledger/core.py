@@ -68,6 +68,12 @@ AMBIGUITY_LONE_FILES = 5
 # tokenizer dependency, and every figure derived from this is labelled an
 # estimate rather than presented as a measurement.
 CHARS_PER_TOKEN = 4
+# How many files or symbols a single change record shows before it reports a
+# count instead. One broad refactor or an initial index touches every file in
+# the repository, and returning that list inside a change record made the
+# answer to "is there anything to resume?" grow with the size of the project.
+# The totals travel with the list, so a truncated answer never looks complete.
+CHANGE_LIST_LIMIT = 20
 # 'completed' and 'failed' predate this vocabulary and still exist in older
 # databases. They mean the same as 'ended' and are never rewritten.
 ENDED = ("ended", "completed", "failed")
@@ -390,7 +396,39 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             if "within a transaction" not in str(exc):
                 raise
 
-    def _attribute(self, agent: str, observed: bool) -> tuple[str, dict]:
+    def _inherit_session(self, agent: str, session: str, request: str, observed: bool):
+        """Recover the task a nameless refresh belongs to, without naming an author.
+
+        A bare `codeledger refresh --changed` arrives with no session and no
+        request, and was recorded as `NOT RECORDED` even while a single live
+        session in the same database held the request text. Losing that is a
+        propagation failure — the request is the most valuable thing the ledger
+        keeps, because it is the only record of *why* a change was made.
+
+        Authorship is a different question and is deliberately not answered
+        here. A live session proves work is underway; it does not prove who ran
+        this command, and a developer typing `refresh` in a second terminal
+        looks identical. So the session and its request are carried over, the
+        agent is not, and the change reads: during this session, for this
+        request, an edit nobody claimed.
+
+        - an explicitly named agent or request always wins; the caller knows better
+        - an observed edit inherits nothing: the watcher already has its own rule
+        - two live sessions is ambiguous evidence, so nothing is taken
+        """
+        if observed or (agent and agent != "unknown"):
+            return session, request, None
+        # Reconcile first: a crashed session still says 'active' in the row, and
+        # inheriting from a process that died last week would be worse than
+        # recording nothing at all.
+        self.reconcile_sessions()
+        named = [row for row in self._session_rows(LIVE) if (row["agent"] or "unknown") != "unknown"]
+        if len(named) != 1:
+            return session, request, None
+        row = named[0]
+        return session or row["session_id"], request or (row["request"] or ""), row
+
+    def _attribute(self, agent: str, observed: bool, inherited=None) -> tuple[str, dict]:
         """Decide who to credit for an edit, and how well that is actually known.
 
         The filesystem records that a file changed. It does not record which
@@ -402,8 +440,15 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         actor = agent or "unknown"
         if not observed:
             if actor == "unknown":
-                return actor, {"source": "unattributed-refresh", "confidence": "UNKNOWN",
-                               "reason": "A refresh was recorded without an agent name, so authorship is unknown."}
+                reason = "A refresh was recorded without an agent name, so authorship is unknown."
+                if inherited is not None:
+                    # The task is recovered; the author still is not. Saying so
+                    # in the same breath keeps the two from being confused.
+                    reason += (f" It was recorded during {inherited['agent']}'s live session "
+                               f"({inherited['session_id']}), and that session's request has been attached so the "
+                               "change is not left without a reason — but a live session does not prove who ran "
+                               "this command, so the edit is not credited to that agent.")
+                return actor, {"source": "unattributed-refresh", "confidence": "UNKNOWN", "reason": reason}
             # The agent called refresh itself: it is reporting its own work.
             return actor, {"source": "explicit-agent-refresh", "confidence": "HIGH",
                            "reason": f"{actor} recorded this refresh on its own behalf."}
@@ -451,7 +496,8 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         """
         pending = 0
         started = time.perf_counter(); statuses = git_status(self.root) if include_git_status and (self.root / ".git").exists() and analyze else {}
-        actor, attribution = self._attribute(agent, observed)
+        session, request, inherited = self._inherit_session(agent, session, request, observed)
+        actor, attribution = self._attribute(agent, observed, inherited)
         attribution_note = attribution["reason"] if attribution["confidence"] != "HIGH" else ""
         if session: self.touch_session(session)
         # Take the write lock before reading anything the indexing pass decides
@@ -521,11 +567,19 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 cursor = self.db.execute("INSERT INTO files(path,language,size,hash,mtime,mtime_ns,git_status,status,last_analyzed,analysis_version,analysis_provider,coverage,last_modified_by,last_modified_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (rel, language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), "current", now, current_version, provider, coverage, actor, session)); added += 1; file_id = cursor.lastrowid
             else:
                 self.db.execute("UPDATE files SET language=?,size=?,hash=?,mtime=?,mtime_ns=?,git_status=?,status='current',last_analyzed=?,analysis_version=?,analysis_provider=?,coverage=?,last_modified_by=?,last_modified_session=? WHERE path=?", (language(path), size, file_hash, mtime_ns / 1_000_000_000, mtime_ns, statuses.get(rel, "current"), now, current_version, provider, coverage, actor, session, rel)); modified += 1; file_id = old["id"]
-            old_symbols = {r["name"]: r for r in self.db.execute("SELECT * FROM symbols WHERE file_id=? AND status='active'", (file_id,))}
+            # Every prior symbol for this file, not only the live ones. Matching
+            # on active rows alone meant a recreated symbol missed the revive
+            # path and was inserted again, leaving the file with two rows for
+            # one name — one permanently 'deleted' and still carrying the line
+            # and signature it had when it was removed. `ORDER BY status='active'`
+            # puts the live row last so it wins the mapping in a database that
+            # already collected duplicates from that bug.
+            old_symbols = {r["name"]: r for r in self.db.execute("SELECT * FROM symbols WHERE file_id=? ORDER BY status='active'", (file_id,))}
             current = set()
             for item in parsed:
                 current.add(item.name); prior = old_symbols.get(item.name)
-                if prior and prior["hash"] == item.hash:
+                revived = bool(prior) and prior["status"] != "active"
+                if prior and prior["hash"] == item.hash and not revived:
                     # Same content, possibly shifted by an edit elsewhere in the
                     # file. Line numbers are facts and get refreshed; authorship
                     # and updated_at must not move, or every refresh would
@@ -533,11 +587,20 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                     self.db.execute("UPDATE symbols SET kind=?,line_start=?,line_end=?,signature=?,status='active' WHERE id=?", (item.kind, item.start, item.end, item.signature, prior["id"]))
                     continue
                 if prior:
-                    self.db.execute("UPDATE symbols SET kind=?,line_start=?,line_end=?,signature=?,hash=?,updated_at=?,status='active',last_modified_by=?,last_modified_session=? WHERE id=?", (item.kind, item.start, item.end, item.signature, item.hash, now, actor, session, prior["id"]))
+                    # `deleted_at` is cleared here, not left behind: a symbol
+                    # that exists again is current, and stale deletion metadata
+                    # on a live row is the contradiction this fix removes.
+                    self.db.execute("UPDATE symbols SET kind=?,line_start=?,line_end=?,signature=?,hash=?,updated_at=?,status='active',deleted_at=NULL,last_modified_by=?,last_modified_session=? WHERE id=?", (item.kind, item.start, item.end, item.signature, item.hash, now, actor, session, prior["id"]))
+                    if revived: symbols += 1
                 else:
                     self.db.execute("INSERT INTO symbols(name,qualified_name,kind,file_id,line_start,line_end,signature,hash,status,created_at,updated_at,last_modified_by,last_modified_session) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (item.name, item.name, item.kind, file_id, item.start, item.end, item.signature, item.hash, "active", now, now, actor, session)); symbols += 1
                 changed_symbols.append(item.name)
             for name, prior in old_symbols.items():
+                # Only a live symbol can be newly deleted. Without this an
+                # already-retired symbol would be re-marked on every refresh and
+                # reported as a fresh change forever.
+                if prior["status"] != "active":
+                    continue
                 if name not in current:
                     self.db.execute("UPDATE symbols SET status='deleted',deleted_at=?,updated_at=?,last_modified_by=?,last_modified_session=? WHERE id=?", (now, now, actor, session, prior["id"])); deleted += 1
                     changed_symbols.append(name)
@@ -697,12 +760,30 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             imported += 1
         self.db.commit(); return {"commits_imported": imported, "commit_files_imported": files}
 
+    @staticmethod
+    def _present_symbol(row) -> dict:
+        """One representation rule for a symbol, applied wherever one is shown.
+
+        A symbol that no longer exists has no current line and no current
+        signature, and presenting the ones it had when it was removed is how an
+        agent was told a function is at line 42 of a file that no longer
+        contains it. The record is not destroyed — history is the product — it
+        moves under `historical`, where nothing can mistake it for the present.
+        """
+        record = dict(row)
+        if record.get("status") == "active":
+            return record
+        record["historical"] = {"line_start": record.get("line_start"), "line_end": record.get("line_end"),
+                                "signature": record.get("signature"), "deleted_at": record.get("deleted_at")}
+        record["line_start"] = record["line_end"] = record["signature"] = None
+        return record
+
     def lookup(self, query: str, limit: int = 200) -> list[dict]:
         # `%` and `_` in a user query are literal text, not wildcards, and the
         # result set is bounded so a one-character query cannot fan out.
         pattern = f"%{query.translate(LIKE_ESCAPE)}%"
         rows = self.db.execute("SELECT s.*,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.name LIKE ? ESCAPE '\\' OR s.qualified_name LIKE ? ESCAPE '\\' ORDER BY s.status='active' DESC,s.name LIMIT ?", (pattern, pattern, limit)).fetchall()
-        return [dict(r) for r in rows]
+        return [self._present_symbol(r) for r in rows]
 
     def history(self, query: str, limit: int = 200) -> list[dict]:
         pattern = f"%{query.translate(LIKE_ESCAPE)}%"
@@ -729,10 +810,16 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         change a symbol believing nothing depends on it. Pass ``fallback=False``
         to keep the query strictly indexed.
         """
-        matches = self.lookup(query, limit=limit)
-        if not matches:
-            return {"query": query, "symbols": [], "dependencies": [], "referencing_files": [], "risk": "UNKNOWN", "evidence": "No indexed symbol matched this query. Run `codeledger refresh --changed`, or pass --scan to read the working tree.", "source": "index"}
-        names = sorted({row["name"] for row in matches}); ids = [row["id"] for row in matches]
+        found = self.lookup(query, limit=limit)
+        if not found:
+            return {"query": query, "symbols": [], "historical_symbols": [], "dependencies": [], "referencing_files": [], "risk": "UNKNOWN", "evidence": "No indexed symbol matched this query. Run `codeledger refresh --changed`, or pass --scan to read the working tree.", "source": "index"}
+        # A deleted symbol is not a live dependency target, and its file is not
+        # a live defining file. Its edges are still queried below, because
+        # "what still references this thing that no longer exists?" is one of
+        # the more useful questions the graph can answer.
+        matches = [row for row in found if row["status"] == "active"]
+        historical = [row for row in found if row["status"] != "active"]
+        names = sorted({row["name"] for row in found}); ids = [row["id"] for row in found]
         name_slots = ",".join("?" * len(names)); id_slots = ",".join("?" * len(ids))
         dependency_rows = [dict(row) for row in self.db.execute(
             f"SELECT d.*,s.name AS source_name,f.path AS source_path FROM dependencies d "
@@ -747,7 +834,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # empty answer proves nothing.
         shallow = [row["path"] for row in self.db.execute(
             f"SELECT path,coverage FROM files WHERE path IN ({','.join('?' * len(matches))})",
-            [row["path"] for row in matches]) if (row["coverage"] or SHALLOW) != FULL]
+            [row["path"] for row in matches]) if (row["coverage"] or SHALLOW) != FULL] if matches else []
         used_scan = scan or (fallback and (shallow or not refs))
         if used_scan:
             refs |= self._scan_for_names(names)
@@ -758,7 +845,11 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if used_scan and not scan:
             evidence = (f"Shallow analysis coverage for {', '.join(sorted(set(shallow)))}; the working tree was read directly. Install grammars for full coverage: pip install 'code-ledger[languages]'."
                         if shallow else "The dependency index reported no dependents, so the working tree was read directly.")
-        return {"query": query, "symbols": matches, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": source, "coverage": "shallow" if shallow else "full", "evidence": evidence}
+        if historical and not matches:
+            evidence = (evidence + " " if evidence else "") + (
+                f"{names[0]} is recorded as deleted, so it has no current definition. Anything listed as referencing "
+                "it may now be pointing at something that no longer exists.")
+        return {"query": query, "symbols": matches, "historical_symbols": historical, "dependencies": dependency_rows, "referencing_files": sorted(refs), "defining_files": sorted(defining), "risk": "HIGH" if len(blast) > 10 else "MEDIUM" if len(blast) > 3 else "LOW", "source": source, "coverage": "shallow" if shallow else "full", "evidence": evidence}
 
     def search_symbols(self, query: str, limit: int = 200) -> list[dict]:
         """Find symbols relevant to a natural-language request.
@@ -992,12 +1083,35 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 questions.append(ambiguity["question"] + " Ask which scope is intended before editing.")
         return result
 
-    def scope_check(self, request: str, changed_files: list[str], changed_symbols: list[str] | None = None) -> dict:
-        """Conservative post-change scope check; missing evidence is never SAFE."""
+    def _symbol_files(self, names: set[str]) -> dict[str, set[str]]:
+        """Which indexed file(s) define each of these symbol names."""
+        if not names: return {}
+        owners: dict[str, set[str]] = {}
+        for row in self.db.execute(
+                f"SELECT s.name,f.path FROM symbols s JOIN files f ON f.id=s.file_id "
+                f"WHERE s.name IN ({','.join('?' * len(names))})", tuple(names)):
+            owners.setdefault(row["name"], set()).add(row["path"])
+        return owners
+
+    def scope_check(self, request: str, changed_files: list[str], changed_symbols: list[str] | None = None,
+                    plan_files: list[str] | None = None, plan_symbols: list[str] | None = None) -> dict:
+        """Did this change stay inside the task, or reach somewhere unrelated?
+
+        The question is about *files*. A symbol is not a scope violation because
+        the request did not happen to say its name — most symbols an edit touches
+        are implementation details of a file that is legitimately in scope, and
+        flagging them made the guard fire on ordinary work until it meant
+        nothing. So a symbol is unexpected only when the file it lives in is,
+        which is the only version of the question the evidence can answer.
+
+        `plan_files`/`plan_symbols` let a caller widen the boundary with what it
+        said it would do. Missing evidence is still never SAFE.
+        """
         changed_files = sorted(set(changed_files)); changed_symbols = sorted(set(changed_symbols or []))
+        plan_files = sorted(set(plan_files or [])); plan_symbols = set(plan_symbols or [])
         if not changed_files:
             return {"status": "NO_CHANGES", "request": request, "allowed_files": [], "unexpected_files": [], "unexpected_symbols": []}
-        context = self.context(request); allowed, evidence = self._task_boundary(context)
+        context = self.context(request); allowed, evidence = self._task_boundary(context, request, plan_files)
         if not allowed:
             return {"status": "UNKNOWN", "request": request, "reason": "Insufficient task-specific context to define a safe boundary.", "allowed_files": [], "unexpected_files": [], "unexpected_symbols": changed_symbols, "boundary_evidence": []}
         # A new file is tolerated only in a directory that already holds a
@@ -1005,28 +1119,67 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # `src/` mark the whole subtree SAFE, which made the guard vacuous.
         allowed_dirs = {str(Path(path).parent).replace("\\", "/") for path in allowed}; allowed_dirs.discard(".")
         unexpected = [path for path in changed_files if path not in allowed and str(Path(path).parent).replace("\\", "/") not in allowed_dirs]
-        relevant_names = {row["name"] for row in context["symbols"]}
-        unexpected_symbols = [name for name in changed_symbols if name not in relevant_names]
-        status = "WARNING" if unexpected or unexpected_symbols else "SAFE"
-        return {"status": status, "request": request, "allowed_files": sorted(allowed), "unexpected_files": unexpected, "unexpected_symbols": unexpected_symbols, "boundary_evidence": evidence, "reason": "Review the diff for unrelated changes." if status == "WARNING" else "Changed files are within the known task boundary."}
+        # Every changed symbol arrived with one of the changed files. If none of
+        # those files is out of bounds there is nothing for a symbol to violate,
+        # so only symbols that actually live in an unexpected file are reported.
+        unexpected_set = set(unexpected)
+        unexpected_symbols = []
+        if unexpected_set:
+            owners = self._symbol_files(set(changed_symbols))
+            for name in changed_symbols:
+                if name in plan_symbols:
+                    continue
+                homes = owners.get(name)
+                # Unindexed name (just deleted, or created since the last index):
+                # attributable only to the files in this change, so it counts as
+                # unexpected exactly when every changed file it could have come
+                # from is unexpected.
+                if homes is None:
+                    if set(changed_files) <= unexpected_set:
+                        unexpected_symbols.append(name)
+                elif homes <= unexpected_set:
+                    unexpected_symbols.append(name)
+        status = "WARNING" if unexpected else "SAFE"
+        return {"status": status, "request": request, "allowed_files": sorted(allowed), "unexpected_files": unexpected,
+                "unexpected_symbols": unexpected_symbols, "boundary_evidence": evidence,
+                "changed_symbols_in_scope": [name for name in changed_symbols if name not in unexpected_symbols],
+                "reason": "Review the diff for unrelated changes." if status == "WARNING" else "Changed files are within the known task boundary."}
 
-    def _task_boundary(self, context: dict) -> tuple[set[str], list[str]]:
+    def _task_boundary(self, context: dict, request: str = "", plan_files: list[str] | None = None) -> tuple[set[str], list[str]]:
         """Files a task may legitimately touch, with the evidence behind them.
 
         Indexed symbol matches are the strong signal. Paths written into the
-        request are equally strong and are always honoured. Only when neither
-        exists does this fall back to matching request keywords against file
-        paths, which is weak but still better than refusing to judge at all —
-        the guard was returning UNKNOWN on any request whose wording did not
-        happen to match an indexed symbol name.
+        request are equally strong and are always honoured. So are the files
+        that *depend on* those symbols: a request to change `PeriodNav` lands
+        legitimately in whatever imports it, and the dependency graph already
+        knows which files those are. That is structural evidence rather than
+        word matching, and it is what stops a correct edit to a caller being
+        reported as out of scope.
+
+        Only when none of that exists does this fall back to matching request
+        keywords against file paths, which is weak but still better than
+        refusing to judge at all.
         """
-        analysis = context["task_analysis"]; allowed = set(context["files"]); evidence = []
+        analysis = context["task_analysis"]; evidence = []
+        # Not `context["files"]`: that is capped at 20 for presentation, and
+        # reusing it silently clipped the safety boundary to the same number.
+        matches = self.search_symbols(request) if request else context["symbols"]
+        allowed = {row["path"] for row in matches}
         if allowed:
             evidence.append("indexed symbols matching the request")
+        names = {row["name"] for row in matches}
+        if names:
+            dependents = {row["path"] for row in self.db.execute(
+                f"SELECT DISTINCT f.path FROM dependencies d JOIN files f ON f.id=d.source_file_id "
+                f"WHERE d.target_name IN ({','.join('?' * len(names))}) AND f.status!='deleted'", tuple(names))}
+            if dependents - allowed:
+                allowed |= dependents; evidence.append("files that depend on those symbols")
         indexed = [row["path"] for row in self.db.execute("SELECT path FROM files WHERE status!='deleted'")]
         named = {path for token in analysis["paths"] for path in indexed if token.strip("/") in path}
         if named:
             allowed |= named; evidence.append("paths named in the request")
+        if plan_files:
+            allowed |= set(plan_files); evidence.append("files named in the implementation plan")
         if not allowed:
             words = {word for word in re.findall(r"[a-z][a-z0-9]{3,}", analysis["normalized"].lower()) if word not in STOPWORDS}
             keyword_matches = {path for path in indexed if any(word in path.lower() for word in words)}
@@ -1099,9 +1252,16 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             row_files = [item["path"] for item in self.db.execute("SELECT path FROM change_files WHERE change_id=?", (row["id"],))]
             row_symbols = [item["name"] for item in self.db.execute("SELECT name FROM change_symbols WHERE change_id=?", (row["id"],))]
             files.update(row_files); symbols.update(row_symbols); agents.add(row["agent"] or "unknown")
+            # The aggregates above keep the complete set; only the per-change
+            # view is bounded, and it carries its own totals so the reader can
+            # see exactly how much was left out.
             changes.append({"change_id": row["id"], "timestamp": row["timestamp"], "agent": row["agent"] or "unknown",
                             "request": row["user_request"] or "NOT RECORDED", "effect": row["effect"] or "unknown",
-                            "risk": row["risk"], "files": row_files, "symbols": row_symbols})
+                            "risk": row["risk"],
+                            "files": row_files[:CHANGE_LIST_LIMIT], "files_total": len(row_files),
+                            "files_truncated": len(row_files) > CHANGE_LIST_LIMIT,
+                            "symbols": row_symbols[:CHANGE_LIST_LIMIT], "symbols_total": len(row_symbols),
+                            "symbols_truncated": len(row_symbols) > CHANGE_LIST_LIMIT})
         by_others = [item for item in changes if agent and item["agent"] != agent]
         summary = "Nothing has been recorded since that point."
         if changes:
@@ -1279,6 +1439,35 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 proposed.append(name)
         return proposed
 
+    def _plan_paths(self, plan_text: str) -> list[str]:
+        """Paths the plan names explicitly. Same shape `analyze_prompt` reads."""
+        return sorted(set(re.findall(r"(?:[\w.-]+/)+[\w.-]+", plan_text)))
+
+    def _plan_scope_violations(self, analysis: dict, matched: list[dict], plan_paths: list[str]) -> list[dict]:
+        """Paths the plan names that the request's own scope does not cover.
+
+        Only ever fires on a path the plan actually named and got wrong. A plan
+        that names no paths is not punished for its silence — the alternative
+        warns on most ordinary plans, which is how a safety signal becomes noise.
+        """
+        if not plan_paths: return []
+        requested = analysis["paths"]
+        if requested:
+            # The user named the scope. Nothing outranks that.
+            outside = [path for path in plan_paths
+                       if not any(token.strip("/") in path or path in token for token in requested)]
+            return [{"path": path, "reason": f"the request limits this task to {', '.join(requested)}",
+                     "evidence": "explicit user scope"} for path in outside]
+        relevant = {row["path"] for row in matched} | set((analysis.get("blast_radius") or {}).get("files") or [])
+        if not relevant: return []
+        # A new file beside a relevant one is ordinary; a new file in an
+        # unrelated part of the tree is the thing worth asking about.
+        relevant_dirs = {str(Path(path).parent).replace("\\", "/") for path in relevant}; relevant_dirs.discard(".")
+        return [{"path": path, "reason": "outside the files CodeLedger finds relevant to this request",
+                 "evidence": "indexed relevance and blast radius"}
+                for path in plan_paths
+                if path not in relevant and str(Path(path).parent).replace("\\", "/") not in relevant_dirs]
+
     def handshake(self, request: str, ai_plan: str = "") -> dict:
         matched = self.search_symbols(request)
         analysis = self.analyze_prompt(request, symbols=matched); plan_text = " ".join(ai_plan.split()); lower = plan_text.lower()
@@ -1288,6 +1477,8 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         mentioned = set(re.findall(r"[a-z][a-z0-9_-]{3,}", lower))
         missing_constraints = [constraint for constraint in analysis["preservation_constraints"] if not any(word in lower for word in re.findall(r"[a-z][a-z0-9_-]{3,}", constraint.lower()))]
         relevant = [area for area in analysis["areas"] if area not in lower]
+        plan_paths = self._plan_paths(plan_text)
+        scope_violations = self._plan_scope_violations(analysis, matched, plan_paths)
         # Building a second implementation of something the project already has
         # is the most expensive mistake an agent makes here, and nothing was
         # looking for it: a plan to create a parallel component with its own
@@ -1305,11 +1496,38 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                              "This is a recommendation, not a rejection — a genuinely new implementation is sometimes "
                              "correct, and if it is, say why."),
             }
-        status = "WARNING" if missing_constraints or duplicate or (relevant and len(relevant) > 1) else "ALIGNED"
+        # What this handshake was actually able to check. Word overlap is not on
+        # the list: "fix payment calculation" and "change payment animation"
+        # share a word and are different tasks, so a shared term is reported
+        # below as a signal and never counted as a reason to believe anything.
+        #
+        # A feature request is the one case where finding no existing symbol is
+        # itself the finding — there is nothing to reuse — rather than an
+        # absence of evidence, which is what `duplicate_implementation` reports.
+        checkable = bool(matched or analysis["paths"] or analysis["preservation_constraints"]
+                         or duplicate or analysis["intent"] == "feature")
+        if not checkable:
+            return {"status": "INSUFFICIENT_EVIDENCE", "request": request, "task_analysis": analysis, "ai_plan": ai_plan,
+                    "missing_preservation_constraints": missing_constraints, "unmentioned_areas": relevant,
+                    "matched_terms": sorted(required & mentioned), "duplicate_implementation": None,
+                    "scope_violations": scope_violations, "plan_paths": plan_paths,
+                    "scope_ambiguity": analysis.get("scope_ambiguity"),
+                    "message": ("No indexed symbol, named path or stated constraint connects this request to this "
+                                "project, so there is no evidence to align the plan against. This is not approval. "
+                                "Index the relevant code (`codeledger refresh --changed`), or proceed knowing "
+                                "CodeLedger could not check this plan."),
+                    "guidance": "Treat this as unverified rather than as agreement."}
+        status = "WARNING" if missing_constraints or duplicate or scope_violations else "ALIGNED"
         message = "The AI plan covers the known task requirements."
         if status == "WARNING":
-            message = duplicate["message"] + " Consider reuse before editing." if duplicate else "Revise the plan before editing."
-        return {"status": status, "request": request, "task_analysis": analysis, "ai_plan": ai_plan, "missing_preservation_constraints": missing_constraints, "unmentioned_areas": relevant, "matched_terms": sorted(required & mentioned), "duplicate_implementation": duplicate, "scope_ambiguity": analysis.get("scope_ambiguity"), "message": message}
+            if scope_violations:
+                message = (f"The plan changes {', '.join(item['path'] for item in scope_violations[:3])}, which is "
+                           f"{scope_violations[0]['reason']}. Revise the plan, or say why the wider scope is needed.")
+            elif duplicate:
+                message = duplicate["message"] + " Consider reuse before editing."
+            else:
+                message = "Revise the plan before editing."
+        return {"status": status, "request": request, "task_analysis": analysis, "ai_plan": ai_plan, "missing_preservation_constraints": missing_constraints, "unmentioned_areas": relevant, "matched_terms": sorted(required & mentioned), "duplicate_implementation": duplicate, "scope_violations": scope_violations, "plan_paths": plan_paths, "scope_ambiguity": analysis.get("scope_ambiguity"), "message": message}
 
     def suggest_tests(self, changed_files: list[str] | None = None, symbols: list[str] | None = None) -> list[str]:
         changed_files, symbols = changed_files or [], symbols or []
@@ -1801,18 +2019,38 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         and answering "nothing here" would be wrong.
         """
         recent = self.since(limit=10)
+        open_issues = self.db.execute("SELECT count(*) FROM issues WHERE status='OPEN'").fetchone()[0]
+        if task:
+            # With a task in hand, orient around *its* code rather than around
+            # whatever happened to change last. This is the difference between
+            # a summary and a dump: the same query the rest of the pre-change
+            # layer uses, bounded, instead of the repository's recent history.
+            relevant = self.search_symbols(task)
+            relevant_files = sorted({row["path"] for row in relevant})
+            relevant_symbols = [row["name"] for row in relevant[:10]]
+        else:
+            relevant_files, relevant_symbols = [], []
+        summary = {"project": self.config.project_name, "recent_changes": len(recent["changes"]),
+                   "relevant_files": len(relevant_files), "relevant_symbols": len(relevant_symbols),
+                   "open_issues": open_issues, "checkpoint": "NONE"}
         unverified = [item for item in recent["changes"] if item["effect"] != "none"]
         if not unverified:
-            return {"status": "NO_CHECKPOINTS", "task": task or UNKNOWN, "recent_work": [],
+            return {"status": "NO_CHECKPOINTS", "task": task or UNKNOWN, "recent_work": [], "summary": summary,
+                    "relevant_files": relevant_files[:10], "relevant_symbols": relevant_symbols,
                     "guidance": "No checkpoint has been recorded for this project and nothing recent looks unfinished. Start with `codeledger_get_plan`."}
-        return {"status": "NO_CHECKPOINTS_RECENT_WORK_FOUND", "task": task or UNKNOWN,
-                "recent_work": unverified[:5], "files": recent["files_changed"][:20],
+        return {"status": "NO_CHECKPOINTS_RECENT_WORK_FOUND", "task": task or UNKNOWN, "summary": summary,
+                "recent_work": unverified[:5],
+                "relevant_files": relevant_files[:10], "relevant_symbols": relevant_symbols,
+                "files": recent["files_changed"][:20],
                 "symbols": recent["symbols_changed"][:20], "agents": recent["agents"],
-                "efficiency": {"files_relevant": len(recent["files_changed"]), "files_in_repository": total_files,
+                "efficiency": {"files_relevant": len(relevant_files) or len(recent["files_changed"]),
+                               "files_in_repository": total_files,
                                "files_avoided": max(0, total_files - len(recent["files_changed"])),
-                               "full_repository_scan_required": False},
+                               "full_repository_scan_required": False,
+                               "estimated_tokens": self._estimate_tokens(summary) + self._estimate_tokens(unverified[:5])},
                 "guidance": ("No checkpoint exists, so this is inferred from recorded changes rather than recorded "
-                             "intent: it shows what was changed recently, not what anybody meant to do. Record a "
+                             "intent: it shows what was changed recently, not what anybody meant to do. Lists are "
+                             "bounded and report their totals; use `codeledger since` for the full record. Record a "
                              "checkpoint at the end of this session so the next one does not have to guess.")}
 
     def _mechanical_checkpoint(self, session_id: str, reason: str) -> dict | None:

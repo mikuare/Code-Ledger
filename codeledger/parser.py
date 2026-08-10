@@ -98,25 +98,69 @@ def parse_file(path: Path, text: str) -> list[SymbolData]:
     from .providers import analyze
     return analyze(path, text)[0]
 
+# Tokens that can open a `keyword (...) {` statement. The `method` pattern below
+# matches that shape, and a control-flow head wearing it is a statement, not a
+# declaration — `if (ready) {` is not a method called `if`.
+#
+# This is a structural rule, not a list of names that looked wrong: none of these
+# tokens can legally be an identifier in the position the pattern captures them,
+# so excluding them cannot cost a real symbol. It is deliberately confined to
+# that one pattern; a method genuinely named `move` or `submit` is untouched, and
+# `function if(...)` is impossible so the declaration patterns never need it.
+CONTROL_FLOW_HEADS = frozenset({
+    "if", "else", "elif", "for", "foreach", "while", "do", "switch", "case", "default",
+    "try", "catch", "except", "finally", "with", "using", "match", "when", "unless",
+    "return", "yield", "await", "throw", "guard", "defer", "lock", "synchronized",
+})
+# Modifiers that may legally precede a type declaration. Requiring the keyword to
+# sit at the head of a line behind only these is what separates a declaration
+# from prose: `class Widget {` starts a line, "the class of service" does not.
+TYPE_MODIFIERS = r"(?:export|default|public|private|protected|internal|abstract|sealed|final|static|partial|declare|open|data|inner)\s+"
+# Comment spans, blanked (not deleted) so line numbers stay exact.
+BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+LINE_COMMENT = re.compile(r"(?<!:)//[^\n]*|#[^\n]*")
+
+def _strip_comments(text: str) -> str:
+    """Blank out comment text, preserving every line break and offset.
+
+    Documentation is prose, and prose contains the words `type`, `class` and
+    `interface`. Matching declaration patterns against it invented symbols named
+    `the` and `of` out of English sentences. Replacing the span with spaces
+    rather than removing it keeps `line_start`/`line_end` truthful.
+
+    The `(?<!:)` guard leaves `http://` alone; nothing here tries to be a lexer,
+    because the provider it serves is explicitly SHALLOW.
+    """
+    def blank(match: re.Match) -> str:
+        return re.sub(r"[^\n]", " ", match.group(0))
+    return LINE_COMMENT.sub(blank, BLOCK_COMMENT.sub(blank, text))
+
 def regex_symbols(text: str) -> list[SymbolData]:
     patterns = [
-        ("class", re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)")),
-        ("interface", re.compile(r"\b(?:interface|type)\s+([A-Za-z_$][\w$]*)")),
+        ("class", re.compile(rf"^\s*(?:{TYPE_MODIFIERS})*class\s+([A-Za-z_$][\w$]*)")),
+        ("interface", re.compile(rf"^\s*(?:{TYPE_MODIFIERS})*(?:interface|type)\s+([A-Za-z_$][\w$]*)")),
         ("function", re.compile(r"(?:function\s+|def\s+|fn\s+|func\s+)([A-Za-z_$][\w$]*)\s*\(")),
         ("function", re.compile(r"(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>")),
         ("method", re.compile(r"^\s*(?:public|private|protected|static|async|export\s+)*\s*([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*[{:]")),
     ]
     result = []
     lines = text.splitlines()
-    for i, line in enumerate(lines, 1):
+    # Hashes still cover the original source: a comment edit inside a symbol is
+    # a change to that symbol's text, and the shallow provider says so honestly
+    # rather than pretending to the comment-awareness only a parse tree has.
+    scan_lines = _strip_comments(text).splitlines()
+    for i, line in enumerate(scan_lines, 1):
         for kind, pattern in patterns:
             match = pattern.search(line)
             if match:
+                name = match.group(1)
+                if kind == "method" and name in CONTROL_FLOW_HEADS:
+                    continue          # `if (x) {` — a statement wearing a call's shape
                 end = _block_end(lines, i)
                 # Hash the whole block, not the declaration line. Hashing one
                 # line meant an edit inside a function body never changed the
                 # symbol's hash, so the edit was invisible to attribution.
-                result.append(SymbolData(match.group(1), kind, i, end, line.strip(), digest("\n".join(lines[i-1:end]))))
+                result.append(SymbolData(name, kind, i, end, lines[i-1].strip(), digest("\n".join(lines[i-1:end]))))
                 break
     return result
 
