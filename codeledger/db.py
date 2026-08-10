@@ -73,6 +73,20 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("sessions", "provider", "ALTER TABLE sessions ADD COLUMN provider TEXT"),
     ("sessions", "model", "ALTER TABLE sessions ADD COLUMN model TEXT"),
     ("sessions", "model_version", "ALTER TABLE sessions ADD COLUMN model_version TEXT"),
+    # A verification is about a state of the code, and stored none of it: no
+    # commit, no command, no exit code. So a PASSED result could not be told
+    # apart from a PASSED result for code that has since been rewritten.
+    #
+    # Deliberately NOT backfilled. A row written before these columns existed
+    # has no commit, and inventing one would manufacture exactly the false
+    # confidence the columns are here to remove: `git_commit IS NULL` means
+    # "this predates provenance" and is reported as UNVERIFIABLE. An empty
+    # string means "recorded, and this project has no git" — a different fact,
+    # kept distinct so projects outside version control are not punished for it.
+    ("verifications", "git_commit", "ALTER TABLE verifications ADD COLUMN git_commit TEXT"),
+    ("verifications", "command", "ALTER TABLE verifications ADD COLUMN command TEXT"),
+    ("verifications", "exit_code", "ALTER TABLE verifications ADD COLUMN exit_code INTEGER"),
+    ("verifications", "tree_dirty", "ALTER TABLE verifications ADD COLUMN tree_dirty INTEGER"),
 ]
 
 def connect(root: Path) -> sqlite3.Connection:

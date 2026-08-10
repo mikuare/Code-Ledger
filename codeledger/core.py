@@ -930,13 +930,30 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         names = list(names)
         latest: dict[str, tuple] = {}
         for row in self.db.execute(
-                f"SELECT subject_id,recorded_at,result FROM verifications WHERE subject_type='symbol' "
+                f"SELECT subject_id,recorded_at,result,git_commit FROM verifications WHERE subject_type='symbol' "
                 f"AND subject_id IN ({','.join('?' * len(names))}) ORDER BY recorded_at, id", tuple(names)):
-            latest[row["subject_id"]] = (row["recorded_at"], row["result"])   # ordered, so the last wins
+            latest[row["subject_id"]] = (row["recorded_at"], row["result"], row["git_commit"])   # ordered, so the last wins
         return latest
 
+    def _git_provenance(self) -> tuple[str, int | None]:
+        """The repository state a verification is being recorded against, now.
+
+        Observed at record time, never reconstructed afterwards. An empty commit
+        means "this project is not in git", which is a different fact from a row
+        that never recorded one — that stays NULL and is reported UNVERIFIABLE.
+        Collapsing the two would make every verification in a non-git project
+        unusable for a reason that has nothing to do with the evidence.
+        """
+        commit = head(self.root)
+        if not commit:
+            return "", None
+        # Untracked files count: the working tree not matching the commit is
+        # exactly what makes the commit an incomplete description of what ran.
+        return commit, 1 if git_status(self.root) else 0
+
     @staticmethod
-    def _verification_applicability(verified_at, verified_result, code_changed_at, alive: bool) -> dict:
+    def _verification_applicability(verified_at, verified_result, code_changed_at, alive: bool,
+                                    git_commit=None, indexed=True) -> dict:
         """Does this verification still describe the code that exists now?
 
         Evidence is about a code state, not about a name. `symbols.updated_at`
@@ -960,13 +977,25 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             # release before verifications were checked for applicability.
             return {"status": "UNKNOWN", "applicability": "UNVERIFIABLE", "result_recorded": verified_result,
                     "reason": "The verification predates applicability tracking, so it cannot be dated against the code."}
+        # Proving the evidence does *not* apply outranks being unable to prove
+        # that it does, so a code change is reported before a provenance gap.
         if code_changed_at and code_changed_at > verified_at:
             return {"status": "UNKNOWN", "applicability": "SUPERSEDED", "result_recorded": verified_result,
                     "verified_at": verified_at, "code_changed_at": code_changed_at,
                     "reason": (f"The symbol changed at {code_changed_at} after being verified at {verified_at}. "
                                "The recorded result describes code that no longer exists.")}
+        if git_commit is None:
+            return {"status": "UNKNOWN", "applicability": "UNVERIFIABLE", "result_recorded": verified_result,
+                    "verified_at": verified_at,
+                    "reason": ("The record was written before verifications carried provenance, so there is no "
+                               "commit to prove which code it describes. It is not evidence about the code now.")}
+        if not indexed:
+            return {"status": "UNKNOWN", "applicability": "UNVERIFIABLE", "result_recorded": verified_result,
+                    "verified_at": verified_at,
+                    "reason": ("The file has changed on disk since it was indexed, so the recorded code state "
+                               "cannot be compared. Run `codeledger refresh --changed` and ask again.")}
         return {"status": verified_result, "applicability": "CURRENT", "result_recorded": verified_result,
-                "verified_at": verified_at, "code_changed_at": code_changed_at,
+                "verified_at": verified_at, "code_changed_at": code_changed_at, "git_commit": git_commit or None,
                 "reason": "The symbol has not changed since it was verified."}
 
     @staticmethod
@@ -985,9 +1014,10 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # reads it. A stale PASSED is worse than no answer: it is the one field
         # that could talk an agent out of running the test that would have
         # caught the regression.
-        verified_at, verified_result = verification or (None, None)
+        verified_at, verified_result, verified_commit = verification or (None, None, None)
         verification = Ledger._verification_applicability(
-            verified_at, verified_result or record.get("last_verified"), record.get("updated_at"), alive)
+            verified_at, verified_result or record.get("last_verified"), record.get("updated_at"), alive,
+            git_commit=verified_commit)
         if verification["applicability"] != "NONE":
             record["verification"] = verification
         # The bare column keeps its meaning only while the evidence still holds.
@@ -1848,36 +1878,77 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             return {"subject_type": subject_type, "subject_id": subject_id, "status": "UNKNOWN",
                     "applicability": "NONE", "history_count": 0,
                     "reason": "Nothing has been verified for this subject."}
-        alive, changed_at = True, None
+        alive, changed_at, indexed = True, None, True
         if subject_type == "symbol":
-            row = self.db.execute("SELECT status,updated_at FROM symbols WHERE name=? ORDER BY status='active' DESC, updated_at DESC LIMIT 1",
+            row = self.db.execute("SELECT s.status,s.updated_at,f.path FROM symbols s JOIN files f ON f.id=s.file_id "
+                                  "WHERE s.name=? ORDER BY s.status='active' DESC, s.updated_at DESC LIMIT 1",
                                   (subject_id,)).fetchone()
             alive = bool(row) and row["status"] == "active"
             changed_at = row["updated_at"] if row else None
+            # One stat: if the file no longer matches what was indexed, the
+            # recorded code state cannot be compared to anything. Cheap enough
+            # here because this is the deliberate, per-subject question; the
+            # `lookup` path deliberately does not pay it per row.
+            if row and alive:
+                indexed = not self.stale_records([row["path"]])
         elif subject_type == "file":
             row = self.db.execute("SELECT status,last_analyzed FROM files WHERE path=?", (subject_id,)).fetchone()
             alive = bool(row) and row["status"] != "deleted"
             changed_at = row["last_analyzed"] if row else None
+            if row and alive:
+                indexed = not self.stale_records([subject_id])
         else:
             # Unscopable subjects: the newest code change anywhere supersedes.
             row = self.db.execute("SELECT MAX(updated_at) AS moved FROM symbols WHERE status='active'").fetchone()
             changed_at = row["moved"] if row else None
-        state = self._verification_applicability(latest["recorded_at"], latest["result"], changed_at, alive)
-        if subject_type not in ("symbol", "file") and state["applicability"] == "SUPERSEDED":
+        state = self._verification_applicability(latest["recorded_at"], latest["result"], changed_at, alive,
+                                                 git_commit=latest["git_commit"], indexed=indexed)
+        if subject_type not in ("symbol", "file") and state["applicability"] == "SUPERSEDED" and changed_at:
             state["reason"] = (f"Code changed at {changed_at} after this was verified at {latest['recorded_at']}. "
                                f"A {subject_type}-level result cannot be scoped to the code it exercised, so any "
                                "later change supersedes it.")
+        # A project-level result is tied to the commit it ran against, because
+        # nothing narrower is available. This is the only place a differing
+        # commit changes the verdict: for a symbol, the content hash is a
+        # sharper signal and already decided the question above.
+        current_commit = head(self.root)
+        if (state["applicability"] == "CURRENT" and subject_type not in ("symbol", "file")
+                and latest["git_commit"] and current_commit and latest["git_commit"] != current_commit):
+            state = {**state, "status": "UNKNOWN", "applicability": "SUPERSEDED",
+                     "reason": (f"Recorded against commit {latest['git_commit'][:8]}, but the repository is now at "
+                                f"{current_commit[:8]}. A {subject_type}-level result cannot be scoped to the code it "
+                                "exercised, so it does not carry across a commit.")}
+        provenance = {"git_commit": latest["git_commit"] or None,
+                      "command": json.loads(latest["command"]) if latest["command"] else None,
+                      "exit_code": latest["exit_code"],
+                      "tree_dirty": None if latest["tree_dirty"] is None else bool(latest["tree_dirty"]),
+                      "recorded_at": latest["recorded_at"]}
+        if provenance["tree_dirty"]:
+            # Not a verdict of its own: the code identity still comes from the
+            # index. But a commit does not describe a dirty tree, so anyone
+            # reading the commit should know it is incomplete.
+            state["caveat"] = ("The working tree had uncommitted changes when this was recorded, so the commit does "
+                               "not fully describe the code that was verified.")
         return {"subject_type": subject_type, "subject_id": subject_id, "kind": latest["kind"],
-                "history_count": history, **state}
+                "history_count": history, "provenance": provenance, **state}
 
-    def verify(self, subject_type: str, subject_id: str, kind: str, result: str, evidence: str = "") -> dict:
+    def verify(self, subject_type: str, subject_id: str, kind: str, result: str, evidence: str = "",
+               command: list[str] | None = None, exit_code: int | None = None) -> dict:
         now = NOW()
-        self.db.execute("INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at) VALUES(?,?,?,?,?,?)", (subject_type, subject_id, kind, result.upper(), evidence, now))
+        # Observed now, about now's code — not reconstructed for an older row.
+        # `verify` records what is true at the moment it is called, which is the
+        # only moment at which this is knowable.
+        git_commit, tree_dirty = self._git_provenance()
+        self.db.execute("INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at,git_commit,command,exit_code,tree_dirty) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (subject_type, subject_id, kind, result.upper(), evidence, now, git_commit,
+                         json.dumps(command) if command else None, exit_code, tree_dirty))
         if subject_type == "symbol":
             self.db.execute("UPDATE symbols SET last_verified=? WHERE name=? AND status='active'", (result.upper(), subject_id))
         elif subject_type == "feature":
             self.db.execute("UPDATE features SET last_verified=?,status=? WHERE name=?", (now, result.upper() if result.upper() in {"WORKING", "BROKEN", "PARTIAL"} else "UNVERIFIED", subject_id))
-        self.db.commit(); record = {"subject_type": subject_type, "subject_id": subject_id, "kind": kind, "result": result.upper(), "evidence": evidence, "recorded_at": now}
+        self.db.commit(); record = {"subject_type": subject_type, "subject_id": subject_id, "kind": kind, "result": result.upper(), "evidence": evidence, "recorded_at": now,
+                                    "git_commit": git_commit or None, "command": command, "exit_code": exit_code,
+                                    "tree_dirty": None if tree_dirty is None else bool(tree_dirty)}
         record["regressions"] = self.regressions(subject_type, subject_id)
         # What this result is worth *now*, computed the same way every reader
         # computes it. Recorded and current are different questions.
@@ -1890,7 +1961,10 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         completed = subprocess.run(command, cwd=self.root, text=True, capture_output=True)
         output = (completed.stdout + "\n" + completed.stderr).strip()[-4000:]
         result = "PASSED" if completed.returncode == 0 else "FAILED"
-        return self.verify(subject_type, subject_id, kind, result, evidence or output)
+        # The argv and the exit code are the two facts that make this a
+        # measurement rather than a claim, and both were being discarded.
+        return self.verify(subject_type, subject_id, kind, result, evidence or output,
+                           command=list(command), exit_code=completed.returncode)
 
     def regressions(self, subject_type: str | None = None, subject_id: str | None = None) -> list[dict]:
         query = "SELECT * FROM verifications"; args = []

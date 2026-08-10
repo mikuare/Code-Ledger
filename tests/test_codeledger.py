@@ -1,6 +1,7 @@
 import json
 import re
 import sqlite3
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -3490,3 +3491,248 @@ class VerificationInvalidationTests(unittest.TestCase):
             charge = self.symbol(ledger, "charge")
             self.assertIsNone(charge["last_verified"])
             self.assertEqual(charge["verification"]["applicability"], "UNVERIFIABLE")
+
+
+def git_project(root: Path, files: dict[str, str]):
+    """A real repository with one commit, or a skip if git is unavailable."""
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    if shutil.which("git") is None:
+        raise unittest.SkipTest("git is not available")
+    root.mkdir(parents=True, exist_ok=True)
+    if git("init", "-q").returncode != 0:
+        raise unittest.SkipTest("git init failed")
+    git("config", "user.email", "test@example.invalid"); git("config", "user.name", "Test")
+    for name, text in files.items():
+        path = root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(text)
+    git("add", "-A"); git("commit", "-q", "-m", "initial")
+    return git
+
+
+class VerificationProvenanceTests(unittest.TestCase):
+    """A verification records the state it was measured against, or says it cannot.
+
+    Timestamps alone answer "has this symbol changed since". They cannot answer
+    "which code was this measured against" — that information is discarded the
+    moment a command finishes and is not recoverable later. These four columns
+    are the smallest thing that makes a verification a measurement rather than
+    an undated claim.
+    """
+
+    def latest(self, ledger):
+        return dict(ledger.db.execute("SELECT * FROM verifications ORDER BY id DESC LIMIT 1").fetchone())
+
+    def test_a_successful_command_records_all_four_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            git_project(root, {"pay.py": "def charge(a):\n    return a * 2\n"})
+            ledger = Ledger(root); ledger.init()
+            record = ledger.verify_command("project", "project", "TEST", [sys.executable, "-c", "print('ok')"])
+            self.assertEqual(record["result"], "PASSED")
+            row = self.latest(ledger)
+            self.assertEqual(len(row["git_commit"]), 40, "the commit under test was not recorded")
+            self.assertEqual(json.loads(row["command"])[1:], ["-c", "print('ok')"])
+            self.assertEqual(row["exit_code"], 0)
+            self.assertIsNotNone(row["tree_dirty"])
+
+    def test_a_failed_command_records_its_exit_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            git_project(root, {"pay.py": "def charge(a):\n    return a * 2\n"})
+            ledger = Ledger(root); ledger.init()
+            record = ledger.verify_command("project", "project", "TEST", [sys.executable, "-c", "raise SystemExit(7)"])
+            self.assertEqual(record["result"], "FAILED")
+            row = self.latest(ledger)
+            self.assertEqual(row["exit_code"], 7, "a non-zero exit code must be preserved, not flattened to FAILED")
+            self.assertEqual(len(row["git_commit"]), 40)
+
+    def test_a_clean_tree_is_recorded_as_clean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            git = git_project(root, {"pay.py": "def charge(a):\n    return a * 2\n"})
+            # `codeledger init` writes protocol files, so commit them first.
+            ledger = Ledger(root); ledger.init(); git("add", "-A"); git("commit", "-q", "-m", "ledger")
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.assertEqual(self.latest(ledger)["tree_dirty"], 0)
+            self.assertNotIn("caveat", ledger.verification_state("symbol", "charge"))
+
+    def test_a_dirty_tree_is_recorded_and_caveated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            git_project(root, {"pay.py": "def charge(a):\n    return a * 2\n"})
+            ledger = Ledger(root); ledger.init()      # leaves untracked files behind
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.assertEqual(self.latest(ledger)["tree_dirty"], 1)
+            state = ledger.verification_state("symbol", "charge")
+            self.assertIn("caveat", state)
+            self.assertIn("uncommitted", state["caveat"])
+            # A dirty tree is a caveat on the provenance, not a verdict of its own.
+            self.assertEqual(state["applicability"], "CURRENT")
+
+    def test_a_project_without_git_is_not_punished_for_it(self):
+        """Empty commit means 'no git here', which is not a provenance gap."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.assertEqual(self.latest(ledger)["git_commit"], "")
+            self.assertIsNone(self.latest(ledger)["tree_dirty"])
+            self.assertEqual(ledger.verification_state("symbol", "charge")["applicability"], "CURRENT")
+
+    def test_a_legacy_row_without_provenance_is_unverifiable(self):
+        """The pre-migration shape: a result with no commit behind it."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.db.execute(
+                "INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at) "
+                "VALUES('symbol','charge','TEST','PASSED','old run',?)", (datetime.now(timezone.utc).isoformat(),))
+            ledger.db.commit()
+            state = ledger.verification_state("symbol", "charge")
+            self.assertEqual(state["applicability"], "UNVERIFIABLE")
+            self.assertEqual(state["status"], "UNKNOWN")
+            self.assertEqual(state["result_recorded"], "PASSED", "the historical result must stay readable")
+            self.assertIn("provenance", state["reason"])
+            symbol = next(row for row in ledger.lookup("charge") if row["name"] == "charge")
+            self.assertIsNone(symbol["last_verified"])
+            self.assertEqual(symbol["verification"]["applicability"], "UNVERIFIABLE")
+
+    def test_a_changed_symbol_is_superseded_not_merely_unverifiable(self):
+        """Proving it does not apply outranks being unable to prove it does."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "pay.py"; source.write_text("def charge(a):\n    return a * 2\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.db.execute(
+                "INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at) "
+                "VALUES('symbol','charge','TEST','PASSED','old run',?)", (datetime.now(timezone.utc).isoformat(),))
+            ledger.db.commit()
+            source.write_text("def charge(a):\n    return a * 5\n"); ledger.refresh(True)
+            self.assertEqual(ledger.verification_state("symbol", "charge")["applicability"], "SUPERSEDED")
+
+    def test_a_project_result_does_not_survive_a_new_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            git = git_project(root, {"pay.py": "def charge(a):\n    return a * 2\n"})
+            ledger = Ledger(root); ledger.init()
+            ledger.verify("project", "project", "BUILD", "PASSED", "build green")
+            self.assertEqual(ledger.verification_state("project", "project")["status"], "PASSED")
+
+            (root / "notes.md").write_text("unrelated\n")
+            git("add", "-A"); git("commit", "-q", "-m", "second")
+            state = ledger.verification_state("project", "project")
+            self.assertEqual(state["applicability"], "SUPERSEDED")
+            self.assertIn("does not carry across a commit", state["reason"])
+            self.assertEqual(state["result_recorded"], "PASSED")
+
+    def test_a_symbol_result_survives_an_unrelated_commit(self):
+        """The content hash is sharper than the commit and decides for symbols."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            git = git_project(root, {"pay.py": "def charge(a):\n    return a * 2\n"})
+            ledger = Ledger(root); ledger.init()
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            (root / "notes.md").write_text("unrelated\n")
+            git("add", "-A"); git("commit", "-q", "-m", "second")
+            ledger.refresh(True)
+            self.assertEqual(ledger.verification_state("symbol", "charge")["applicability"], "CURRENT")
+
+    def test_a_file_edited_behind_the_index_is_unverifiable(self):
+        """Checkout without a refresh: the index cannot speak for the disk."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "pay.py"; source.write_text("def charge(a):\n    return a * 2\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.assertEqual(ledger.verification_state("symbol", "charge")["applicability"], "CURRENT")
+            time.sleep(0.01)
+            source.write_text("def charge(a):\n    return a * 99\n")     # no refresh
+            state = ledger.verification_state("symbol", "charge")
+            self.assertEqual(state["applicability"], "UNVERIFIABLE")
+            self.assertIn("changed on disk", state["reason"])
+
+    def test_provenance_is_reported_alongside_the_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            git_project(root, {"pay.py": "def charge(a):\n    return a * 2\n"})
+            ledger = Ledger(root); ledger.init()
+            ledger.verify_command("project", "project", "TEST", [sys.executable, "-c", "print('ok')"])
+            provenance = ledger.verification_state("project", "project")["provenance"]
+            self.assertEqual(len(provenance["git_commit"]), 40)
+            self.assertEqual(provenance["exit_code"], 0)
+            self.assertEqual(provenance["command"][1:], ["-c", "print('ok')"])
+            self.assertIsInstance(provenance["tree_dirty"], bool)
+
+    def test_history_survives_the_migration_and_later_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.db.execute(
+                "INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at) "
+                "VALUES('symbol','charge','TEST','PASSED','the old run','2020-01-01T00:00:00+00:00')")
+            ledger.db.commit()
+            ledger.verify("symbol", "charge", "TEST", "FAILED", "the new run")
+            rows = [dict(r) for r in ledger.db.execute("SELECT * FROM verifications ORDER BY id")]
+            self.assertEqual([r["evidence"] for r in rows], ["the old run", "the new run"])
+            self.assertIsNone(rows[0]["git_commit"], "a legacy row must not be given a fabricated commit")
+            self.assertEqual(rows[1]["git_commit"], "")
+            self.assertEqual(ledger.verification_state("symbol", "charge")["history_count"], 2)
+
+    def test_evidence_kinds_stay_independent(self):
+        """No pipeline: a passing test says nothing about a build or a deploy."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.verify("project", "project", "TEST", "PASSED", "suite green")
+            self.assertEqual(ledger.verification_state("project", "project")["status"], "PASSED")
+            # Nothing was recorded about any other subject, and nothing is implied.
+            for subject in ("build", "deployment", "runtime"):
+                state = ledger.verification_state("project", subject)
+                self.assertEqual(state["status"], "UNKNOWN", f"{subject} was inferred from a passing test")
+                self.assertEqual(state["applicability"], "NONE")
+
+
+class ProvenanceMigrationTests(unittest.TestCase):
+    """A database written before P0-E must upgrade without losing anything."""
+
+    def test_a_pre_provenance_database_upgrades_in_place(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+            # Build the pre-P0-E table shape by hand, then let `connect` migrate.
+            path = root / ".ai" / "codeledger" / "codeledger.db"; path.parent.mkdir(parents=True)
+            legacy = sqlite3.connect(path)
+            legacy.executescript(
+                "CREATE TABLE verifications (id INTEGER PRIMARY KEY, subject_type TEXT NOT NULL, "
+                "subject_id TEXT NOT NULL, kind TEXT NOT NULL, result TEXT NOT NULL, evidence TEXT, "
+                "recorded_at TEXT NOT NULL);"
+                "INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at) "
+                "VALUES('project','project','TEST','PASSED','historical evidence','2020-01-01T00:00:00+00:00');")
+            legacy.commit(); legacy.close()
+
+            connection = db_module.connect(root)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(verifications)")}
+            self.assertLessEqual({"git_commit", "command", "exit_code", "tree_dirty"}, columns)
+            row = dict(connection.execute("SELECT * FROM verifications").fetchone())
+            self.assertEqual(row["evidence"], "historical evidence")
+            self.assertIsNone(row["git_commit"], "existing rows must not be backfilled")
+            self.assertIsNone(row["command"]); self.assertIsNone(row["exit_code"]); self.assertIsNone(row["tree_dirty"])
+            connection.close()
+
+            ledger = Ledger(root)
+            self.assertEqual(ledger.verification_state("project", "project")["applicability"], "UNVERIFIABLE")
+            self.assertEqual(ledger.doctor(check_mcp=False)["checks"]["schema"], "OK")
+            self.assertEqual(ledger.doctor(check_mcp=False)["checks"]["migrations"], "OK")
+
+    def test_the_migration_is_additive_and_declared(self):
+        entries = {(table, column) for table, column, _ in db_module.MIGRATIONS}
+        self.assertLessEqual({("verifications", "git_commit"), ("verifications", "command"),
+                              ("verifications", "exit_code"), ("verifications", "tree_dirty")}, entries)
+        for table, column, statement in db_module.MIGRATIONS:
+            if table == "verifications":
+                self.assertTrue(statement.startswith("ALTER TABLE verifications ADD COLUMN"), statement)
+                self.assertNotIn("NOT NULL", statement, "a NOT NULL column cannot be added to existing rows")
