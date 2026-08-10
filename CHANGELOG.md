@@ -12,9 +12,9 @@ to be wrong — which is the failure mode this project exists to avoid.
 
 A reliability pass over the intelligence that already existed. Every item below
 was reproduced from a real session before it was fixed, and each has a
-regression test that fails without the fix. No new subsystem, no schema change,
-no migration: the goal was to make the existing answers trustworthy rather than
-to add more of them.
+regression test that fails without the fix. No new subsystem, and no destructive
+migration: the goal was to make the existing answers trustworthy rather than to
+add more of them.
 
 ### Fixed
 
@@ -107,12 +107,48 @@ to add more of them.
   the client during `initialize` and started the session under that name. They
   now fall back to it; an explicit argument still wins.
 
+### Changed
+
+- **Verifications recorded before provenance support now report
+  `UNVERIFIABLE`.** A verification is a claim about a state of the code, and
+  until now it stored none of that state: no commit, no command, no exit code,
+  and no record of whether the working tree was clean. Records written by
+  earlier releases therefore cannot be shown to describe the code that exists
+  today, and CodeLedger no longer reports them as `CURRENT`.
+
+  **This is intentional.** The alternative is to keep presenting a historical
+  `PASSED` as though it still applied — which is precisely the failure this
+  release exists to remove. An agent asking "is this tested?" would be told yes
+  about code that has since been rewritten, and would skip the test that would
+  have caught the regression. `UNVERIFIABLE` is less pleasant to read and far
+  safer to act on: CodeLedger will not claim a historical verification is
+  current when it cannot prove which code was verified.
+
+  **Nothing is deleted or rewritten.** The original result stays visible as
+  `result_recorded`, the recorded evidence text is untouched, and the row keeps
+  its place in the history. Old rows are deliberately *not* backfilled with a
+  commit: inventing provenance after the fact would manufacture exactly the
+  confidence these columns exist to withdraw.
+
+  **Re-running the verification restores it.** A fresh run records the commit,
+  the exact argv, the exit code and whether the tree was dirty, and the subject
+  returns to `CURRENT` — and stays there for as long as the code it covers is
+  unchanged. For a symbol that means until the symbol's own content changes;
+  reformatting and comment edits do not disturb it.
+
+  Projects not under Git are unaffected. A record written where no repository
+  exists is stored distinguishably from one that predates provenance, and
+  continues to report `CURRENT` on the content-hash rule.
+
 ### Notes
 
 - Existing databases upgrade in place. The `files.analysis_version` stamp moves
   to `:2`, so `refresh --changed` reparses each file once and retires symbols
   like `if` and `v_email` — they are marked deleted, never destroyed, and all
-  change history is preserved. There is no migration to run.
+  change history is preserved. That part needs no migration.
+- `verifications` gains four nullable columns — `git_commit`, `command`,
+  `exit_code` and `tree_dirty` — through the existing additive migration path.
+  No new table, no backfill, and no other schema is touched.
 - `codeledger scope` gains optional `--plan-files` and `--plan-symbols`.
 - `since` and change records gain `files_total`, `files_truncated`,
   `symbols_total` and `symbols_truncated`; the handshake gains
