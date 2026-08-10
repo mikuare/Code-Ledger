@@ -10,11 +10,68 @@ to be wrong — which is the failure mode this project exists to avoid.
 
 ## [Unreleased]
 
-A reliability pass over the intelligence that already existed. Every item below
-was reproduced from a real session before it was fixed, and each has a
-regression test that fails without the fix. No new subsystem, and no destructive
-migration: the goal was to make the existing answers trustworthy rather than to
-add more of them.
+A reliability pass over the intelligence that already existed, and a small
+extension of what CodeLedger is willing to record. Every item below was
+reproduced from a real session before it was fixed, and each has a regression
+test that fails without the fix. No destructive migration.
+
+What is new follows the same rule as what was fixed: it reports what the
+repository can prove, names what it cannot, and never fills the gap between the
+two with a guess.
+
+### Added
+
+- **Verification subjects beyond code: `endpoint`, `deployment`, `artifact`.**
+  A test result and a health-check probe are different kinds of claim, and
+  collapsing them into `project` meant an endpoint probe was reported as
+  "The symbol has not changed since it was verified" — confident, fluent, and
+  about the wrong thing entirely. Non-code subjects are now described as what
+  they are, including when they are superseded: local source moving is still a
+  reason to stop trusting an observation of a running system, but it is not the
+  same statement as "the code you verified changed".
+
+- **Evidence about running systems expires; evidence about code does not.**
+  A `RUNTIME_PROBE` was true when it was taken and says nothing about now, so
+  kinds that observe something *running* carry a lifetime
+  (`evidence_ttl_seconds` in config, defaulting to one hour for
+  `RUNTIME_PROBE` and one day for `DEPLOY`). `TEST` and `BUILD` are
+  deliberately absent and never expire — a test that passed at this commit is
+  still true tomorrow if nothing moved, and expiring it would train an agent to
+  ignore the status. Expiry is derived from `recorded_at`; no column stores it,
+  and a kind with no configured lifetime never expires. Precedence is
+  `SUPERSEDED` > `UNVERIFIABLE` > `EXPIRED` > `CURRENT`: proving the evidence
+  does not apply outranks being unable to prove that it does, which outranks it
+  merely being old.
+
+- **Environment variables and external packages are now part of `plan`.** Read
+  structurally from the parse tree — `os.environ[...]`, `os.getenv`,
+  `import.meta.env`, `process.env`, `Deno.env` — never by scanning for strings,
+  so `"set DATABASE_URL before running"` is prose and not a dependency. A
+  computed key is recorded as a real read whose name is `<dynamic>`, because
+  the dependency exists even when its identity is not in the source.
+
+  Only *names* are ever recorded. Values live in the environment and in `.env`,
+  which stays excluded from indexing, and a test asserts no secret value
+  reaches the database.
+
+  External packages are read from the module specifier rather than from the
+  words in the import statement. The existing import edges are a deliberately
+  coarse bag of identifiers — good enough for name-matching in the dependency
+  graph, where a stray `from` matches nothing — so reusing them here reported
+  `import { createClient } from "@supabase/supabase-js"` as five packages,
+  among them `from`, `js` and `createClient`. The specifier is now read
+  structurally and cut on the conventions of the language that wrote it: a
+  quoted path for JavaScript and Go, where `@supabase/supabase-js/dist` is one
+  package; a dotted or scoped path for Python, Java and Rust, where the first
+  component is. Relative imports, URL imports and bare scopes name no package
+  and are reported as none.
+
+  The useful half is `cannot_prove`. A source reference proves a variable is
+  read; it proves nothing about whether that variable is set, correct, or
+  pointing at the right project in any environment — and no amount of reading
+  the repository will settle it. That list is the shortest honest answer to
+  "why might correct-looking code still fail?", and it prints even when nothing
+  was proven, so a plan never reads as though it checked everything.
 
 ### Fixed
 
@@ -153,6 +210,35 @@ add more of them.
 - `since` and change records gain `files_total`, `files_truncated`,
   `symbols_total` and `symbols_truncated`; the handshake gains
   `scope_violations` and `plan_paths`; `impact` gains `historical_symbols`.
+- `plan` gains `external_dependencies`, rendered in the text output as well as
+  in `--json`. `config.json` gains an optional `evidence_ttl_seconds` map.
+- Environment reads and module specifiers are stored as new `env` and `module`
+  dependency kinds. Both name something outside the repository, so neither is
+  ever resolved to a same-named symbol, and `impact` and the task boundary walk
+  code edges only (`calls`, `uses`, `imports`) — so
+  `export const DATABASE_URL = process.env.DATABASE_URL` no longer drags every
+  file that reads the variable into the blast radius of the constant. The
+  existing `imports` edges are unchanged. No schema change: `kind` already
+  existed.
+- Python standard-library imports are excluded from the external inventory.
+  The rule is applied only to `.py` files, because `types`, `signal` and `copy`
+  are all real npm packages and dropping one would be the error that matters.
+- Review of the above found and fixed, each with a regression test: a project's
+  own top-level modules were reported as third-party packages (paths are stored
+  root-relative, so matching only `%/name.%` never matched them); `_` in a
+  module name acted as a LIKE wildcard; the default (no-grammar) path reported
+  bound names — `React`, `x` — as packages; Go import paths collapsed into
+  `github.com`; a chained access such as `process.env.NODE_ENV.toLowerCase()`
+  recorded a spurious computed-key read; an interpolated key became a variable
+  literally named `${prefix}_URL`; a malformed `evidence_ttl_seconds` raised out
+  of every command instead of degrading to defaults; a lifetime serialised as a
+  float was silently discarded, reading as "never expires"; a verification whose
+  timestamp could not be read reported `CURRENT`; and the inventory truncated at
+  12 with no total. Environment reads are only extracted from a parse tree, so a
+  file analysed by line patterns now says so rather than showing an empty list
+  that reads as "none found".
+- Tree-sitter files are parsed once per analysis rather than twice, and node
+  text is decoded only for the nodes that need it.
 
 ## [0.4.0]
 

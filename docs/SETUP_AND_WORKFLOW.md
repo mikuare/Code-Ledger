@@ -315,9 +315,22 @@ Important settings include:
   "max_file_size": 2000000,
   "source_extensions": [".py", ".ts", ".tsx"],
   "follow_symlinks": false,
-  "ignores": ["node_modules", "dist", "custom-generated-folder"]
+  "ignores": ["node_modules", "dist", "custom-generated-folder"],
+  "evidence_ttl_seconds": {"RUNTIME_PROBE": 3600, "DEPLOY": 86400}
 }
 ```
+
+`evidence_ttl_seconds` says how long a verification of each kind still
+describes the present. Only evidence about something *running* belongs here: a
+health-check probe was true when it was taken and says nothing about now, so it
+expires. Evidence about code is invalidated by the code changing, not by the
+clock — a `TEST` that passed at this commit is still true tomorrow if nothing
+moved, which is why `TEST` and `BUILD` are absent from the default and never
+expire. A kind you do not list never expires, and lookup is case-insensitive.
+
+Once past its lifetime a result reports `EXPIRED` and its status becomes
+`UNKNOWN`, but the recorded result stays visible as `result_recorded` — nothing
+is deleted, and nothing contradicted it. It is simply too old to be relied on.
 
 Additional ignore patterns can be placed in:
 
