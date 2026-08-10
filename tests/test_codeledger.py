@@ -3736,3 +3736,275 @@ class ProvenanceMigrationTests(unittest.TestCase):
             if table == "verifications":
                 self.assertTrue(statement.startswith("ALTER TABLE verifications ADD COLUMN"), statement)
                 self.assertNotIn("NOT NULL", statement, "a NOT NULL column cannot be added to existing rows")
+
+
+class VerificationSubjectTests(unittest.TestCase):
+    """Non-code subjects are first-class, and are described as what they are.
+
+    Widening the enum alone would have shipped an endpoint probe reporting
+    "The symbol has not changed since it was verified" — confidently wrong
+    prose in the one system whose value is not producing any.
+    """
+
+    def project(self, directory):
+        root = Path(directory)
+        (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+        ledger = Ledger(root); ledger.init()
+        return ledger, root / "pay.py"
+
+    def test_the_cli_accepts_non_code_subjects(self):
+        parser = build_parser()
+        for subject in ("symbol", "feature", "project", "endpoint", "deployment", "artifact"):
+            with self.subTest(subject=subject):
+                args = parser.parse_args(["verify", subject, "x", "TEST", "PASSED"])
+                self.assertEqual(args.subject_type, subject)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["verify", "nonsense", "x", "TEST", "PASSED"])
+
+    def test_a_current_endpoint_is_not_described_as_a_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            ledger.verify("endpoint", "https://api.example.com/health", "RUNTIME_PROBE", "PASSED", '{"ok":true}')
+            state = ledger.verification_state("endpoint", "https://api.example.com/health")
+            self.assertEqual(state["applicability"], "CURRENT")
+            self.assertNotIn("symbol", state["reason"].lower())
+            self.assertIn("endpoint", state["reason"])
+
+    def test_a_superseded_endpoint_is_not_described_as_changed_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("endpoint", "https://api.example.com/health", "RUNTIME_PROBE", "PASSED")
+            source.write_text("def charge(a):\n    return a * 3\n"); ledger.refresh(True)
+            state = ledger.verification_state("endpoint", "https://api.example.com/health")
+            self.assertEqual(state["applicability"], "SUPERSEDED")
+            self.assertNotIn("The endpoint changed", state["reason"])
+            self.assertIn("source changed", state["reason"])
+
+    def test_subject_wording_uses_the_right_article(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            for subject in ("endpoint", "artifact", "deployment", "project"):
+                with self.subTest(subject=subject):
+                    ledger.verify(subject, f"subject-{subject}", "RUNTIME_PROBE", "PASSED")
+                    # A distinct body each time, so the symbol genuinely changes
+                    # and the SUPERSEDED wording is the one under test.
+                    source.write_text(f"def charge(a):\n    return a * {abs(hash(subject)) % 997}\n")
+                    ledger.refresh(True)
+                    reason = ledger.verification_state(subject, f"subject-{subject}")["reason"]
+                    expected = "An" if subject[0] in "aeiou" else "A"
+                    wrong = "A" if expected == "An" else "An"
+                    self.assertIn(f"{expected} {subject}-level", reason, reason)
+                    self.assertNotIn(f"{wrong} {subject}-level", reason, f"ungrammatical article in: {reason}")
+
+    def test_a_code_subject_keeps_its_original_wording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.assertIn("The symbol has not changed",
+                          ledger.verification_state("symbol", "charge")["reason"])
+            source.write_text("def charge(a):\n    return a * 7\n"); ledger.refresh(True)
+            self.assertIn("The symbol changed at", ledger.verification_state("symbol", "charge")["reason"])
+
+    def test_a_non_code_subject_cannot_pollute_symbol_presentation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            # Deliberately collide the subject_id with a real symbol name.
+            ledger.verify("endpoint", "charge", "RUNTIME_PROBE", "PASSED")
+            symbol = next(row for row in ledger.lookup("charge") if row["name"] == "charge")
+            self.assertIsNone(symbol["last_verified"], "an endpoint result leaked onto a symbol")
+            self.assertNotIn("verification", symbol)
+            self.assertIsNone(ledger.db.execute(
+                "SELECT last_verified FROM symbols WHERE name='charge'").fetchone()[0])
+
+    def test_regressions_work_for_a_non_code_subject(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            ledger.verify("endpoint", "https://api/health", "RUNTIME_PROBE", "PASSED")
+            ledger.verify("endpoint", "https://api/health", "RUNTIME_PROBE", "FAILED", "503")
+            found = ledger.regressions("endpoint", "https://api/health")
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0]["status"], "REGRESSION")
+
+
+class VerificationExpiryTests(unittest.TestCase):
+    """Evidence about a running system decays; evidence about code does not.
+
+    Expiry is derived from `recorded_at` and a per-kind lifetime in Config.
+    No column stores it, and no kind expires unless it is configured to.
+    """
+
+    def project(self, directory, ttl=None):
+        root = Path(directory)
+        (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+        ledger = Ledger(root); ledger.init()
+        if ttl is not None:
+            ledger.config.evidence_ttl_seconds = ttl
+        return ledger, root / "pay.py"
+
+    def age(self, ledger, subject_type, subject_id, seconds):
+        """Simulate time passing with nothing changing, rather than sleeping.
+
+        The code must stay *older* than the record: backdating only the record
+        would make the untouched index look newer than the observation and
+        supersede it, which is a different state from the one under test.
+        """
+        recorded = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+        ledger.db.execute("UPDATE verifications SET recorded_at=? WHERE subject_type=? AND subject_id=?",
+                          (recorded.isoformat(), subject_type, subject_id))
+        older = (recorded - timedelta(hours=1)).isoformat()
+        ledger.db.execute("UPDATE symbols SET updated_at=?", (older,))
+        ledger.db.execute("UPDATE files SET last_analyzed=?", (older,))
+        ledger.db.commit()
+
+    def test_a_runtime_probe_expires_after_its_configured_lifetime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory, {"RUNTIME_PROBE": 60})
+            ledger.verify("endpoint", "https://api/health", "RUNTIME_PROBE", "PASSED")
+            self.assertEqual(ledger.verification_state("endpoint", "https://api/health")["applicability"], "CURRENT")
+            self.age(ledger, "endpoint", "https://api/health", 120)
+            state = ledger.verification_state("endpoint", "https://api/health")
+            self.assertEqual(state["applicability"], "EXPIRED")
+            self.assertEqual(state["status"], "UNKNOWN")
+            self.assertEqual(state["result_recorded"], "PASSED", "the recorded result must stay visible")
+            self.assertIn("too old", state["reason"])
+
+    def test_a_kind_with_no_configured_lifetime_never_expires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory, {"RUNTIME_PROBE": 60})
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.age(ledger, "symbol", "charge", 86_400 * 365)
+            self.assertEqual(ledger.verification_state("symbol", "charge")["applicability"], "CURRENT",
+                             "code evidence must be invalidated by code, not by the clock")
+
+    def test_the_default_config_expires_runtime_kinds_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            self.assertIsNone(ledger.config.evidence_ttl("TEST"))
+            self.assertIsNone(ledger.config.evidence_ttl("BUILD"))
+            self.assertTrue(ledger.config.evidence_ttl("RUNTIME_PROBE"))
+            self.assertEqual(ledger.config.evidence_ttl("runtime_probe"),
+                             ledger.config.evidence_ttl("RUNTIME_PROBE"), "lookup must be case-insensitive")
+
+    def test_precedence_superseded_beats_expired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory, {"RUNTIME_PROBE": 60})
+            ledger.verify("endpoint", "https://api/health", "RUNTIME_PROBE", "PASSED")
+            self.age(ledger, "endpoint", "https://api/health", 120)
+            source.write_text("def charge(a):\n    return a * 4\n"); ledger.refresh(True)
+            self.assertEqual(ledger.verification_state("endpoint", "https://api/health")["applicability"],
+                             "SUPERSEDED", "a demonstrated change outranks mere age")
+
+    def test_precedence_unverifiable_beats_expired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory, {"TEST": 60})
+            ledger.db.execute(
+                "INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at) "
+                "VALUES('symbol','charge','TEST','PASSED','legacy',?)",
+                ((datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat(),))
+            ledger.db.commit()
+            self.age(ledger, "symbol", "charge", 120)
+            self.assertEqual(ledger.verification_state("symbol", "charge")["applicability"], "UNVERIFIABLE",
+                             "a provenance gap outranks age")
+
+    def test_expiry_reaches_the_symbol_lookup_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory, {"TEST": 60})
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.age(ledger, "symbol", "charge", 120)
+            symbol = next(row for row in ledger.lookup("charge") if row["name"] == "charge")
+            self.assertEqual(symbol["verification"]["applicability"], "EXPIRED")
+            self.assertIsNone(symbol["last_verified"], "expired evidence must not read as current")
+
+
+class ExpiryEdgeCaseTests(unittest.TestCase):
+    """Expiry is the weakest doubt, and must never be the only one that speaks."""
+
+    def project(self, directory, ttl):
+        root = Path(directory)
+        (root / "pay.py").write_text("def charge(a):\n    return a * 2\n")
+        ledger = Ledger(root); ledger.init()
+        ledger.config.evidence_ttl_seconds = ttl
+        return ledger
+
+    def test_an_unreadable_timestamp_never_reports_current(self):
+        """A configured lifetime makes age load-bearing; an unparseable
+        `recorded_at` makes it unanswerable, and unanswerable is not CURRENT."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(directory, {"RUNTIME_PROBE": 60})
+            ledger.verify("endpoint", "https://api/health", "RUNTIME_PROBE", "PASSED")
+            ledger.db.execute("UPDATE verifications SET recorded_at='not-a-timestamp'")
+            ledger.db.commit()
+            state = ledger.verification_state("endpoint", "https://api/health")
+            self.assertEqual(state["applicability"], "UNVERIFIABLE")
+            self.assertEqual(state["status"], "UNKNOWN")
+            self.assertEqual(state["result_recorded"], "PASSED", "the recorded result must stay visible")
+
+    def test_a_zero_or_negative_lifetime_is_not_a_lifetime(self):
+        """A lifetime of zero would expire evidence the instant it was recorded,
+        so `Config` drops it at construction rather than honouring it."""
+        from codeledger.config import Config
+        def build(ttl): return Config(project_name="t", root=".", ignores=[], evidence_ttl_seconds=ttl)
+        config = build({"RUNTIME_PROBE": 0, "DEPLOY": -1, "SMOKE": 30})
+        self.assertIsNone(config.evidence_ttl("RUNTIME_PROBE"))
+        self.assertIsNone(config.evidence_ttl("DEPLOY"))
+        self.assertEqual(config.evidence_ttl("SMOKE"), 30, "a real lifetime still survives")
+        self.assertIsNone(build({"JUNK": "soon"}).evidence_ttl("JUNK"),
+                          "a non-numeric lifetime is not a lifetime")
+
+    def test_a_zero_lifetime_does_not_expire_a_fresh_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(directory, {"RUNTIME_PROBE": 0})
+            ledger.verify("endpoint", "https://api/health", "RUNTIME_PROBE", "PASSED")
+            self.assertEqual(ledger.verification_state("endpoint", "https://api/health")["applicability"],
+                             "CURRENT")
+
+    def test_expiry_never_downgrades_a_failure_into_reassurance(self):
+        """An expired FAILED must not read as though the failure went away."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.project(directory, {"RUNTIME_PROBE": 60})
+            ledger.verify("endpoint", "https://api/health", "RUNTIME_PROBE", "FAILED", "503")
+            recorded = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+            ledger.db.execute("UPDATE verifications SET recorded_at=?", (recorded,))
+            older = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+            ledger.db.execute("UPDATE symbols SET updated_at=?", (older,))
+            ledger.db.execute("UPDATE files SET last_analyzed=?", (older,))
+            ledger.db.commit()
+            state = ledger.verification_state("endpoint", "https://api/health")
+            self.assertEqual(state["applicability"], "EXPIRED")
+            self.assertEqual(state["status"], "UNKNOWN", "an expired result is unknown, not passing")
+            self.assertEqual(state["result_recorded"], "FAILED")
+
+
+class ConfigRobustnessTests(unittest.TestCase):
+    """`load` promises a bad config degrades to defaults rather than breaking
+    every command, and that has to survive a value of the wrong shape."""
+
+    def config(self, ttl):
+        from codeledger.config import Config
+        return Config(project_name="t", root=".", ignores=[], evidence_ttl_seconds=ttl)
+
+    def test_a_malformed_lifetime_map_does_not_break_every_command(self):
+        for broken in (["RUNTIME_PROBE"], "3600", 5, True):
+            with self.subTest(value=broken):
+                config = self.config(broken)
+                self.assertIsInstance(config.evidence_ttl_seconds, dict)
+                self.assertTrue(config.evidence_ttl("RUNTIME_PROBE"), "it should fall back to the defaults")
+
+    def test_a_lifetime_written_as_a_float_is_honoured(self):
+        """JSON has one number type, so a lifetime can arrive as 3600.0.
+        Dropping it silently would read as 'never expires'."""
+        self.assertEqual(self.config({"RUNTIME_PROBE": 3600.5}).evidence_ttl("RUNTIME_PROBE"), 3600)
+        self.assertEqual(self.config({"RUNTIME_PROBE": "900"}).evidence_ttl("RUNTIME_PROBE"), 900)
+        self.assertEqual(self.config({"RUNTIME_PROBE": "3600.5"}).evidence_ttl("RUNTIME_PROBE"), 3600,
+                         "a lifetime serialised as a decimal string is still a lifetime")
+
+    def test_a_config_file_of_the_wrong_shape_still_loads(self):
+        from codeledger.config import Config
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / ".ai" / "codeledger").mkdir(parents=True)
+            (root / ".ai" / "codeledger" / "config.json").write_text(
+                json.dumps({"evidence_ttl_seconds": ["RUNTIME_PROBE"]}))
+            config = Config.load(root)
+            self.assertTrue(config.evidence_ttl("RUNTIME_PROBE"))
+
+

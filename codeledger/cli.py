@@ -234,7 +234,11 @@ def emit_doctor(value, as_json=False):
     for action in value["recommended_actions"]: print(f"   {action}")
 
 AGENT_CHOICES = ("codex", "claude-code", "gemini", "aider", "cursor")
-SUBJECT_CHOICES = ("symbol", "feature", "project")
+# Code subjects CodeLedger indexes, then observations of things outside the
+# repository. The enum is documentation as much as validation: `subject_id`
+# for an endpoint is a URL nobody will re-read, so a typo would silently
+# create a second subject rather than update the first.
+SUBJECT_CHOICES = ("symbol", "feature", "project", "endpoint", "deployment", "artifact")
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="codeledger", description="Persistent project memory and change intelligence")

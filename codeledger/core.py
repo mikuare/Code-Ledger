@@ -77,6 +77,17 @@ CHARS_PER_TOKEN = 4
 # answer to "is there anything to resume?" grow with the size of the project.
 # The totals travel with the list, so a truncated answer never looks complete.
 CHANGE_LIST_LIMIT = 20
+# Subjects whose code state CodeLedger can scope precisely, because it indexes
+# them. Everything else — an endpoint, a deployment, an artifact — is an
+# observation of something outside the repository, and is worded accordingly.
+CODE_SUBJECTS = ("symbol", "file")
+SUBJECT_NOUNS = {"symbol": "symbol", "file": "file", "project": "project", "feature": "feature",
+                 "endpoint": "endpoint", "deployment": "deployment", "artifact": "artifact"}
+
+def article(word: str) -> str:
+    """`a` or `an`. Small, but "A endpoint-level result" is the kind of seam
+    that makes a report read as though nobody has ever looked at it."""
+    return "an" if word[:1].lower() in "aeiou" else "a"
 # 'completed' and 'failed' predate this vocabulary and still exist in older
 # databases. They mean the same as 'ended' and are never rewritten.
 ENDED = ("ended", "completed", "failed")
@@ -914,6 +925,10 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             imported += 1
         self.db.commit(); return {"commits_imported": imported, "commit_files_imported": files}
 
+    def _ttl_for(self, kind: str | None) -> int | None:
+        """How long this kind of evidence describes the present, if at all."""
+        return self.config.evidence_ttl(kind)
+
     def _symbol_verifications(self, names) -> dict[str, tuple]:
         """Latest verification per symbol name, in one query.
 
@@ -930,9 +945,9 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         names = list(names)
         latest: dict[str, tuple] = {}
         for row in self.db.execute(
-                f"SELECT subject_id,recorded_at,result,git_commit FROM verifications WHERE subject_type='symbol' "
+                f"SELECT subject_id,recorded_at,result,git_commit,kind FROM verifications WHERE subject_type='symbol' "
                 f"AND subject_id IN ({','.join('?' * len(names))}) ORDER BY recorded_at, id", tuple(names)):
-            latest[row["subject_id"]] = (row["recorded_at"], row["result"], row["git_commit"])   # ordered, so the last wins
+            latest[row["subject_id"]] = (row["recorded_at"], row["result"], row["git_commit"], row["kind"])   # ordered, so the last wins
         return latest
 
     def _git_provenance(self) -> tuple[str, int | None]:
@@ -953,37 +968,51 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
 
     @staticmethod
     def _verification_applicability(verified_at, verified_result, code_changed_at, alive: bool,
-                                    git_commit=None, indexed=True) -> dict:
-        """Does this verification still describe the code that exists now?
+                                    git_commit=None, indexed=True, subject_type: str = "symbol",
+                                    ttl_seconds: int | None = None, now: datetime | None = None) -> dict:
+        """Does this verification still describe the thing it was recorded about?
 
-        Evidence is about a code state, not about a name. `symbols.updated_at`
-        moves only when a symbol's content hash changes — reformatting and
-        comment edits leave it alone — so it is exactly the line between
-        "verified and untouched since" and "verified, then rewritten". Comparing
-        the two timestamps needs no new column and no new subsystem.
+        Evidence is about a state, not about a name. For a code subject
+        `symbols.updated_at` moves only when the content hash changes —
+        reformatting and comment edits leave it alone — so it is exactly the
+        line between "verified and untouched since" and "verified, then
+        rewritten". Comparing the two timestamps needs no column of its own.
+
+        A non-code subject — an endpoint, a deployment, an artifact — is a
+        different kind of claim, and the wording says so. Local source moving is
+        still a reason to stop trusting an observation of a running system, but
+        it is not the same statement as "the code you verified changed", and
+        describing it that way would be a small lie in a system whose whole
+        value is not telling them.
+
+        Precedence is SUPERSEDED > UNVERIFIABLE > EXPIRED > CURRENT: proving the
+        evidence does not apply outranks being unable to prove that it does,
+        which outranks it merely being old. Any doubt costs the claim.
 
         Nothing is deleted and nothing is invented: the recorded result is still
         reported, under a status that says what it is now worth.
         """
+        noun = SUBJECT_NOUNS.get(subject_type, subject_type)
+        code_scoped = subject_type in CODE_SUBJECTS
         if not verified_result:
             return {"status": "UNKNOWN", "applicability": "NONE",
-                    "reason": "No verification has been recorded for this symbol."}
+                    "reason": f"No verification has been recorded for this {noun}."}
         if not alive:
             return {"status": "UNKNOWN", "applicability": "SUPERSEDED", "result_recorded": verified_result,
                     "verified_at": verified_at,
-                    "reason": "The symbol has been deleted since it was verified."}
+                    "reason": f"The {noun} has been deleted since it was verified."}
         if not verified_at:
             # A `last_verified` value with no dated row behind it — written by a
             # release before verifications were checked for applicability.
             return {"status": "UNKNOWN", "applicability": "UNVERIFIABLE", "result_recorded": verified_result,
                     "reason": "The verification predates applicability tracking, so it cannot be dated against the code."}
-        # Proving the evidence does *not* apply outranks being unable to prove
-        # that it does, so a code change is reported before a provenance gap.
         if code_changed_at and code_changed_at > verified_at:
+            reason = (f"The {noun} changed at {code_changed_at} after being verified at {verified_at}. "
+                      "The recorded result describes code that no longer exists.") if code_scoped else (
+                     f"The project's source changed at {code_changed_at} after this was observed at {verified_at}. "
+                     f"The observation may no longer describe the {noun} that is running.")
             return {"status": "UNKNOWN", "applicability": "SUPERSEDED", "result_recorded": verified_result,
-                    "verified_at": verified_at, "code_changed_at": code_changed_at,
-                    "reason": (f"The symbol changed at {code_changed_at} after being verified at {verified_at}. "
-                               "The recorded result describes code that no longer exists.")}
+                    "verified_at": verified_at, "code_changed_at": code_changed_at, "reason": reason}
         if git_commit is None:
             return {"status": "UNKNOWN", "applicability": "UNVERIFIABLE", "result_recorded": verified_result,
                     "verified_at": verified_at,
@@ -994,12 +1023,36 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                     "verified_at": verified_at,
                     "reason": ("The file has changed on disk since it was indexed, so the recorded code state "
                                "cannot be compared. Run `codeledger refresh --changed` and ask again.")}
+        # Age is the weakest of the three doubts, so it is asked last. Only a
+        # kind with a configured lifetime can expire; everything else is
+        # invalidated by code, not by the clock.
+        if ttl_seconds:
+            recorded = parse_time(verified_at)
+            if recorded is None:
+                # A lifetime was configured, so this kind is only trustworthy
+                # while it is young enough — and an unreadable timestamp makes
+                # that unanswerable. Falling through to CURRENT would claim the
+                # one thing the record cannot support.
+                return {"status": "UNKNOWN", "applicability": "UNVERIFIABLE", "result_recorded": verified_result,
+                        "verified_at": verified_at,
+                        "reason": ("This kind of evidence expires, but its recorded timestamp cannot be read, "
+                                   "so its age cannot be established. Re-run it to refresh the evidence.")}
+            if recorded:
+                expires = recorded + timedelta(seconds=ttl_seconds)
+                if (now or datetime.now(timezone.utc)) > expires:
+                    return {"status": "UNKNOWN", "applicability": "EXPIRED", "result_recorded": verified_result,
+                            "verified_at": verified_at, "expires_at": expires.isoformat(),
+                            "reason": (f"This observation is older than its configured lifetime of {ttl_seconds}s, "
+                                       f"so it expired at {expires.isoformat()}. Nothing contradicts it; it is "
+                                       "simply too old to describe the present. Re-run it to refresh the evidence.")}
+        current = (f"The {noun} has not changed since it was verified." if code_scoped
+                   else f"Nothing recorded since has invalidated this observation of the {noun}.")
         return {"status": verified_result, "applicability": "CURRENT", "result_recorded": verified_result,
                 "verified_at": verified_at, "code_changed_at": code_changed_at, "git_commit": git_commit or None,
-                "reason": "The symbol has not changed since it was verified."}
+                "reason": current}
 
     @staticmethod
-    def _present_symbol(row, verification=None) -> dict:
+    def _present_symbol(row, verification=None, ttl=None) -> dict:
         """One representation rule for a symbol, applied wherever one is shown.
 
         A symbol that no longer exists has no current line and no current
@@ -1014,10 +1067,10 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # reads it. A stale PASSED is worse than no answer: it is the one field
         # that could talk an agent out of running the test that would have
         # caught the regression.
-        verified_at, verified_result, verified_commit = verification or (None, None, None)
+        verified_at, verified_result, verified_commit, verified_kind = verification or (None, None, None, None)
         verification = Ledger._verification_applicability(
             verified_at, verified_result or record.get("last_verified"), record.get("updated_at"), alive,
-            git_commit=verified_commit)
+            git_commit=verified_commit, subject_type="symbol", ttl_seconds=ttl)
         if verification["applicability"] != "NONE":
             record["verification"] = verification
         # The bare column keeps its meaning only while the evidence still holds.
@@ -1035,7 +1088,9 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         pattern = f"%{query.translate(LIKE_ESCAPE)}%"
         rows = self.db.execute("SELECT s.*,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.name LIKE ? ESCAPE '\\' OR s.qualified_name LIKE ? ESCAPE '\\' ORDER BY s.status='active' DESC,s.name LIMIT ?", (pattern, pattern, limit)).fetchall()
         verified = self._symbol_verifications({row["name"] for row in rows})
-        return [self._present_symbol(r, verified.get(r["name"])) for r in rows]
+        return [self._present_symbol(r, verified.get(r["name"]),
+                                     self._ttl_for(verified.get(r["name"], (None, None, None, None))[3]))
+                for r in rows]
 
     def history(self, query: str, limit: int = 200) -> list[dict]:
         pattern = f"%{query.translate(LIKE_ESCAPE)}%"
@@ -1901,23 +1956,25 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             # Unscopable subjects: the newest code change anywhere supersedes.
             row = self.db.execute("SELECT MAX(updated_at) AS moved FROM symbols WHERE status='active'").fetchone()
             changed_at = row["moved"] if row else None
+        noun = SUBJECT_NOUNS.get(subject_type, subject_type)
         state = self._verification_applicability(latest["recorded_at"], latest["result"], changed_at, alive,
-                                                 git_commit=latest["git_commit"], indexed=indexed)
-        if subject_type not in ("symbol", "file") and state["applicability"] == "SUPERSEDED" and changed_at:
-            state["reason"] = (f"Code changed at {changed_at} after this was verified at {latest['recorded_at']}. "
-                               f"A {subject_type}-level result cannot be scoped to the code it exercised, so any "
-                               "later change supersedes it.")
+                                                 git_commit=latest["git_commit"], indexed=indexed,
+                                                 subject_type=subject_type, ttl_seconds=self._ttl_for(latest["kind"]))
+        if subject_type not in CODE_SUBJECTS and state["applicability"] == "SUPERSEDED" and changed_at:
+            state["reason"] = (f"The project's source changed at {changed_at} after this was recorded at "
+                               f"{latest['recorded_at']}. {article(noun).capitalize()} {noun}-level result cannot be "
+                               "scoped to the code it exercised, so any later change supersedes it.")
         # A project-level result is tied to the commit it ran against, because
         # nothing narrower is available. This is the only place a differing
         # commit changes the verdict: for a symbol, the content hash is a
         # sharper signal and already decided the question above.
         current_commit = head(self.root)
-        if (state["applicability"] == "CURRENT" and subject_type not in ("symbol", "file")
+        if (state["applicability"] == "CURRENT" and subject_type not in CODE_SUBJECTS
                 and latest["git_commit"] and current_commit and latest["git_commit"] != current_commit):
             state = {**state, "status": "UNKNOWN", "applicability": "SUPERSEDED",
                      "reason": (f"Recorded against commit {latest['git_commit'][:8]}, but the repository is now at "
-                                f"{current_commit[:8]}. A {subject_type}-level result cannot be scoped to the code it "
-                                "exercised, so it does not carry across a commit.")}
+                                f"{current_commit[:8]}. {article(noun).capitalize()} {noun}-level result cannot be "
+                                "scoped to the code it exercised, so it does not carry across a commit.")}
         provenance = {"git_commit": latest["git_commit"] or None,
                       "command": json.loads(latest["command"]) if latest["command"] else None,
                       "exit_code": latest["exit_code"],

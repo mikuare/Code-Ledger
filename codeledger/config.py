@@ -8,6 +8,9 @@ from pathlib import Path
 
 DEFAULT_IGNORES = [".git", ".ai/codeledger", "node_modules", "dist", "build", ".next", ".nuxt", ".cache", "coverage", ".tmp", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "env", "target", "vendor", "tmp", "temp", "logs"]
 SECRET_NAMES = {".env", ".env.local", ".env.production", "id_rsa", "id_ed25519"}
+# Only kinds that observe something *running* get a lifetime. Code-scoped
+# evidence is invalidated by the code changing, never by the clock.
+DEFAULT_EVIDENCE_TTL = {"RUNTIME_PROBE": 3600, "DEPLOY": 86400}
 DEFAULT_SOURCE_EXTENSIONS = [".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".java", ".kt", ".go", ".rs", ".rb", ".php", ".cs", ".cpp", ".c", ".h", ".hpp", ".swift", ".dart", ".vue", ".svelte", ".css", ".scss", ".html", ".sql"]
 
 @dataclass
@@ -26,6 +29,17 @@ class Config:
     # `session_state` says a checkpoint is recommended; CodeLedger never acts on
     # it by itself and never interrupts an agent mid-task.
     checkpoint_threshold_pct: int = 80
+    # How long a verification of each kind describes the present, in seconds.
+    #
+    # Most evidence is invalidated by code changing, not by the clock: a TEST
+    # that passed at this commit is still true tomorrow if nothing moved, so
+    # TEST and BUILD are deliberately absent and never expire. An observation of
+    # something *running* is different — it was true when it was taken and says
+    # nothing about now — so those kinds carry a lifetime.
+    #
+    # A kind absent from this map never expires. Lookup is case-insensitive
+    # because `kind` is free text.
+    evidence_ttl_seconds: dict[str, int] | None = None
 
     @classmethod
     def load(cls, root: Path) -> "Config":
@@ -47,6 +61,29 @@ class Config:
     def __post_init__(self):
         self.ignores = list(dict.fromkeys(DEFAULT_IGNORES + (self.ignores or [])))
         self.source_extensions = [x.lower() if x.startswith(".") else "." + x.lower() for x in (self.source_extensions or DEFAULT_SOURCE_EXTENSIONS)]
+        stored = DEFAULT_EVIDENCE_TTL if self.evidence_ttl_seconds is None else self.evidence_ttl_seconds
+        # `load` promises that a hand-edited or newer-written config degrades to
+        # defaults rather than making the tool unusable, and that promise has to
+        # survive a value of the wrong *shape*, not just an unknown key. A
+        # non-mapping here would otherwise raise out of every command.
+        if not isinstance(stored, dict):
+            stored = DEFAULT_EVIDENCE_TTL
+        lifetimes: dict[str, int] = {}
+        for kind, seconds in stored.items():
+            try:
+                # JSON has one number type, so a lifetime may arrive as a float.
+                # Dropping it silently would read as "never expires", which is
+                # the least safe reading of an unclear value.
+                value = int(float(seconds))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                lifetimes[str(kind).upper()] = value
+        self.evidence_ttl_seconds = lifetimes
+
+    def evidence_ttl(self, kind: str | None) -> int | None:
+        """Seconds this kind of evidence stays current, or None for 'forever'."""
+        return (self.evidence_ttl_seconds or {}).get((kind or "").upper())
 
     def save(self, root: Path) -> None:
         path = root / ".ai" / "codeledger" / "config.json"
