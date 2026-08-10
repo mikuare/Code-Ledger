@@ -4431,3 +4431,53 @@ class EnvironmentReadPrecisionTests(unittest.TestCase):
             self.envs('const a = import.meta.env.VITE_URL;\nconst b = process.env["A_B"];\n'
                       'const c = import.meta.env[chosen];\nconst s = "VITE_URL is a string";\n'),
             {"VITE_URL", "A_B", "<dynamic>"})
+
+
+class EnvironmentEdgeUpgradeTests(unittest.TestCase):
+    """An index built by the previous release must gain the new edges.
+
+    `refresh --changed` skips any file whose analysis stamp is already current,
+    so shipping new extraction without re-stamping leaves every existing project
+    with no `env` or `module` edges at all — and the inventory then reports an
+    empty list for code that plainly reads the environment. Nothing else catches
+    it: the file was fully parsed, just by a version that did not look, so the
+    coverage caveat stays silent and the answer reads as "needs nothing".
+    """
+
+    def test_an_index_from_the_previous_stamp_is_reparsed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text(
+                'import os\nimport psycopg2\n\ndef connect():\n'
+                '    return psycopg2.connect(os.environ["DATABASE_URL"])\n')
+            ledger = Ledger(root); ledger.init()
+
+            # Simulate the state a previous release leaves behind: the file is
+            # indexed and stamped current, but carries none of the new edges.
+            ledger.db.execute("DELETE FROM dependencies WHERE kind IN ('env','module')")
+            ledger.db.execute("UPDATE files SET analysis_version='ast:2'")
+            ledger.db.commit()
+            self.assertEqual(
+                [], ledger.db.execute("SELECT 1 FROM dependencies WHERE kind='env'").fetchall())
+
+            ledger.refresh(changed_only=True)
+            kinds = {row["kind"] for row in ledger.db.execute("SELECT DISTINCT kind FROM dependencies")}
+            self.assertIn("env", kinds, "an upgraded index never gained environment edges")
+            self.assertIn("module", kinds, "an upgraded index never gained module edges")
+            report = ledger.external_dependencies(["app.py"])
+            self.assertIn("DATABASE_URL", {i["name"] for i in report["environment_variables"]})
+            self.assertIn("psycopg2", {i["name"] for i in report["external_packages"]})
+
+    def test_the_upgrade_preserves_symbols_and_history(self):
+        """Re-stamping reparses; it must not destroy what was already recorded."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text('import os\n\ndef connect():\n    return os.environ["DB"]\n')
+            ledger = Ledger(root); ledger.init()
+            before = ledger.db.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+            ledger.db.execute("UPDATE files SET analysis_version='ast:2'"); ledger.db.commit()
+            ledger.refresh(changed_only=True)
+            self.assertIn("connect", {row["name"] for row in ledger.db.execute(
+                "SELECT name FROM symbols WHERE status='active'")}, "a live symbol was retired by the upgrade")
+            self.assertGreaterEqual(ledger.db.execute("SELECT COUNT(*) FROM changes").fetchone()[0], before,
+                                    "change history was lost")

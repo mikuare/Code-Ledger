@@ -506,8 +506,16 @@ def version_for(path: Path) -> str:
     Bumped to 2 when keyword, comment and grammar-vocabulary exclusions landed:
     an index built before them holds symbols like `if` and `v_email`, and the
     stamp is what retires them on the next refresh without a migration.
+
+    Bumped to 3 when `env` and `module` edges landed. Without it an existing
+    index is already stamped current, so `refresh --changed` analyses nothing,
+    no environment or package edge is ever created, and the inventory reports an
+    empty list for a project that plainly reads the environment. Nothing catches
+    that: the file was fully parsed, just by a version that did not look — so
+    the coverage caveat stays silent and the answer reads as "this code needs
+    nothing from outside". Re-stamping makes each file reparse once.
     """
-    return f"{provider_for(path).name}:2"
+    return f"{provider_for(path).name}:3"
 
 def analyze(path: Path, text: str) -> tuple[list[SymbolData], list[tuple[str, str, str]], str, str]:
     """Symbols, edges, provider name, and coverage tier for one file."""

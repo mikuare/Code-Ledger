@@ -239,6 +239,13 @@ two with a guess.
   that reads as "none found".
 - Tree-sitter files are parsed once per analysis rather than twice, and node
   text is decoded only for the nodes that need it.
+- `files.analysis_version` moves to `:3`, so `refresh --changed` reparses each
+  file once and existing projects gain the new `env` and `module` edges. Without
+  it an index built by 0.4.x is already stamped current, nothing is reanalysed,
+  and the inventory reports an empty list for code that plainly reads the
+  environment — with no caveat, because the file *was* fully parsed, just by a
+  version that did not look. Symbols are re-derived, not destroyed, and all
+  change history is preserved; no migration and no schema change.
 
 ## [0.4.0]
 
