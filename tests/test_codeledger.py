@@ -868,7 +868,19 @@ class CodeLedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/"src"/"auth").mkdir(parents=True); (root/"src"/"auth"/"service.ts").write_text("export const authenticate = async () => true;\ninterface Session { id: string }\n")
             ledger=Ledger(root); ledger.init(); names={item["name"] for item in ledger.infer_features()}
-            self.assertIn("Authentication", names); self.assertEqual(ledger.lookup("authenticate")[0]["kind"], "function"); self.assertIn("codeledger mcp", ledger.agent_config("codex")["command"])
+            self.assertIn("Authentication", names); self.assertEqual(ledger.lookup("authenticate")[0]["kind"], "function")
+            # Was `assertIn("codeledger mcp", …)`, which passed only while the
+            # bare name was registered — the defect itself. The property that
+            # actually matters is that the agent is handed something it can
+            # launch without inheriting our PATH.
+            # Form-agnostic on purpose: a console-script install and an
+            # interpreter `-m` fallback are both valid, and which one applies
+            # depends on how CodeLedger was installed.
+            config = ledger.agent_config("codex")
+            launch = config["launch_command"]
+            self.assertTrue(Path(launch[0]).is_absolute())
+            self.assertEqual(launch[launch.index("mcp") + 1], "--root")
+            self.assertEqual(launch[-1], str(root))
 
     def test_edit_in_undecodable_bytes_is_still_detected(self):
         """Two files differing only in undecodable bytes must not share a hash."""
@@ -3128,3 +3140,353 @@ class AnalysisUpgradeTests(unittest.TestCase):
             self.assertEqual(kept["agent"], "codex")
             self.assertEqual(ledger.doctor()["checks"]["schema"], "OK")
             self.assertEqual(ledger.doctor()["checks"]["migrations"], "OK")
+
+
+class McpLaunchCommandTests(unittest.TestCase):
+    """The registered command must be launchable by a process that is not us.
+
+    The reported failure: `setup-agent` registered the bare name `codeledger`,
+    which the agent resolves against its own PATH. A desktop app or an
+    IDE-spawned agent does not inherit the shell that activated a project venv,
+    so the recommended install layout was the one case the registration could
+    not express — and it failed silently.
+    """
+
+    def test_the_registered_executable_is_never_a_bare_name(self):
+        from codeledger.core import mcp_launch_command
+        command = mcp_launch_command(Path("/tmp/project"))
+        self.assertTrue(Path(command[0]).is_absolute(),
+                        f"{command[0]!r} would be resolved against the agent's PATH")
+        self.assertIn("--root", command)
+        self.assertEqual(command[command.index("--root") + 1], "/tmp/project")
+
+    def test_a_project_local_virtualenv_is_preferred(self):
+        """The console script beside the running interpreter wins."""
+        from codeledger import core
+        with tempfile.TemporaryDirectory() as directory:
+            venv_bin = Path(directory) / ".venv" / "bin"; venv_bin.mkdir(parents=True)
+            script = venv_bin / ("codeledger.exe" if os.name == "nt" else "codeledger")
+            script.write_text("#!/bin/sh\n"); script.chmod(0o755)
+            original = sys.executable
+            try:
+                sys.executable = str(venv_bin / "python")
+                command = core.mcp_launch_command(Path("/tmp/project"))
+            finally:
+                sys.executable = original
+            self.assertEqual(command[0], str(script))
+
+    def test_a_virtualenv_symlink_is_not_resolved_away(self):
+        """`.venv/bin/python` symlinks to the system interpreter.
+
+        Resolving it walks out of the virtualenv and loses the install being
+        looked for — which is exactly what the first draft of this did, and what
+        the doctor self-test caught.
+        """
+        from codeledger import core
+        with tempfile.TemporaryDirectory() as directory:
+            system_bin = Path(directory) / "usr" / "bin"; system_bin.mkdir(parents=True)
+            (system_bin / "python3").write_text("#!/bin/sh\n")
+            venv_bin = Path(directory) / ".venv" / "bin"; venv_bin.mkdir(parents=True)
+            script = venv_bin / ("codeledger.exe" if os.name == "nt" else "codeledger")
+            script.write_text("#!/bin/sh\n"); script.chmod(0o755)
+            try:
+                (venv_bin / "python").symlink_to(system_bin / "python3")
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            original = sys.executable
+            try:
+                sys.executable = str(venv_bin / "python")
+                command = core.mcp_launch_command(Path("/tmp/project"))
+            finally:
+                sys.executable = original
+            self.assertEqual(command[0], str(script),
+                             "the venv symlink was resolved away and the system interpreter was chosen")
+
+    def test_paths_containing_spaces_survive_as_argv(self):
+        from codeledger.core import mcp_launch_command
+        root = Path("/tmp/a project/with spaces")
+        command = mcp_launch_command(root)
+        self.assertEqual(command[command.index("--root") + 1], str(root),
+                         "the root must stay one argv element, not be split on the space")
+
+    def test_the_interpreter_fallback_needs_no_console_script(self):
+        """With no script and nothing on PATH, `-m` still works."""
+        from codeledger import core
+        with tempfile.TemporaryDirectory() as directory:
+            empty_bin = Path(directory) / "bin"; empty_bin.mkdir()
+            original_exe, original_which = sys.executable, core.shutil.which
+            try:
+                sys.executable = str(empty_bin / "python")
+                core.shutil.which = lambda name: None
+                command = core.mcp_launch_command(Path("/tmp/project"))
+            finally:
+                sys.executable = original_exe; core.shutil.which = original_which
+            self.assertEqual(command[:3], [str(empty_bin / "python"), "-m", "codeledger.cli"])
+
+    def test_agent_config_quotes_only_what_needs_quoting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Ledger(Path(directory))
+            config = ledger.agent_config("claude-code")
+            self.assertIsInstance(config["launch_command"], list)
+            self.assertNotIn(" -- codeledger mcp", config["command"],
+                             "the bare-name form must not be emitted any more")
+            for part in config["launch_command"]:
+                if " " in part:
+                    self.assertIn(f'"{part}"', config["command"])
+
+
+class McpSelfTestTests(unittest.TestCase):
+    """Doctor must prove an MCP client can connect, not that a file exists."""
+
+    def test_a_real_handshake_succeeds_and_reports_the_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "a project with spaces"; root.mkdir()
+            (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            result = ledger.mcp_selftest()
+            self.assertEqual(result["status"], "OK", result)
+            self.assertEqual(Path(result["reported_root"]), root.resolve())
+            self.assertGreaterEqual(result["tools_exposed"], 20)
+            self.assertEqual(result["stderr"], "")
+            self.assertFalse(result["agent_environment_verified"],
+                             "doctor must not claim to have verified the agent's own environment")
+
+    def test_a_missing_executable_is_reported_as_a_launch_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.mcp_command = lambda: ["/nonexistent/codeledger", "mcp", "--root", str(root)]
+            result = ledger.mcp_selftest()
+            self.assertEqual(result["status"], "LAUNCH_FAILED", result)
+            self.assertIn("does not exist", result["detail"])
+
+    def test_an_executable_that_is_not_codeledger_fails_to_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.mcp_command = lambda: [sys.executable, "-c", "raise SystemExit(3)", "mcp", "--root", str(root)]
+            result = ledger.mcp_selftest()
+            self.assertEqual(result["status"], "LAUNCH_FAILED", result)
+
+    def test_a_server_that_never_answers_is_a_handshake_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            # Answers --version, then exits without speaking MCP.
+            ledger.mcp_command = lambda: [
+                sys.executable, "-c",
+                "import sys\n"
+                "if '--version' in sys.argv: print('0.0.0'); raise SystemExit(0)\n"
+                "raise SystemExit(0)\n",
+                "mcp", "--root", str(root)]
+            result = ledger.mcp_selftest()
+            self.assertEqual(result["status"], "HANDSHAKE_FAILED", result)
+
+    def test_a_server_bound_to_another_project_is_a_root_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "intended"; root.mkdir()
+            (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            elsewhere = Path(directory) / "elsewhere"; elsewhere.mkdir()
+            (elsewhere / "other.py").write_text("def other():\n    return 2\n")
+            Ledger(elsewhere).init()
+            command = ledger.mcp_command()
+            ledger.mcp_command = lambda: [*command[:command.index("--root")], "--root", str(elsewhere)]
+            result = ledger.mcp_selftest()
+            self.assertEqual(result["status"], "ROOT_MISMATCH", result)
+            self.assertIn("different project", result["detail"])
+
+    def test_a_reduced_tool_surface_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.mcp_command = lambda: [
+                sys.executable, "-c",
+                "import sys, json\n"
+                "if '--version' in sys.argv: print('0.0.0'); raise SystemExit(0)\n"
+                "for line in sys.stdin:\n"
+                "    m = json.loads(line)\n"
+                "    if m.get('method') == 'initialize':\n"
+                "        r = {'protocolVersion':'2024-11-05','serverInfo':{'name':'codeledger','version':'x',"
+                f"        'root': {str(root)!r}, 'status':'READY'}}}}\n"
+                "    else:\n"
+                "        r = {'tools': [{'name': 'codeledger_get_context'}]}\n"
+                "    print(json.dumps({'jsonrpc':'2.0','id':m.get('id'),'result':r}), flush=True)\n",
+                "mcp", "--root", str(root)]
+            result = ledger.mcp_selftest()
+            self.assertEqual(result["status"], "TOOL_SURFACE_MISMATCH", result)
+            self.assertTrue(result["missing_tools"])
+
+    def test_doctor_surfaces_the_mcp_result_and_can_skip_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            self.assertNotIn("mcp_server", ledger.doctor(check_mcp=False)["checks"])
+            report = ledger.doctor()
+            self.assertIn("mcp_server", report["checks"])
+            self.assertTrue(report["checks"]["mcp_server"].startswith("OK"), report["checks"]["mcp_server"])
+
+    def test_doctor_recommends_re_registration_when_mcp_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "app.py").write_text("def run():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            ledger.mcp_command = lambda: ["/nonexistent/codeledger", "mcp", "--root", str(root)]
+            report = ledger.doctor()
+            self.assertTrue(report["checks"]["mcp_server"].startswith("LAUNCH_FAILED"))
+            self.assertTrue(any("setup-agent" in action for action in report["recommended_actions"]))
+
+
+class McpRootSafetyTests(unittest.TestCase):
+    """An MCP server must never invent a project by being started in one."""
+
+    def run_server(self, cwd, args, calls=()):
+        messages = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "x"}}}]
+        messages += [{"jsonrpc": "2.0", "id": index + 2, "method": "tools/call",
+                      "params": {"name": name, "arguments": {}}} for index, name in enumerate(calls)]
+        completed = subprocess.run([sys.executable, "-m", "codeledger.cli", "mcp", *args],
+                                   input="\n".join(json.dumps(m) for m in messages) + "\n",
+                                   capture_output=True, text=True, cwd=cwd,
+                                   env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)})
+        return [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+
+    def test_an_uninitialised_directory_is_reported_not_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            replies = self.run_server(directory, [], calls=["codeledger_get_context"])
+            info = replies[0]["result"]["serverInfo"]
+            self.assertEqual(info["status"], "NOT_INITIALISED")
+            self.assertEqual(Path(info["root"]), Path(directory).resolve())
+            self.assertEqual(replies[1]["result"]["structuredContent"]["status"], "NOT_INITIALISED")
+            self.assertFalse((Path(directory) / ".ai").exists(),
+                             "a ledger was created in a directory that was never initialised")
+
+    def test_an_initialised_project_reports_its_root_in_the_handshake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "a project with spaces"; root.mkdir()
+            (root / "app.py").write_text("def run():\n    return 1\n")
+            Ledger(root).init()
+            elsewhere = Path(directory) / "elsewhere"; elsewhere.mkdir()
+            replies = self.run_server(elsewhere, ["--root", str(root)])
+            info = replies[0]["result"]["serverInfo"]
+            self.assertEqual(info["status"], "READY")
+            self.assertEqual(Path(info["root"]), root.resolve())
+            self.assertGreaterEqual(info["indexed_files"], 1)
+            self.assertFalse((elsewhere / ".ai").exists())
+
+
+class VerificationInvalidationTests(unittest.TestCase):
+    """A verification describes a code state, not a name.
+
+    Reproduced before the fix: verify(symbol, PASSED) → edit the symbol →
+    refresh → the symbol still advertised PASSED. That is the one field capable
+    of talking an agent out of running the test that would catch a regression.
+    """
+
+    def project(self, directory):
+        root = Path(directory)
+        (root / "pay.py").write_text("def charge(amount):\n    return amount * 2\n\n\ndef refund(amount):\n    return amount\n")
+        ledger = Ledger(root); ledger.init()
+        return ledger, root / "pay.py"
+
+    def symbol(self, ledger, name):
+        return next(row for row in ledger.lookup(name) if row["name"] == name)
+
+    def test_an_unchanged_symbol_keeps_its_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            ledger.verify("symbol", "charge", "TEST", "PASSED", "3 tests")
+            ledger.refresh(True)
+            charge = self.symbol(ledger, "charge")
+            self.assertEqual(charge["last_verified"], "PASSED")
+            self.assertEqual(charge["verification"]["applicability"], "CURRENT")
+            self.assertEqual(ledger.verification_state("symbol", "charge")["status"], "PASSED")
+
+    def test_changing_the_verified_symbol_makes_the_evidence_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("symbol", "charge", "TEST", "PASSED", "3 tests")
+            source.write_text("def charge(amount):\n    return amount * 3\n\n\ndef refund(amount):\n    return amount\n")
+            ledger.refresh(True)
+
+            charge = self.symbol(ledger, "charge")
+            self.assertIsNone(charge["last_verified"], "a changed symbol still advertised a PASSED verification")
+            state = charge["verification"]
+            self.assertEqual(state["applicability"], "SUPERSEDED")
+            self.assertEqual(state["status"], "UNKNOWN")
+            self.assertEqual(state["result_recorded"], "PASSED", "the historical result must remain visible")
+            self.assertIn("no longer exists", state["reason"])
+
+    def test_changing_an_unrelated_symbol_leaves_the_verification_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("symbol", "charge", "TEST", "PASSED", "3 tests")
+            source.write_text("def charge(amount):\n    return amount * 2\n\n\ndef refund(amount):\n    return amount + 1\n")
+            ledger.refresh(True)
+            self.assertEqual(self.symbol(ledger, "charge")["verification"]["applicability"], "CURRENT")
+            self.assertEqual(self.symbol(ledger, "charge")["last_verified"], "PASSED")
+
+    def test_a_comment_edit_does_not_invalidate_a_verification(self):
+        """Staleness follows the code hash, which ignores comments and layout."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            source.write_text("def charge(amount):\n    # unchanged behaviour\n    return amount * 2\n\n\ndef refund(amount):\n    return amount\n")
+            ledger.refresh(True)
+            self.assertEqual(self.symbol(ledger, "charge")["verification"]["applicability"], "CURRENT")
+
+    def test_history_is_preserved_when_evidence_goes_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("symbol", "charge", "TEST", "PASSED", "first run")
+            source.write_text("def charge(amount):\n    return amount * 3\n\n\ndef refund(amount):\n    return amount\n")
+            ledger.refresh(True)
+            rows = ledger.db.execute("SELECT result,evidence FROM verifications WHERE subject_id='charge'").fetchall()
+            self.assertEqual([row["result"] for row in rows], ["PASSED"], "the record was deleted rather than superseded")
+            self.assertEqual(rows[0]["evidence"], "first run")
+            self.assertEqual(ledger.verification_state("symbol", "charge")["history_count"], 1)
+
+    def test_a_deleted_symbol_cannot_remain_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("symbol", "charge", "TEST", "PASSED")
+            source.write_text("def refund(amount):\n    return amount\n")
+            ledger.refresh(True)
+            state = ledger.verification_state("symbol", "charge")
+            self.assertEqual(state["applicability"], "SUPERSEDED")
+            self.assertIn("deleted", state["reason"])
+
+    def test_nothing_verified_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            state = ledger.verification_state("symbol", "refund")
+            self.assertEqual(state["status"], "UNKNOWN")
+            self.assertEqual(state["applicability"], "NONE")
+            self.assertNotIn("verification", self.symbol(ledger, "refund"))
+
+    def test_a_project_verification_is_superseded_by_any_later_change(self):
+        """Unscopable evidence errs toward UNKNOWN, never toward PASSED."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, source = self.project(directory)
+            ledger.verify("project", "project", "TEST", "PASSED", "suite green")
+            self.assertEqual(ledger.verification_state("project", "project")["status"], "PASSED")
+            source.write_text("def charge(amount):\n    return amount * 9\n\n\ndef refund(amount):\n    return amount\n")
+            ledger.refresh(True)
+            state = ledger.verification_state("project", "project")
+            self.assertEqual(state["status"], "UNKNOWN")
+            self.assertEqual(state["result_recorded"], "PASSED")
+            self.assertIn("cannot be scoped", state["reason"])
+
+    def test_verify_reports_what_the_result_is_worth_now(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            record = ledger.verify("symbol", "charge", "TEST", "PASSED")
+            self.assertEqual(record["state"]["applicability"], "CURRENT")
+
+    def test_a_legacy_last_verified_column_is_not_trusted(self):
+        """A value with no dated evidence behind it cannot be dated against code."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger, _source = self.project(directory)
+            ledger.db.execute("UPDATE symbols SET last_verified='PASSED' WHERE name='charge'")
+            ledger.db.commit()
+            charge = self.symbol(ledger, "charge")
+            self.assertIsNone(charge["last_verified"])
+            self.assertEqual(charge["verification"]["applicability"], "UNVERIFIABLE")

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
+import sys
 import uuid
 import os
 import socket
+import tempfile
 import time
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -78,6 +81,44 @@ CHANGE_LIST_LIMIT = 20
 # databases. They mean the same as 'ended' and are never rewritten.
 ENDED = ("ended", "completed", "failed")
 TERMINAL = ENDED + ("stale", "crashed")
+
+def mcp_launch_command(root: Path) -> list[str]:
+    """The argv an external agent must use to launch *this* CodeLedger's MCP server.
+
+    Registering the bare name `codeledger` was the defect: the agent resolves it
+    against its own PATH, and a desktop app, an IDE extension or a
+    service-started agent does not inherit the shell that activated a project
+    venv. So a project-local install — the recommended layout — was exactly the
+    case the registration could not express, and the failure was silent.
+
+    Resolution prefers the console script beside the interpreter that is running
+    right now, because that is the one install we can prove exists. Every branch
+    returns an absolute path or an explicit interpreter invocation; none returns
+    a bare name for someone else's PATH to resolve. Nothing here is specific to
+    a machine — it is all derived from the running process.
+    """
+    # Deliberately NOT resolved: a virtualenv's `bin/python` is a symlink to the
+    # system interpreter, so resolving it walks straight out of the venv and
+    # loses the very install we are trying to find. `sys.executable` as given is
+    # the venv path, and its sibling `bin/` is where the console script lives.
+    interpreter = Path(sys.executable)
+    script = interpreter.parent / ("codeledger.exe" if os.name == "nt" else "codeledger")
+    if script.is_file():
+        return [str(script), "mcp", "--root", str(root)]
+    # Installed, but the console script is not beside this interpreter (a
+    # `pipx` layout, or an interpreter invoked directly). argv[0] is the next
+    # best evidence of how this process was actually started.
+    argv0 = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
+    if argv0 and argv0.is_file() and argv0.stem == "codeledger":
+        return [str(argv0), "mcp", "--root", str(root)]
+    found = shutil.which("codeledger")
+    if found:
+        # On PATH for us. Register the absolute path anyway, so the agent does
+        # not have to have the same PATH we do.
+        return [str(Path(found).absolute()), "mcp", "--root", str(root)]
+    # Always available: this interpreter can import codeledger, because it is
+    # running it. `-m` needs no console script and no PATH entry at all.
+    return [str(interpreter), "-m", "codeledger.cli", "mcp", "--root", str(root)]
 
 def parse_time(value: str | None) -> datetime | None:
     if not value: return None
@@ -694,7 +735,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         result["stale_sessions"] = [item["session_id"] for name in ("stale", "crashed") for item in sessions["by_status"].get(name, [])]
         return result
 
-    def doctor(self) -> dict:
+    def doctor(self, check_mcp: bool = True) -> dict:
         """One command that answers "is this ledger telling me the truth?"
 
         Every check reports what it found rather than a bare OK, and anything
@@ -727,13 +768,126 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         checks["config"] = "OK" if (self.root / ".ai" / "codeledger" / "config.json").exists() else "using defaults (no config.json)"
         checks["storage_ignored"] = "OK" if self.config.is_ignored(Path(".ai/codeledger"), self.root) else "WARNING — CodeLedger is indexing its own database"
 
+        # A healthy ledger no agent can reach is the failure this exists to
+        # catch: every check above passed while the registered MCP command could
+        # not be launched at all.
+        mcp = self.mcp_selftest() if check_mcp else None
+        if mcp:
+            checks["mcp_server"] = {
+                "OK": f"OK — handshake succeeded, {mcp.get('tools_exposed')} tools, bound to {mcp.get('reported_root')}",
+                "OK_WITH_WARNINGS": f"OK (with warnings) — {mcp['detail']}",
+            }.get(mcp["status"], f"{mcp['status']} — {mcp['detail']}")
+
         actions = []
         if dead: actions.append("codeledger session reconcile")
         if status["stale_files"]: actions.append("codeledger refresh --changed")
         if analysis["shallow_languages"]: actions.append(analysis["hint"])
         if not protocols: actions.append("codeledger init")
-        return {"checks": checks, "reconciled_now": reconciled["transitions"], "stale_sessions": dead,
-                "active_agents": self.active_agents(reconcile=False), "recommended_actions": actions or ["none"]}
+        if mcp and mcp["status"] not in ("OK", "OK_WITH_WARNINGS"):
+            actions.append("codeledger setup-agent <agent>   # re-register the MCP server with a launchable command")
+        result = {"checks": checks, "reconciled_now": reconciled["transitions"], "stale_sessions": dead,
+                  "active_agents": self.active_agents(reconcile=False), "recommended_actions": actions or ["none"]}
+        if mcp: result["mcp"] = mcp
+        return result
+
+    def mcp_selftest(self, timeout: float = 30.0) -> dict:
+        """Launch the registered MCP command and complete a real handshake.
+
+        Checking that a file exists proves nothing: the reported failure was a
+        command that existed conceptually and could not be launched by the
+        process that needed it. So this runs the exact argv an agent would run,
+        from a *different* working directory, and reads the protocol back.
+
+        Running from elsewhere is deliberate — it is what proves `--root` is
+        doing the binding. If the root argument were wrong or missing, the
+        server would resolve to the temporary directory and answer
+        NOT_INITIALISED, which shows up here as ROOT_MISMATCH rather than as a
+        healthy server pointed at nothing.
+
+        What this cannot prove is that *your* agent can launch it: the agent's
+        own environment is not visible from here, and the result says so.
+        """
+        from .mcp import TOOLS
+        command = self.mcp_command()
+        executable = command[0]
+        report = {"command": command, "executable": executable, "expected_root": str(self.root),
+                  "agent_environment_verified": False,
+                  "note": ("Verified by launching the server from this process. An agent runs it from its own "
+                           "environment, which cannot be inspected from here, so a pass does not guarantee the "
+                           "agent will succeed — only that the command itself is launchable and correct.")}
+
+        def fail(status, detail, **extra):
+            return {**report, "status": status, "detail": detail, **extra}
+
+        if not Path(executable).exists():
+            return fail("LAUNCH_FAILED", f"{executable} does not exist. Reinstall CodeLedger, or re-run `codeledger setup-agent <agent>` after moving the virtualenv.")
+        # A neutral directory: also proves the server creates nothing where it
+        # happens to be started.
+        workdir = tempfile.gettempdir()
+        # Everything before `mcp` is how CodeLedger is invoked; swapping the
+        # subcommand for --version proves the executable runs and is CodeLedger,
+        # separately from whether the MCP server works.
+        invocation = command[:command.index("mcp")] if "mcp" in command else [executable]
+        version_argv = [*invocation, "--version"]
+        try:
+            version = subprocess.run(version_argv, capture_output=True, text=True, timeout=timeout, cwd=workdir)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return fail("LAUNCH_FAILED", f"{' '.join(version_argv)} could not be executed: {exc}")
+        if version.returncode != 0:
+            return fail("LAUNCH_FAILED", f"{' '.join(version_argv)} exited {version.returncode}: {(version.stderr or '').strip()[:300]}")
+        report["version"] = (version.stdout or version.stderr).strip()
+
+        handshake = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "params": {"clientInfo": {"name": "codeledger-doctor"}}})
+        listing = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        try:
+            completed = subprocess.run([*command, "--agent", "codeledger-doctor"],
+                                       input=f"{handshake}\n{listing}\n", capture_output=True, text=True,
+                                       timeout=timeout, cwd=workdir)
+        except subprocess.TimeoutExpired:
+            return fail("HANDSHAKE_FAILED", f"the MCP server did not respond within {timeout:g}s")
+        except (OSError, subprocess.SubprocessError) as exc:
+            return fail("LAUNCH_FAILED", f"the MCP server could not be started: {exc}")
+
+        stderr = (completed.stderr or "").strip()
+        report["stderr"] = stderr[:500]
+        replies = {}
+        for line in (completed.stdout or "").splitlines():
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and message.get("id") is not None:
+                replies[message["id"]] = message
+        if 1 not in replies or "result" not in replies.get(1, {}):
+            detail = f"no initialize response; the process exited {completed.returncode}"
+            if stderr: detail += f" with stderr: {stderr[:300]}"
+            return fail("HANDSHAKE_FAILED", detail)
+
+        info = replies[1]["result"].get("serverInfo") or {}
+        report["protocol_version"] = replies[1]["result"].get("protocolVersion")
+        report["reported_root"] = info.get("root")
+        report["server_status"] = info.get("status")
+        if info.get("status") == "NOT_INITIALISED" or (info.get("root") and Path(info["root"]) != self.root):
+            return fail("ROOT_MISMATCH",
+                        f"the server bound to {info.get('root')!r}, not {str(self.root)!r}. The registered command's "
+                        "--root is wrong or missing, so an agent would be querying a different project.")
+
+        exposed = {tool.get("name") for tool in (replies.get(2, {}).get("result", {}).get("tools") or [])}
+        report["tools_exposed"] = len(exposed)
+        missing = sorted({name for name, _ in TOOLS} - exposed)
+        if missing:
+            return fail("TOOL_SURFACE_MISMATCH",
+                        f"{len(missing)} expected tool(s) absent, starting with {', '.join(missing[:5])}. "
+                        "The launched executable is probably a different CodeLedger version than this one.",
+                        missing_tools=missing[:10])
+        # stderr is reported either way; a server that answered correctly while
+        # printing to stderr is working but worth looking at.
+        if stderr:
+            return {**report, "status": "OK_WITH_WARNINGS",
+                    "detail": f"handshake succeeded, but the server wrote to stderr: {stderr[:300]}"}
+        return {**report, "status": "OK",
+                "detail": f"launched {executable}, completed the MCP handshake, and exposed {len(exposed)} tools bound to {self.root}."}
 
     def coverage_report(self) -> dict:
         """How much of this project is actually analysed, by language.
@@ -760,8 +914,63 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             imported += 1
         self.db.commit(); return {"commits_imported": imported, "commit_files_imported": files}
 
+    def _symbol_verifications(self, names) -> dict[str, tuple]:
+        """Latest verification per symbol name, in one query.
+
+        Deliberately not a correlated subquery on `lookup`: `verifications` has
+        no index on (subject_type, subject_id), so a per-row lookup made
+        `handshake` five times slower — `search_symbols` calls `lookup` once per
+        salient word, and each call would rescan the table for every row. One
+        bounded query per lookup, skipped entirely when nothing has ever been
+        verified, keeps the common case free.
+        """
+        if not names: return {}
+        if not self.db.execute("SELECT 1 FROM verifications WHERE subject_type='symbol' LIMIT 1").fetchone():
+            return {}
+        names = list(names)
+        latest: dict[str, tuple] = {}
+        for row in self.db.execute(
+                f"SELECT subject_id,recorded_at,result FROM verifications WHERE subject_type='symbol' "
+                f"AND subject_id IN ({','.join('?' * len(names))}) ORDER BY recorded_at, id", tuple(names)):
+            latest[row["subject_id"]] = (row["recorded_at"], row["result"])   # ordered, so the last wins
+        return latest
+
     @staticmethod
-    def _present_symbol(row) -> dict:
+    def _verification_applicability(verified_at, verified_result, code_changed_at, alive: bool) -> dict:
+        """Does this verification still describe the code that exists now?
+
+        Evidence is about a code state, not about a name. `symbols.updated_at`
+        moves only when a symbol's content hash changes — reformatting and
+        comment edits leave it alone — so it is exactly the line between
+        "verified and untouched since" and "verified, then rewritten". Comparing
+        the two timestamps needs no new column and no new subsystem.
+
+        Nothing is deleted and nothing is invented: the recorded result is still
+        reported, under a status that says what it is now worth.
+        """
+        if not verified_result:
+            return {"status": "UNKNOWN", "applicability": "NONE",
+                    "reason": "No verification has been recorded for this symbol."}
+        if not alive:
+            return {"status": "UNKNOWN", "applicability": "SUPERSEDED", "result_recorded": verified_result,
+                    "verified_at": verified_at,
+                    "reason": "The symbol has been deleted since it was verified."}
+        if not verified_at:
+            # A `last_verified` value with no dated row behind it — written by a
+            # release before verifications were checked for applicability.
+            return {"status": "UNKNOWN", "applicability": "UNVERIFIABLE", "result_recorded": verified_result,
+                    "reason": "The verification predates applicability tracking, so it cannot be dated against the code."}
+        if code_changed_at and code_changed_at > verified_at:
+            return {"status": "UNKNOWN", "applicability": "SUPERSEDED", "result_recorded": verified_result,
+                    "verified_at": verified_at, "code_changed_at": code_changed_at,
+                    "reason": (f"The symbol changed at {code_changed_at} after being verified at {verified_at}. "
+                               "The recorded result describes code that no longer exists.")}
+        return {"status": verified_result, "applicability": "CURRENT", "result_recorded": verified_result,
+                "verified_at": verified_at, "code_changed_at": code_changed_at,
+                "reason": "The symbol has not changed since it was verified."}
+
+    @staticmethod
+    def _present_symbol(row, verification=None) -> dict:
         """One representation rule for a symbol, applied wherever one is shown.
 
         A symbol that no longer exists has no current line and no current
@@ -771,7 +980,19 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         moves under `historical`, where nothing can mistake it for the present.
         """
         record = dict(row)
-        if record.get("status") == "active":
+        alive = record.get("status") == "active"
+        # Verification travels with the symbol, because that is where an agent
+        # reads it. A stale PASSED is worse than no answer: it is the one field
+        # that could talk an agent out of running the test that would have
+        # caught the regression.
+        verified_at, verified_result = verification or (None, None)
+        verification = Ledger._verification_applicability(
+            verified_at, verified_result or record.get("last_verified"), record.get("updated_at"), alive)
+        if verification["applicability"] != "NONE":
+            record["verification"] = verification
+        # The bare column keeps its meaning only while the evidence still holds.
+        record["last_verified"] = verification["result_recorded"] if verification["applicability"] == "CURRENT" else None
+        if alive:
             return record
         record["historical"] = {"line_start": record.get("line_start"), "line_end": record.get("line_end"),
                                 "signature": record.get("signature"), "deleted_at": record.get("deleted_at")}
@@ -783,7 +1004,8 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # result set is bounded so a one-character query cannot fan out.
         pattern = f"%{query.translate(LIKE_ESCAPE)}%"
         rows = self.db.execute("SELECT s.*,f.path FROM symbols s JOIN files f ON f.id=s.file_id WHERE s.name LIKE ? ESCAPE '\\' OR s.qualified_name LIKE ? ESCAPE '\\' ORDER BY s.status='active' DESC,s.name LIMIT ?", (pattern, pattern, limit)).fetchall()
-        return [self._present_symbol(r) for r in rows]
+        verified = self._symbol_verifications({row["name"] for row in rows})
+        return [self._present_symbol(r, verified.get(r["name"])) for r in rows]
 
     def history(self, query: str, limit: int = 200) -> list[dict]:
         pattern = f"%{query.translate(LIKE_ESCAPE)}%"
@@ -1602,6 +1824,52 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if commit: self.db.commit()
         return change_id
 
+    def verification_state(self, subject_type: str, subject_id: str) -> dict:
+        """Is the newest verification for this subject still worth anything?
+
+        Answered from what is already recorded: the verification's timestamp
+        against the moment the code it covers last changed. No new table, and no
+        result is ever invented — a superseded PASSED becomes UNKNOWN with the
+        original result still visible under `result_recorded`.
+
+        Scope honesty differs by subject. A symbol is precise: its own hash
+        moved or it did not. `project` and `feature` verifications cannot be
+        scoped to the code they actually exercised, so *any* later symbol change
+        supersedes them. That is deliberately conservative — it errs toward
+        UNKNOWN, never toward a PASSED the evidence cannot support.
+        """
+        latest = self.db.execute(
+            "SELECT * FROM verifications WHERE subject_type=? AND subject_id=? ORDER BY recorded_at DESC, id DESC LIMIT 1",
+            (subject_type, subject_id)).fetchone()
+        history = self.db.execute(
+            "SELECT count(*) FROM verifications WHERE subject_type=? AND subject_id=?",
+            (subject_type, subject_id)).fetchone()[0]
+        if latest is None:
+            return {"subject_type": subject_type, "subject_id": subject_id, "status": "UNKNOWN",
+                    "applicability": "NONE", "history_count": 0,
+                    "reason": "Nothing has been verified for this subject."}
+        alive, changed_at = True, None
+        if subject_type == "symbol":
+            row = self.db.execute("SELECT status,updated_at FROM symbols WHERE name=? ORDER BY status='active' DESC, updated_at DESC LIMIT 1",
+                                  (subject_id,)).fetchone()
+            alive = bool(row) and row["status"] == "active"
+            changed_at = row["updated_at"] if row else None
+        elif subject_type == "file":
+            row = self.db.execute("SELECT status,last_analyzed FROM files WHERE path=?", (subject_id,)).fetchone()
+            alive = bool(row) and row["status"] != "deleted"
+            changed_at = row["last_analyzed"] if row else None
+        else:
+            # Unscopable subjects: the newest code change anywhere supersedes.
+            row = self.db.execute("SELECT MAX(updated_at) AS moved FROM symbols WHERE status='active'").fetchone()
+            changed_at = row["moved"] if row else None
+        state = self._verification_applicability(latest["recorded_at"], latest["result"], changed_at, alive)
+        if subject_type not in ("symbol", "file") and state["applicability"] == "SUPERSEDED":
+            state["reason"] = (f"Code changed at {changed_at} after this was verified at {latest['recorded_at']}. "
+                               f"A {subject_type}-level result cannot be scoped to the code it exercised, so any "
+                               "later change supersedes it.")
+        return {"subject_type": subject_type, "subject_id": subject_id, "kind": latest["kind"],
+                "history_count": history, **state}
+
     def verify(self, subject_type: str, subject_id: str, kind: str, result: str, evidence: str = "") -> dict:
         now = NOW()
         self.db.execute("INSERT INTO verifications(subject_type,subject_id,kind,result,evidence,recorded_at) VALUES(?,?,?,?,?,?)", (subject_type, subject_id, kind, result.upper(), evidence, now))
@@ -1609,7 +1877,12 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             self.db.execute("UPDATE symbols SET last_verified=? WHERE name=? AND status='active'", (result.upper(), subject_id))
         elif subject_type == "feature":
             self.db.execute("UPDATE features SET last_verified=?,status=? WHERE name=?", (now, result.upper() if result.upper() in {"WORKING", "BROKEN", "PARTIAL"} else "UNVERIFIED", subject_id))
-        self.db.commit(); record = {"subject_type": subject_type, "subject_id": subject_id, "kind": kind, "result": result.upper(), "evidence": evidence, "recorded_at": now}; record["regressions"] = self.regressions(subject_type, subject_id); return record
+        self.db.commit(); record = {"subject_type": subject_type, "subject_id": subject_id, "kind": kind, "result": result.upper(), "evidence": evidence, "recorded_at": now}
+        record["regressions"] = self.regressions(subject_type, subject_id)
+        # What this result is worth *now*, computed the same way every reader
+        # computes it. Recorded and current are different questions.
+        record["state"] = self.verification_state(subject_type, subject_id)
+        return record
 
     def verify_command(self, subject_type: str, subject_id: str, kind: str, command: list[str], evidence: str = "") -> dict:
         if not command:
@@ -1667,10 +1940,23 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             result.append({"name": name, "files": sorted(paths), "status": "UNKNOWN", "evidence": "path and naming analysis"})
         self.db.commit(); return result
 
+    def mcp_command(self) -> list[str]:
+        """How this project's MCP server should be launched. One source of truth.
+
+        Every agent registration and the doctor self-test read this, so the path
+        logic exists once rather than once per vendor.
+        """
+        return mcp_launch_command(self.root)
+
     def agent_config(self, agent: str) -> dict:
         executable = {"codex": "codex", "claude-code": "claude", "gemini": "gemini", "aider": "aider", "cursor": "cursor"}.get(agent, agent)
-        command = f"{executable} mcp add codeledger -- codeledger mcp --root \"{self.root}\""
-        return {"agent": agent, "command": command, "server": "codeledger", "transport": "stdio", "root": str(self.root), "note": "Agent CLI syntax may vary by version; use this command as the setup template and verify its output."}
+        launch = self.mcp_command()
+        # Quoted for copy/paste into a shell: the interpreter path, the project
+        # root, or both may contain spaces.
+        printable = " ".join(f'"{part}"' if " " in part else part for part in launch)
+        return {"agent": agent, "command": f"{executable} mcp add codeledger -- {printable}",
+                "launch_command": launch, "server": "codeledger", "transport": "stdio", "root": str(self.root),
+                "note": "Agent CLI syntax may vary by version; use this command as the setup template and verify its output."}
 
     def why(self, query: str) -> dict:
         symbols = self.lookup(query)

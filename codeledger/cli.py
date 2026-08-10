@@ -218,6 +218,14 @@ def emit_doctor(value, as_json=False):
     width = max(len(name) for name in value["checks"])
     for name, outcome in value["checks"].items():
         print(f"{name.replace('_',' ').title():<{width + 2}} {outcome}")
+    mcp = value.get("mcp")
+    if mcp and mcp["status"] not in ("OK", "OK_WITH_WARNINGS"):
+        print(f"\nMCP SELF-TEST — {mcp['status']}")
+        print(f"   {mcp['detail']}")
+        print(f"   command: {' '.join(mcp['command'])}")
+    elif mcp:
+        print(f"\nMCP self-test: {mcp['status']} — {mcp.get('tools_exposed')} tools, root {mcp.get('reported_root')}")
+        print(f"   {mcp['note']}")
     if value["stale_sessions"]:
         print("\nStale sessions:")
         for row in value["stale_sessions"]:
@@ -290,8 +298,12 @@ def build_parser():
     tests_cmd.add_argument("--files", nargs="*", default=[])
     tests_cmd.add_argument("--symbols", nargs="*", default=[])
 
-    for name in ("changes", "issues", "decisions", "export", "doctor"):
+    for name in ("changes", "issues", "decisions", "export"):
         add(name)
+
+    doctor_cmd = add("doctor", "Diagnose the ledger, including a real MCP handshake")
+    doctor_cmd.add_argument("--no-mcp", action="store_true",
+                            help="Skip the MCP self-test (it launches a short-lived subprocess)")
 
     issue = add("issue", "Record or update a known issue")
     issue.add_argument("key"); issue.add_argument("title")
@@ -388,29 +400,39 @@ def build_parser():
 
 def main(argv=None):
     parser = build_parser()
-    args=parser.parse_args(argv); ledger=Ledger(getattr(args, "mcp_root", None) or args.root)
+    args=parser.parse_args(argv)
+    # `Ledger(...)` creates `.ai/codeledger` as a side effect of connecting, so
+    # the MCP branch is taken before anything is constructed. Otherwise a server
+    # launched in the wrong directory would already have created a ledger there
+    # by the time the root-safety check ran.
     if args.command == "mcp":
         from .mcp import serve
-        serve(ledger.root, args.agent, args.session); return
-    if args.command == "setup-codex":
+        serve(Path(getattr(args, "mcp_root", None) or args.root).resolve(), args.agent, args.session); return
+    ledger=Ledger(getattr(args, "mcp_root", None) or args.root)
+    if args.command in ("setup-codex", "setup-agent"):
         import shutil
+        agent = "codex" if args.command == "setup-codex" else args.agent
         ledger._write_instructions()
-        codex = shutil.which("codex")
-        command = ["codex", "mcp", "add", "codeledger", "--", "codeledger", "mcp", "--root", str(ledger.root)]
-        if not codex:
-            value = {"configured": False, "reason": "codex executable was not found", "command": command}
+        executable = {"codex":"codex", "claude-code":"claude", "gemini":"gemini", "aider":"aider", "cursor":"cursor"}.get(agent, agent)
+        # One source of truth for how the server is launched: an absolute path
+        # this process can prove exists, never a bare name for the agent's PATH
+        # to resolve. See core.mcp_launch_command.
+        launch = ledger.mcp_command()
+        command = [executable, "mcp", "add", "codeledger", "--", *launch]
+        # Prove the thing being registered actually works *before* claiming
+        # success. Registering a command that cannot be launched is the exact
+        # failure this command used to produce silently.
+        selftest = ledger.mcp_selftest()
+        value = {"agent": agent, "command": command, "launch_command": launch,
+                 "mcp_selftest": selftest, "config": ledger.agent_config(agent)}
+        if selftest["status"] not in ("OK", "OK_WITH_WARNINGS"):
+            value.update(configured=False, reason=f"MCP self-test failed ({selftest['status']}): {selftest['detail']}")
+        elif not shutil.which(executable):
+            value.update(configured=False, reason=f"{executable} executable was not found — the MCP command below is correct, register it by hand")
         else:
             completed = subprocess.run(command, cwd=ledger.root, text=True, capture_output=True)
-            value = {"configured": completed.returncode == 0, "command": command, "stdout": completed.stdout.strip(), "stderr": completed.stderr.strip()}
+            value.update(configured=completed.returncode == 0, stdout=completed.stdout.strip(), stderr=completed.stderr.strip())
         emit(value, args.as_json); return 0 if value["configured"] else 1
-    if args.command == "setup-agent":
-        import shutil
-        ledger._write_instructions(); executable = {"codex":"codex", "claude-code":"claude", "gemini":"gemini", "aider":"aider", "cursor":"cursor"}[args.agent]
-        command = [executable, "mcp", "add", "codeledger", "--", "codeledger", "mcp", "--root", str(ledger.root)]
-        if not shutil.which(executable): value={"configured":False,"agent":args.agent,"reason":f"{executable} executable was not found","command":command,"config":ledger.agent_config(args.agent)}
-        else:
-            completed=subprocess.run(command,cwd=ledger.root,text=True,capture_output=True); value={"configured":completed.returncode==0,"agent":args.agent,"command":command,"stdout":completed.stdout.strip(),"stderr":completed.stderr.strip(),"config":ledger.agent_config(args.agent)}
-        emit(value,args.as_json); return 0 if value["configured"] else 1
     if args.command == "watch":
         session = args.session or ledger.start_session(args.agent, args.request, owns_process=True)["session_id"]
         print(f"CodeLedger watching {ledger.root} (agent={args.agent}, session={session}, pid={os.getpid()})", flush=True)
@@ -497,7 +519,7 @@ def main(argv=None):
             print(f"\n[CODELEDGER] NO EFFECT: this attempt {detail}.", flush=True)
             print(f"[CODELEDGER] Run `codeledger progress {args.request!r}` before retrying.", flush=True)
         return completed.returncode
-    if args.command == "doctor": emit_doctor(ledger.doctor(), args.as_json); return 0
+    if args.command == "doctor": emit_doctor(ledger.doctor(check_mcp=not args.no_mcp), args.as_json); return 0
     if args.command == "init": value=ledger.init(args.quick, args.verbose); value["root"]=str(ledger.root)
     elif args.command == "status": value=ledger.status()
     elif args.command == "refresh": emit_refresh(ledger.refresh(args.changed, args.agent, args.session, args.request, verbose=args.verbose), args.as_json); return 0

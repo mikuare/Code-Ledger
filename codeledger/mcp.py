@@ -5,6 +5,7 @@ source. Launch with: ``codeledger mcp``.
 """
 from __future__ import annotations
 import json, os, sys
+from pathlib import Path
 from . import __version__
 from .core import Ledger
 
@@ -116,7 +117,61 @@ def client_agent(params) -> str:
     name = ((params or {}).get("clientInfo") or {}).get("name") or ""
     return name.strip() or "unknown"
 
+def ledger_exists(root) -> bool:
+    """Has `codeledger init` ever run here? Checked before anything creates it."""
+    return (Path(root) / ".ai" / "codeledger" / "codeledger.db").is_file()
+
+NOT_INITIALISED = (
+    "CodeLedger is not initialised for this directory, so there is no project memory to answer from. "
+    "This usually means the MCP server was launched without --root, or with the wrong one, and it is "
+    "reported rather than silently creating an empty ledger here — an empty ledger answers every "
+    "question with 'nothing found', which reads as 'this project has no relevant code'. "
+    "Run `codeledger init` in the intended project, or re-register the server with the correct --root "
+    "(`codeledger setup-agent <agent>` writes the right command)."
+)
+
+def serve_uninitialised(root):
+    """Speak MCP correctly, answer nothing, and create nothing.
+
+    A hard exit would show up in an agent's logs as a crashed server with no
+    explanation. Completing the handshake and then reporting NOT_INITIALISED on
+    every call puts the reason in front of the agent, which is the only place it
+    is useful.
+    """
+    payload = {"status": "NOT_INITIALISED", "root": str(root), "guidance": NOT_INITIALISED}
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+        except ValueError:
+            continue
+        method, request_id = request.get("method"), request.get("id")
+        if method == "notifications/initialized" or request_id is None:
+            continue
+        if method == "initialize":
+            result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "codeledger", "version": __version__,
+                                     "root": str(root), "status": "NOT_INITIALISED"},
+                      "instructions": NOT_INITIALISED}
+        elif method == "tools/list":
+            result = {"tools": [{"name": name, "description": description,
+                                 "inputSchema": SCHEMAS.get(name, {"type": "object"})}
+                                for name, description in TOOLS]}
+        else:
+            result = _result(payload)
+        print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+
 def serve(root, agent: str = "", session: str = ""):
+    root = Path(root).resolve()
+    # Construct nothing yet. `Ledger(root)` creates `.ai/codeledger` as a side
+    # effect of connecting, so an MCP server launched in the wrong directory —
+    # the default when an agent registers the command without `--root` — used to
+    # silently produce a brand-new empty ledger there. The agent then received a
+    # perfectly healthy server whose every answer was "nothing found", which
+    # reads as "this project has no relevant code" rather than "you are pointed
+    # at the wrong project". Refusing to create is the difference between a
+    # loud failure and a wrong answer.
+    if not ledger_exists(root):
+        return serve_uninitialised(root)
     ledger = Ledger(root)
     # The MCP server is the one long-lived process in an agent's session, so it
     # is the only place a session can begin and end without asking the user to
@@ -138,8 +193,16 @@ def serve(root, agent: str = "", session: str = ""):
                     if not owned and not session:
                         started = ledger.start_session(agent or client_agent(params), owns_process=True)
                         owned = started["session_id"]; identity = started["agent"]
+                    # The resolved root travels in the handshake so a client can
+                    # tell *which* project it is talking to. Without it, a
+                    # server bound to the wrong directory is indistinguishable
+                    # from one bound to the right one.
                     result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                              "serverInfo": {"name": "codeledger", "version": __version__},
+                              "serverInfo": {"name": "codeledger", "version": __version__,
+                                             "root": str(ledger.root), "status": "READY",
+                                             "project": ledger.config.project_name,
+                                             "indexed_files": ledger.db.execute(
+                                                 "SELECT count(*) FROM files WHERE status IN ('current','unindexed')").fetchone()[0]},
                               "instructions": INSTRUCTIONS}
                 elif method == "tools/list":
                     result = {"tools": [{"name": name, "description": description, "inputSchema": SCHEMAS.get(name, {"type": "object"})} for name, description in TOOLS]}
