@@ -197,6 +197,85 @@ def dependencies(path: Path, text: str) -> list[tuple[str, str, str]]:
     from .providers import analyze
     return analyze(path, text)[1]
 
+def ast_env_edges(tree: ast.AST) -> list[tuple[str, str, str]]:
+    """Environment variables this Python module reads, from the parse tree.
+
+    Structural, never a string scan: the name has to appear as the subscript of
+    `os.environ` or the first argument of `os.getenv`/`os.environ.get`, and it
+    has to be a literal. `"DATABASE_URL"` sitting in a list is not a read of it,
+    and `os.environ[name]` reads *something* whose identity is not in the source
+    — reported as UNKNOWN rather than guessed at.
+
+    Only the variable's name is ever recorded. Values live in the environment
+    and in `.env`, and CodeLedger reads neither.
+    """
+    found: list[tuple[str, str, str]] = []
+    def accessor(node) -> str:
+        return ast.unparse(node) if hasattr(ast, "unparse") else ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and accessor(node.value) in ("os.environ", "environ"):
+            key = node.slice
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                found.append(("__module__", key.value, "env"))
+            else:
+                found.append(("__module__", UNKNOWN_ENV, "env"))
+        elif isinstance(node, ast.Call):
+            name = accessor(node.func)
+            if name in ("os.getenv", "getenv", "os.environ.get", "environ.get"):
+                first = node.args[0] if node.args else None
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    found.append(("__module__", first.value, "env"))
+                elif first is not None:
+                    found.append(("__module__", UNKNOWN_ENV, "env"))
+    return found
+
+# Recorded when a module demonstrably reads the environment but the key is
+# computed, so the dependency is real and its name is not knowable from source.
+UNKNOWN_ENV = "<dynamic>"
+
+def package_name(specifier: str, lang: str = "") -> str | None:
+    """The installable package a quoted module specifier names, or None if local.
+
+    Only ever called on a *path-shaped* specifier — the thing inside the quotes
+    of an `import`/`require`. `./config` and `/etc/thing` are not packages, and
+    a URL import names something no package manager resolves; returning None for
+    those is the point, because the inventory would rather say nothing than name
+    a dependency that does not exist.
+
+    Go is cut differently and must be, because its import path *is* the
+    dependency's identity: `github.com/gin-gonic/gin/binding` belongs to the
+    module `github.com/gin-gonic/gin`, and applying the npm rule would collapse
+    every Go dependency in the project into a single entry called `github.com`.
+    """
+    text = (specifier or "").strip().strip("'\"`").replace("\\", "/")
+    if not text or text.startswith((".", "/")):
+        return None
+    parts = [part for part in text.split("/") if part]
+    if not parts:
+        return None
+    if lang == "go":
+        # A remote module is host/owner/repo; anything shorter, or with no dot
+        # in the host position, is the standard library (`net/http`) and is
+        # named in full.
+        return "/".join(parts[:3]) if "." in parts[0] else text
+    if ":" in text:
+        return None                      # a URL or protocol import, not a package
+    if parts[0].startswith("@"):
+        # A scope on its own (`@scope`) is not installable; a scoped package is
+        # always two segments.
+        return "/".join(parts[:2]) if len(parts) > 1 else None
+    return parts[0]
+
+def dotted_root(token: str) -> str | None:
+    """The first component of a dotted or scoped module path (`os.path` -> `os`).
+
+    Used for languages that write module paths as identifiers rather than
+    strings — Python, Java, Rust — where the leading component is the package
+    and `.`/`::` separate.
+    """
+    root = re.split(r"[.:]+", (token or "").strip())[0]
+    return root if root and re.fullmatch(r"[A-Za-z_$][\w$-]*", root) else None
+
 def ast_edges(text: str) -> list[tuple[str, str, str]]:
     result: list[tuple[str, str, str]] = []
     try:
@@ -216,20 +295,47 @@ def ast_edges(text: str) -> list[tuple[str, str, str]]:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             names = [a.name.split(".")[0] for a in node.names]
             result.extend(("__module__", name, "imports") for name in names)
+            # The distributed package this import comes from, kept apart from
+            # the bound names above: `from x import y` binds `y` but depends on
+            # `x`, and only the latter is something that can be missing from an
+            # environment. A relative import (`level > 0`) is by definition
+            # inside this project and is not a package.
+            if isinstance(node, ast.ImportFrom):
+                if not node.level and node.module:
+                    result.append(("__module__", node.module.split(".")[0], "module"))
+            else:
+                result.extend(("__module__", name, "module") for name in names)
+    result.extend(ast_env_edges(tree))
     return sorted(set(result))
 
 def regex_edges(path: Path, text: str, symbols: list[SymbolData]) -> list[tuple[str, str, str]]:
     result: list[tuple[str, str, str]] = []
     imported, modules = set(), set()
+    quoted: set[str] = set()             # specifiers that were genuinely in quotes
     for match in ES_FROM.finditer(text):
         imported.update(_imported_names(match.group("body"))); modules.add(match.group("module"))
+        quoted.add(match.group("module"))
     for pattern in (ES_BARE, ES_REQUIRE):
-        modules.update(match.group("module") for match in pattern.finditer(text))
-    for match in GENERIC_IMPORT.finditer(text):
-        modules.add(match.group(1))
+        for match in pattern.finditer(text):
+            modules.add(match.group("module")); quoted.add(match.group("module"))
+    bare = {match.group(1) for match in GENERIC_IMPORT.finditer(text)}
+    modules.update(bare)
     for module in modules:
         stem = PurePosixPath(module.replace("\\", "/")).name.split(".")[0]
         if stem: result.append(("__module__", stem, "imports"))
+    # Package edges come only from specifiers whose shape is known. A quoted
+    # specifier is a module path. A bare one is `GENERIC_IMPORT`'s first token,
+    # which is the module in `import os` but the *bound name* in
+    # `import React from "react"` — so for the languages that quote their
+    # modules it is ignored here, and the quoted form above is used instead.
+    lang = language(path)
+    for module in quoted:
+        package = package_name(module, lang)
+        if package: result.append(("__module__", package, "module"))
+    if lang not in ("javascript", "typescript"):
+        for token in bare - quoted:
+            root = dotted_root(token)
+            if root: result.append(("__module__", root, "module"))
     for name in imported:
         result.append(("__module__", name, "imports"))
         # The name occurs once in its own import statement. A second occurrence

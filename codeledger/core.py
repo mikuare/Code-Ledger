@@ -19,7 +19,7 @@ from .agents import UNKNOWN, identify, resolve_model
 from .config import Config
 from .db import connect
 from .git import commit_files, commits, head, status as git_status
-from .parser import digest, digest_bytes, language
+from .parser import UNKNOWN_ENV, digest, digest_bytes, language
 from .providers import FULL, SHALLOW, analyze as analyze_source, capabilities, version_for
 
 LIKE_ESCAPE = str.maketrans({"\\": r"\\", "%": r"\%", "_": r"\_"})
@@ -83,11 +83,37 @@ CHANGE_LIST_LIMIT = 20
 CODE_SUBJECTS = ("symbol", "file")
 SUBJECT_NOUNS = {"symbol": "symbol", "file": "file", "project": "project", "feature": "feature",
                  "endpoint": "endpoint", "deployment": "deployment", "artifact": "artifact"}
+# Dependency edges that describe relationships *between code*. `impact` and the
+# scope boundary must only ever walk these: an `env` edge names an environment
+# variable, and a variable that happens to share a name with a symbol
+# (`export const DATABASE_URL = process.env.DATABASE_URL`) would otherwise drag
+# unrelated files into a blast radius.
+CODE_EDGE_KINDS = ("calls", "uses", "imports")
+# Edge kinds that name something outside the repository rather than a symbol in
+# it, so `refresh` must not try to resolve them to a symbol id. A `module` edge
+# names a distributed package (`@supabase/supabase-js`), which is not a symbol
+# and not a path in this project.
+EXTERNAL_EDGE_KINDS = ("env", "module")
 
 def article(word: str) -> str:
     """`a` or `an`. Small, but "A endpoint-level result" is the kind of seam
     that makes a report read as though nobody has ever looked at it."""
     return "an" if word[:1].lower() in "aeiou" else "a"
+
+def is_stdlib(name: str, path: str | None) -> bool:
+    """Is this import part of the language's own library, rather than a dependency?
+
+    Only asked of Python files. `sys.stdlib_module_names` describes *this*
+    interpreter and says nothing about npm, where `types`, `signal` and `copy`
+    are all real packages — applying it to JavaScript would quietly drop
+    genuine third-party dependencies from the inventory, which is the one
+    direction of error that matters here.
+
+    The point of the external list is "what might be missing or wrong outside
+    this repository?". `os` is never the answer, and listing it dilutes the
+    names that are.
+    """
+    return bool(path) and path.lower().endswith(".py") and name in sys.stdlib_module_names
 # 'completed' and 'failed' predate this vocabulary and still exist in older
 # databases. They mean the same as 'ended' and are never rewritten.
 ENDED = ("ended", "completed", "failed")
@@ -663,6 +689,13 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 # Module-level imports have no owning symbol. They are still
                 # recorded (source_symbol_id NULL) so file-to-file edges survive;
                 # dropping them left the dependency graph import-blind.
+                if kind in EXTERNAL_EDGE_KINDS:
+                    # An environment variable is not a symbol, however much its
+                    # name may look like one. Resolving it would link
+                    # `process.env.DATABASE_URL` to a constant called
+                    # DATABASE_URL and quietly fuse two unrelated things.
+                    self.db.execute("INSERT OR IGNORE INTO dependencies(source_file_id,source_symbol_id,target_name,target_symbol_id,kind) VALUES(?,?,?,?,?)", (file_id, None, target, None, kind))
+                    continue
                 if target not in resolved:
                     target_row = self.db.execute("SELECT id FROM symbols WHERE name=? AND status='active' LIMIT 1", (target,)).fetchone()
                     resolved[target] = target_row[0] if target_row else None
@@ -1131,8 +1164,9 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         dependency_rows = [dict(row) for row in self.db.execute(
             f"SELECT d.*,s.name AS source_name,f.path AS source_path FROM dependencies d "
             f"LEFT JOIN symbols s ON s.id=d.source_symbol_id LEFT JOIN files f ON f.id=d.source_file_id "
-            f"WHERE (d.target_symbol_id IN ({id_slots}) OR d.target_name IN ({name_slots})) AND f.status!='deleted'",
-            (*ids, *names))]
+            f"WHERE (d.target_symbol_id IN ({id_slots}) OR d.target_name IN ({name_slots})) AND f.status!='deleted' "
+            f"AND d.kind IN ({','.join('?' * len(CODE_EDGE_KINDS))})",
+            (*ids, *names, *CODE_EDGE_KINDS))]
         refs = {row["source_path"] for row in dependency_rows if row["source_path"]}
         defining = {row["path"] for row in matches}
         # Coverage decides whether the index can be trusted, rather than
@@ -1478,7 +1512,8 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if names:
             dependents = {row["path"] for row in self.db.execute(
                 f"SELECT DISTINCT f.path FROM dependencies d JOIN files f ON f.id=d.source_file_id "
-                f"WHERE d.target_name IN ({','.join('?' * len(names))}) AND f.status!='deleted'", tuple(names))}
+                f"WHERE d.target_name IN ({','.join('?' * len(names))}) AND f.status!='deleted' "
+                f"AND d.kind IN ({','.join('?' * len(CODE_EDGE_KINDS))})", (*names, *CODE_EDGE_KINDS))}
             if dependents - allowed:
                 allowed |= dependents; evidence.append("files that depend on those symbols")
         indexed = [row["path"] for row in self.db.execute("SELECT path FROM files WHERE status!='deleted'")]
@@ -1493,6 +1528,101 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             if keyword_matches:
                 allowed |= keyword_matches; evidence.append("request keywords matched against file paths (weak evidence)")
         return allowed, evidence
+
+    def _defined_here(self, name: str) -> bool:
+        """Does this module name resolve to a file in this project?
+
+        Paths are stored relative to the root, so a top-level module is stored
+        as `helpers.py` with no leading directory — matching only `%/name.%`
+        missed every one of them and reported the project's own modules as
+        third-party packages. A module can also be a package directory, so
+        `helpers/__init__.py` counts too.
+
+        The name is escaped because `_` is a LIKE wildcard and is legal (and
+        common) in a module name: unescaped, `my_utils` would match
+        `src/myXutils.py` and be dismissed as local.
+        """
+        escaped = name.translate(LIKE_ESCAPE)
+        return self.db.execute(
+            "SELECT 1 FROM files WHERE status!='deleted' AND (path=? "
+            "OR path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' "
+            "OR path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\') LIMIT 1",
+            (name, f"{escaped}.%", f"%/{escaped}.%", f"{escaped}/%", f"%/{escaped}/%")).fetchone() is not None
+
+    def external_dependencies(self, paths: list[str], limit: int = 12) -> dict:
+        """What these files need from outside the repository, and what is unknowable.
+
+        Three tiers, kept apart on purpose. A source reference is PROVEN — the
+        parse tree shows this file reading this variable, or importing a package
+        that resolves to nothing in this project. Whether that variable is set
+        in production, points at the right project, or matches a dashboard
+        setting is UNKNOWN, and no amount of reading the repository changes
+        that. The `cannot_prove` list is the useful half: it is the shortest
+        honest answer to "why might correct-looking code still fail?".
+
+        Only names are ever recorded. Values live in the environment and in
+        `.env`, which stays excluded from indexing.
+        """
+        if not paths: return {"environment_variables": [], "external_packages": [], "cannot_prove": []}
+        slots = ",".join("?" * len(paths))
+        env: dict[str, list[str]] = {}
+        packages: dict[str, list[str]] = {}
+        for row in self.db.execute(
+                f"SELECT DISTINCT d.target_name,d.kind,d.target_symbol_id,f.path FROM dependencies d "
+                f"JOIN files f ON f.id=d.source_file_id WHERE f.path IN ({slots}) "
+                f"AND d.kind IN ({','.join('?' * len(EXTERNAL_EDGE_KINDS))})",
+                (*paths, *EXTERNAL_EDGE_KINDS)):
+            if row["kind"] == "env":
+                env.setdefault(row["target_name"], []).append(row["path"])
+            elif not is_stdlib(row["target_name"], row["path"]) and not self._defined_here(row["target_name"]):
+                # A module specifier that matches no file here comes from
+                # outside the repository.
+                packages.setdefault(row["target_name"], []).append(row["path"])
+        dynamic = env.pop(UNKNOWN_ENV, None)
+        # Totals travel with the lists, so a truncated inventory never reads as
+        # complete — the same rule the change lists follow.
+        result = {
+            "environment_variables": [{"name": name, "files": sorted(set(files))[:5], "evidence": "PROVEN",
+                                       "proof": "the source reads this variable"}
+                                      for name, files in sorted(env.items())[:limit]],
+            "environment_variables_total": len(env),
+            "environment_variables_truncated": len(env) > limit,
+            "external_packages": [{"name": name, "files": sorted(set(files))[:5], "evidence": "PROVEN",
+                                   "proof": "imported, and resolves to nothing defined in this project"}
+                                  for name, files in sorted(packages.items())[:limit]],
+            "external_packages_total": len(packages),
+            "external_packages_truncated": len(packages) > limit,
+            "cannot_prove": [],
+        }
+        if dynamic:
+            result["cannot_prove"].append({
+                "what": "which environment variable is read", "evidence": "UNKNOWN",
+                "files": sorted(set(dynamic))[:5],
+                "why": "the key is computed at runtime, so its name is not in the source."})
+        # Environment reads are only ever extracted from a parse tree. Where a
+        # file was analysed by line patterns instead, an empty list means "not
+        # looked for", which is a different claim from "none found" and has to
+        # be said out loud — otherwise the default install silently reports no
+        # environment dependencies for every JavaScript project.
+        unparsed = sorted(row["path"] for row in self.db.execute(
+            f"SELECT path FROM files WHERE path IN ({slots}) AND status!='deleted' AND "
+            f"(coverage IS NULL OR coverage!=?)", (*paths, FULL)))
+        if unparsed:
+            result["cannot_prove"].append({
+                "what": "which environment variables these files read", "evidence": "UNKNOWN",
+                "files": unparsed[:5],
+                "why": ("these files were analysed by line patterns rather than a parse tree, and an "
+                        "environment read is only recognised structurally. An empty list above means it was "
+                        "not looked for, not that none exist. Install the grammars "
+                        "(`pip install 'code-ledger[languages]'`) and re-run `codeledger refresh`.")})
+        if env or packages:
+            result["cannot_prove"].append({
+                "what": "whether any of these exist, or are correct, outside this repository", "evidence": "UNKNOWN",
+                "why": ("CodeLedger reads the repository. It cannot see environment values, deployment "
+                        "configuration, dashboard settings, or the state of a third-party service. A reference "
+                        "in source says nothing about whether the thing it names is right in any environment. "
+                        "If the code looks right and the behaviour is still wrong, these are the places to check.")})
+        return result
 
     def plan(self, request: str) -> dict:
         context = self.context(request); symbols = context["symbols"][:20]; impact_files = set(context["files"])
@@ -1519,6 +1649,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         else:
             recommendation = "Inspect the existing implementation before adding new code."
         return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols,
+                "external_dependencies": self.external_dependencies(sorted(impact_files)[:20]),
                 "shared_dependencies": shared, "blast_radius": radius, "coverage_caveat": analysis.get("coverage_caveat"),
                 "scope_ambiguity": analysis.get("scope_ambiguity"),
                 "recent_changes": context["recent_changes"], "known_issues": context["known_issues"], "decisions": context["decisions"], "risk": "HIGH" if analysis["risk"] == "HIGH" else risk, "recommendation": recommendation, "full_scan_required": context["scan_required"], "suggested_tests": self.suggest_tests(sorted(impact_files), [symbol["name"] for symbol in symbols])}
@@ -1723,7 +1854,8 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if not paths: return []
         for row in self.db.execute(
                 f"SELECT DISTINCT d.target_name FROM dependencies d JOIN files f ON f.id=d.source_file_id "
-                f"WHERE f.path IN ({','.join('?' * len(paths))}) AND d.kind IN ('uses','calls','imports')", paths):
+                f"WHERE f.path IN ({','.join('?' * len(paths))}) "
+                f"AND d.kind IN ({','.join('?' * len(CODE_EDGE_KINDS))})", (*paths, *CODE_EDGE_KINDS)):
             name = row["target_name"]
             if name in found: continue
             target = self.db.execute(

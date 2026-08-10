@@ -3916,6 +3916,317 @@ class VerificationExpiryTests(unittest.TestCase):
             self.assertIsNone(symbol["last_verified"], "expired evidence must not read as current")
 
 
+class EnvironmentDependencyTests(unittest.TestCase):
+    """The repository can prove a reference. It can never prove production."""
+
+    def test_python_environment_reads_are_extracted_structurally(self):
+        from codeledger.parser import ast_edges
+        source = ('import os\n'
+                  'a = os.environ["DATABASE_URL"]\n'
+                  'b = os.environ.get("SUPABASE_KEY")\n'
+                  'c = os.getenv("HCAPTCHA_SECRET", "fallback")\n'
+                  'd = os.environ[computed]\n'
+                  'e = "DATABASE_URL"\n'
+                  'f = {"NOT_AN_ENV_VAR": 1}\n')
+        found = {target for _s, target, kind in ast_edges(source) if kind == "env"}
+        self.assertLessEqual({"DATABASE_URL", "SUPABASE_KEY", "HCAPTCHA_SECRET"}, found)
+        self.assertIn("<dynamic>", found, "a computed key is a real read with an unknowable name")
+        self.assertNotIn("NOT_AN_ENV_VAR", found, "a dict key is not an environment read")
+
+    def test_a_string_that_merely_names_a_variable_is_not_a_dependency(self):
+        from codeledger.parser import ast_edges
+        source = 'msg = "set DATABASE_URL before running"\nother = ["SUPABASE_KEY"]\n'
+        self.assertEqual([t for _s, t, k in ast_edges(source) if k == "env"], [])
+
+    def test_javascript_environment_reads_are_extracted_structurally(self):
+        if not capabilities()["tree_sitter_installed"]:
+            self.skipTest("grammars not installed")
+        from codeledger.providers import analyze
+        source = ('const url = import.meta.env.VITE_SUPABASE_URL;\n'
+                  'const key = import.meta.env["VITE_SUPABASE_ANON_KEY"];\n'
+                  'const mode = process.env.NODE_ENV;\n'
+                  'const dyn = import.meta.env[chosen];\n'
+                  'const nope = user.env.thing;\n'
+                  'const s = "VITE_SUPABASE_URL is only a string";\n')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "app.tsx"; path.write_text(source)
+            found = {t for _s, t, k in analyze(path, source)[1] if k == "env"}
+        self.assertLessEqual({"VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY", "NODE_ENV"}, found)
+        self.assertIn("<dynamic>", found)
+        self.assertNotIn("thing", found, "an unrelated member access is not an environment read")
+
+    def test_dotenv_files_are_never_read_or_indexed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text('import os\nKEY = os.environ["SUPABASE_KEY"]\n')
+            (root / ".env").write_text("SUPABASE_KEY=super-secret-value\n")
+            (root / ".env.production").write_text("SUPABASE_KEY=prod-secret\n")
+            ledger = Ledger(root); ledger.init()
+            indexed = {row["path"] for row in ledger.db.execute("SELECT path FROM files")}
+            self.assertNotIn(".env", indexed); self.assertNotIn(".env.production", indexed)
+            blob = " ".join(str(value) for table in ("files", "symbols", "dependencies")
+                            for row in ledger.db.execute(f"SELECT * FROM {table}") for value in row)
+            self.assertNotIn("super-secret-value", blob, "a secret value reached the database")
+            self.assertNotIn("prod-secret", blob)
+            # The *name* is still known, which is the whole point.
+            self.assertIn("SUPABASE_KEY", blob)
+
+    def test_the_inventory_separates_proven_from_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            (root / "src" / "db.py").write_text(
+                'import os\nimport psycopg2\nfrom .local import helper\n'
+                'def connect():\n    return psycopg2.connect(os.environ["DATABASE_URL"])\n')
+            (root / "src" / "local.py").write_text("def helper():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            report = ledger.external_dependencies(["src/db.py"])
+            names = {item["name"] for item in report["environment_variables"]}
+            self.assertIn("DATABASE_URL", names)
+            self.assertTrue(all(item["evidence"] == "PROVEN" for item in report["environment_variables"]))
+            packages = {item["name"] for item in report["external_packages"]}
+            self.assertIn("psycopg2", packages)
+            self.assertNotIn("local", packages, "a module defined in this project is not external")
+            self.assertTrue(report["cannot_prove"], "the unknowns must be stated, not implied")
+            self.assertTrue(any("cannot see" in item["why"] for item in report["cannot_prove"]))
+
+    def test_a_source_reference_never_claims_production_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text('import os\nK = os.environ["SUPABASE_KEY"]\n')
+            ledger = Ledger(root); ledger.init()
+            report = ledger.external_dependencies(["app.py"])
+            serialised = json.dumps(report).lower()
+            for claim in ("is set", "exists in production", "configured correctly", "is available"):
+                self.assertNotIn(claim, serialised, f"the inventory asserted {claim!r}")
+            self.assertIn("UNKNOWN", json.dumps(report))
+
+    def test_plan_surfaces_the_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "supabase.py").write_text(
+                'import os\n\ndef supabase_connection():\n    return os.environ["VITE_SUPABASE_URL"]\n')
+            ledger = Ledger(root); ledger.init()
+            plan = ledger.plan("fix the supabase connection")
+            self.assertIn("external_dependencies", plan)
+            self.assertIn("VITE_SUPABASE_URL",
+                          {item["name"] for item in plan["external_dependencies"]["environment_variables"]})
+
+
+class DependencyKindIsolationTests(unittest.TestCase):
+    """An environment variable is not a symbol, however alike the names look.
+
+    `export const DATABASE_URL = process.env.DATABASE_URL` is ordinary code, and
+    without kind filtering the env edge would drag every file that reads the
+    variable into the blast radius of the constant.
+    """
+
+    def colliding_project(self, directory):
+        # The colliding name must be a *symbol the index actually holds*, or
+        # `impact` matches nothing and the test passes without exercising the
+        # filter at all. A module-level assignment is not indexed as a symbol by
+        # any provider, so the accessor is a function deliberately named after
+        # the variable it wraps.
+        root = Path(directory); (root / "src").mkdir()
+        (root / "src" / "config.py").write_text(
+            'import os\n\ndef DATABASE_URL():\n    return os.environ["DATABASE_URL"]\n')
+        (root / "src" / "unrelated.py").write_text(
+            'import os\n\ndef ping():\n    return os.environ["DATABASE_URL"]\n')
+        ledger = Ledger(root); ledger.init()
+        return ledger
+
+    def test_env_edges_are_recorded_but_never_resolved_to_a_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.colliding_project(directory)
+            rows = ledger.db.execute(
+                "SELECT target_name,target_symbol_id FROM dependencies WHERE kind='env'").fetchall()
+            self.assertTrue(rows, "environment reads were not recorded at all")
+            for row in rows:
+                self.assertIsNone(row["target_symbol_id"],
+                                  "an env edge was linked to a same-named code symbol")
+
+    def test_impact_ignores_environment_edges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.colliding_project(directory)
+            report = ledger.impact("DATABASE_URL", fallback=False)
+            self.assertTrue(report["symbols"], "the colliding symbol must be indexed for this to test anything")
+            referencing = report["referencing_files"]
+            self.assertNotIn("src/unrelated.py", referencing,
+                             "an env read contaminated the blast radius of a code symbol")
+            for row in ledger.impact("DATABASE_URL", fallback=False)["dependencies"]:
+                self.assertNotEqual(row["kind"], "env")
+
+    def test_the_task_boundary_ignores_environment_edges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.colliding_project(directory)
+            result = ledger.scope_check("update DATABASE_URL handling", ["src/config.py"], ["DATABASE_URL"])
+            self.assertNotIn("src/unrelated.py", result["allowed_files"],
+                             "an env read widened the task boundary")
+
+    def test_existing_import_edges_are_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            (root / "src" / "a.py").write_text("import os\nimport psycopg2\nfrom b import helper\n")
+            (root / "src" / "b.py").write_text("def helper():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            kinds = {row["kind"] for row in ledger.db.execute("SELECT DISTINCT kind FROM dependencies")}
+            self.assertIn("imports", kinds)
+            imported = {row["target_name"] for row in ledger.db.execute(
+                "SELECT target_name FROM dependencies WHERE kind='imports'")}
+            # `from b import helper` records the bound name, as it always has.
+            self.assertLessEqual({"os", "psycopg2", "helper"}, imported)
+
+
+class ExternalInventoryPresentationTests(unittest.TestCase):
+    """The inventory has to reach a human, and has to be worth reading.
+
+    `plan --json` carried this from the start; the default text output did not,
+    so the half that answers "why might correct-looking code still fail?" was
+    invisible unless you already knew to ask for JSON.
+    """
+
+    def python_project(self, directory):
+        root = Path(directory); (root / "src").mkdir()
+        (root / "src" / "db.py").write_text(
+            'import os\nimport json\nimport psycopg2\n\n'
+            'def supabase_connection():\n    return psycopg2.connect(os.environ["VITE_SUPABASE_URL"])\n')
+        ledger = Ledger(root); ledger.init()
+        return ledger
+
+    def render(self, plan):
+        import io, contextlib
+        from codeledger.cli import emit_plan
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer): emit_plan(plan)
+        return buffer.getvalue()
+
+    def test_the_text_plan_shows_variables_and_the_unknowns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.python_project(directory)
+            output = self.render(ledger.plan("fix the supabase connection"))
+            self.assertIn("VITE_SUPABASE_URL", output)
+            self.assertIn("CANNOT PROVE", output, "the unknowns must be stated, not only the proven half")
+            self.assertIn("cannot see", output)
+
+    def test_the_text_plan_survives_a_plan_with_no_inventory(self):
+        # `external_dependencies` is absent from plans recorded by older
+        # releases, and emitting one must not crash on them.
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.python_project(directory)
+            plan = ledger.plan("fix the supabase connection"); plan.pop("external_dependencies")
+            self.assertIn("CODELEDGER PLAN", self.render(plan))
+
+    def test_the_standard_library_is_not_an_external_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.python_project(directory)
+            packages = {item["name"] for item in
+                        ledger.external_dependencies(["src/db.py"])["external_packages"]}
+            self.assertIn("psycopg2", packages)
+            for builtin in ("os", "json"):
+                self.assertNotIn(builtin, packages,
+                                 "the standard library is always present and is never the missing piece")
+
+    def test_javascript_imports_are_not_filtered_by_python_rules(self):
+        """`sys.stdlib_module_names` describes this interpreter, not npm."""
+        if not capabilities()["tree_sitter_installed"]:
+            self.skipTest("grammars not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            # Every one of these is a real npm package name that collides with
+            # a Python standard-library module.
+            (root / "src" / "app.jsx").write_text(
+                'import types from "types";\nimport signal from "signal";\nimport copy from "copy";\n'
+                'export function App() { return types; }\n')
+            ledger = Ledger(root); ledger.init()
+            packages = {item["name"] for item in
+                        ledger.external_dependencies(["src/app.jsx"])["external_packages"]}
+            self.assertLessEqual({"types", "signal", "copy"}, packages,
+                                 "a real npm dependency was dropped by a Python-only rule")
+
+
+class ModuleSpecifierTests(unittest.TestCase):
+    """An external package is the module an import names, not the words in it.
+
+    The import edge bag is a coarse `re.findall` over the statement text, which
+    is fine for name-matching in the dependency graph and useless as an answer
+    to "which packages does this need?" — it reported
+    `import { createClient } from "@supabase/supabase-js"` as five packages
+    including `from` and `js`. The module specifier is now read structurally.
+    """
+
+    def test_package_name_cuts_each_specifier_on_its_own_terms(self):
+        from codeledger.parser import package_name
+        self.assertEqual(package_name("@supabase/supabase-js"), "@supabase/supabase-js")
+        self.assertEqual(package_name("@supabase/supabase-js/dist/module"), "@supabase/supabase-js")
+        self.assertEqual(package_name("react-dom/client"), "react-dom")
+        self.assertEqual(package_name("lodash.debounce"), "lodash.debounce", "a dot is legal in a package name")
+        for local in ("./config", "../lib/x", "/etc/thing", "", "   "):
+            self.assertIsNone(package_name(local), f"{local!r} is not a package")
+        self.assertIsNone(package_name("https://deno.land/x/foo.ts"), "a URL import is not a package name")
+        self.assertIsNone(package_name("@scope"), "a bare scope is not installable")
+
+    def test_a_scoped_javascript_package_is_named_once_and_correctly(self):
+        if not capabilities()["tree_sitter_installed"]:
+            self.skipTest("grammars not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            (root / "src" / "client.jsx").write_text(
+                'import { createClient } from "@supabase/supabase-js";\n'
+                'import React from "react";\n'
+                'import { local } from "./local";\n'
+                'export function client() { return createClient(React, local); }\n')
+            (root / "src" / "local.js").write_text("export const local = 1;\n")
+            ledger = Ledger(root); ledger.init()
+            packages = {item["name"] for item in
+                        ledger.external_dependencies(["src/client.jsx"])["external_packages"]}
+            self.assertEqual(packages, {"@supabase/supabase-js", "react"})
+            for noise in ("from", "import", "js", "supabase", "createClient", "React", "local"):
+                self.assertNotIn(noise, packages, f"{noise!r} is not a package")
+
+    def test_a_relative_python_import_is_not_a_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            (root / "src" / "__init__.py").write_text("")
+            (root / "src" / "db.py").write_text(
+                "import psycopg2\nfrom .helpers import assist\nfrom os import path\n\n"
+                "def go():\n    return psycopg2, assist, path\n")
+            (root / "src" / "helpers.py").write_text("def assist():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            packages = {item["name"] for item in
+                        ledger.external_dependencies(["src/db.py"])["external_packages"]}
+            self.assertIn("psycopg2", packages)
+            self.assertNotIn("helpers", packages, "a relative import is inside this project")
+            self.assertNotIn("assist", packages, "a bound name is not a package")
+            self.assertNotIn("os", packages, "`from os import path` depends on the standard library")
+
+    def test_module_edges_are_never_resolved_to_a_same_named_symbol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            # A local symbol deliberately sharing a name with an imported package.
+            # Edges resolve against the symbols that exist when the importing
+            # file is processed, so the importer is named to sort *after* the
+            # definition. Otherwise the symbol simply does not exist yet, the
+            # edge resolves to NULL for that reason rather than by rule, and the
+            # test passes without exercising anything.
+            (root / "src" / "requests.py").write_text("def requests():\n    return 1\n")
+            (root / "src" / "z_app.py").write_text("import requests\n\ndef go():\n    return requests\n")
+            ledger = Ledger(root); ledger.init()
+            rows = ledger.db.execute("SELECT target_symbol_id FROM dependencies WHERE kind='module'").fetchall()
+            self.assertTrue(rows, "no module edge was recorded, so nothing was tested")
+            self.assertTrue(ledger.db.execute("SELECT 1 FROM symbols WHERE name='requests'").fetchone(),
+                            "the colliding symbol must exist for this to test anything")
+            for row in rows:
+                self.assertIsNone(row["target_symbol_id"], "a module edge was fused to a code symbol")
+
+    def test_module_edges_stay_out_of_the_blast_radius(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "src").mkdir()
+            (root / "src" / "core.py").write_text("import psycopg2\n\ndef psycopg2_helper():\n    return 1\n")
+            (root / "src" / "other.py").write_text("import psycopg2\n\ndef ping():\n    return 2\n")
+            ledger = Ledger(root); ledger.init()
+            for row in ledger.impact("psycopg2_helper", fallback=False)["dependencies"]:
+                self.assertNotIn(row["kind"], ("module", "env"))
+
+
 class ExpiryEdgeCaseTests(unittest.TestCase):
     """Expiry is the weakest doubt, and must never be the only one that speaks."""
 
@@ -3975,6 +4286,86 @@ class ExpiryEdgeCaseTests(unittest.TestCase):
             self.assertEqual(state["result_recorded"], "FAILED")
 
 
+class ExternalInventoryCorrectnessTests(unittest.TestCase):
+    """The inventory names real things or says nothing. Every case here was a
+    confident, wrong answer found by review before it was fixed."""
+
+    def build(self, directory, files):
+        root = Path(directory)
+        for name, body in files.items():
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body)
+        ledger = Ledger(root); ledger.init()
+        return ledger
+
+    def test_a_top_level_module_is_not_an_external_package(self):
+        """Paths are stored root-relative, so a top-level module has no `/` in
+        its path. Matching only `%/name.%` reported the project's own modules
+        as third-party dependencies."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory, {
+                "app.py": "import helpers\nimport my_utils\nimport psycopg2\nimport pkg\n\n"
+                          "def go():\n    return helpers, my_utils, psycopg2, pkg\n",
+                "helpers.py": "def h():\n    return 1\n",
+                "my_utils.py": "def u():\n    return 2\n",
+                "pkg/__init__.py": "x = 1\n"})
+            packages = {item["name"] for item in
+                        ledger.external_dependencies(["app.py"])["external_packages"]}
+            self.assertEqual(packages, {"psycopg2"})
+
+    def test_an_underscore_in_a_module_name_is_not_a_wildcard(self):
+        """`_` is a LIKE wildcard, so an unescaped `my_utils` matched
+        `myXutils.py` and was wrongly dismissed as local."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory, {
+                "app.py": "import my_utils\n\ndef go():\n    return my_utils\n",
+                "myXutils.py": "def x():\n    return 1\n"})
+            packages = {item["name"] for item in
+                        ledger.external_dependencies(["app.py"])["external_packages"]}
+            self.assertIn("my_utils", packages, "a same-shaped filename is not this module")
+
+    def test_a_bound_name_is_never_reported_as_a_package(self):
+        """The regex provider is the default install. `GENERIC_IMPORT` captures
+        the bound name for JavaScript, so `import React from "react"` reported
+        packages named `React` and, for `import x from "./local"`, `x`."""
+        from codeledger.parser import regex_edges
+        source = ('import React from "react";\nimport x from "./local";\n'
+                  'import { a } from "@scope/pkg/sub";\nconst r = require("lodash");\n')
+        found = {target for _s, target, kind in regex_edges(Path("a.jsx"), source, []) if kind == "module"}
+        self.assertEqual(found, {"react", "@scope/pkg", "lodash"})
+        for bound in ("React", "x", "a", "local"):
+            self.assertNotIn(bound, found, f"{bound!r} is a bound name, not a package")
+
+    def test_go_import_paths_are_not_collapsed_into_their_host(self):
+        from codeledger.parser import package_name
+        self.assertEqual(package_name("github.com/gin-gonic/gin", "go"), "github.com/gin-gonic/gin")
+        self.assertEqual(package_name("github.com/gin-gonic/gin/binding", "go"), "github.com/gin-gonic/gin")
+        self.assertEqual(package_name("net/http", "go"), "net/http", "the standard library keeps its full path")
+        self.assertEqual(package_name("react-dom/client"), "react-dom", "npm is still cut at the first segment")
+
+    def test_a_shallow_file_says_environment_reads_were_not_looked_for(self):
+        """Without grammars there is no env extraction, and an empty list is
+        'not looked for', not 'none found'."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory, {
+                "src/a.jsx": 'const u = import.meta.env.VITE_URL;\nexport function go(){ return u; }\n'})
+            ledger.db.execute("UPDATE files SET coverage='shallow'"); ledger.db.commit()
+            report = ledger.external_dependencies(["src/a.jsx"])
+            self.assertTrue(any("environment variables these files read" in item["what"]
+                                for item in report["cannot_prove"]),
+                            "a shallow analysis reported no environment reads without saying why")
+
+    def test_a_truncated_inventory_carries_its_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            body = "import os\n" + "".join(f'v{i} = os.environ["VAR_{i:02d}"]\n' for i in range(20))
+            ledger = self.build(directory, {"big.py": body})
+            report = ledger.external_dependencies(["big.py"], limit=12)
+            self.assertEqual(len(report["environment_variables"]), 12)
+            self.assertEqual(report["environment_variables_total"], 20)
+            self.assertTrue(report["environment_variables_truncated"])
+
+
 class ConfigRobustnessTests(unittest.TestCase):
     """`load` promises a bad config degrades to defaults rather than breaking
     every command, and that has to survive a value of the wrong shape."""
@@ -4008,3 +4399,35 @@ class ConfigRobustnessTests(unittest.TestCase):
             self.assertTrue(config.evidence_ttl("RUNTIME_PROBE"))
 
 
+class EnvironmentReadPrecisionTests(unittest.TestCase):
+    """A read is recorded when the structure proves one, and not otherwise."""
+
+    def envs(self, source, name="a.jsx"):
+        from codeledger.providers import analyze
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / name; path.write_text(source)
+            return {target for _s, target, kind in analyze(path, source)[1] if kind == "env"}
+
+    def test_a_chained_access_is_one_read_not_a_dynamic_one(self):
+        """`process.env.NODE_ENV.toLowerCase()` recorded NODE_ENV *and*
+        `<dynamic>`, so `plan` claimed a runtime-computed key in code that
+        computes nothing."""
+        if not capabilities()["tree_sitter_installed"]: self.skipTest("grammars not installed")
+        self.assertEqual(self.envs("const m = process.env.NODE_ENV.toLowerCase();\n"), {"NODE_ENV"})
+
+    def test_an_identifier_that_merely_starts_with_the_prefix_is_not_a_read(self):
+        if not capabilities()["tree_sitter_installed"]: self.skipTest("grammars not installed")
+        self.assertEqual(self.envs("const z = process.environment.foo;\n"), set())
+
+    def test_an_interpolated_key_is_unknown_not_a_fabricated_name(self):
+        if not capabilities()["tree_sitter_installed"]: self.skipTest("grammars not installed")
+        self.assertEqual(self.envs("const v = process.env[`${prefix}_URL`];\n"), {"<dynamic>"})
+        self.assertEqual(self.envs('import os\nv = os.getenv(f"{p}_URL")\n', "a.py"), {"<dynamic>"},
+                         "an f-string key must not become a variable literally named f\"{p}_URL\"")
+
+    def test_the_ordinary_forms_still_resolve(self):
+        if not capabilities()["tree_sitter_installed"]: self.skipTest("grammars not installed")
+        self.assertEqual(
+            self.envs('const a = import.meta.env.VITE_URL;\nconst b = process.env["A_B"];\n'
+                      'const c = import.meta.env[chosen];\nconst s = "VITE_URL is a string";\n'),
+            {"VITE_URL", "A_B", "<dynamic>"})

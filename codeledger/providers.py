@@ -14,8 +14,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .parser import (SymbolData, ast_symbols, ast_edges, digest, language,
-                     regex_symbols, regex_edges)
+from .parser import (UNKNOWN_ENV, SymbolData, ast_symbols, ast_edges, digest, language,
+                     package_name, regex_symbols, regex_edges)
 
 FULL = "full"        # real parse tree; ranges and call edges are trustworthy
 SHALLOW = "shallow"  # line patterns; imports mostly, calls approximate
@@ -99,6 +99,9 @@ IDENTIFIERS = ("identifier", "type_identifier", "field_identifier", "constant", 
 CALL_TYPES = {"call", "call_expression", "method_invocation", "invocation_expression",
               "function_call", "function_call_expression", "call_method", "new_expression"}
 IMPORT_HINTS = ("import", "use_declaration", "package_clause", "require", "include", "using_directive")
+# Member access and subscripting, across the grammars — the two shapes an
+# environment read can take (`process.env.X` and `process.env["X"]`).
+ACCESS_TYPES = {"member_expression", "attribute", "subscript_expression", "subscript"}
 KIND_BY_TYPE = {"class": "class", "struct": "class", "interface": "interface", "trait": "interface",
                 "enum": "enum", "module": "module", "object": "class", "protocol": "interface"}
 
@@ -282,6 +285,145 @@ class TreeSitterProvider:
                 stack.append((child, child_scope))
         return sorted(found, key=lambda item: (item.start, item.name))
 
+    # Object chains that mean "read the process environment". A member access
+    # whose object is one of these, or a call to one of these, is a structural
+    # environment read — as opposed to a string that merely spells a variable's
+    # name, which no amount of scanning can tell apart.
+    ENV_OBJECTS = ("import.meta.env", "process.env", "os.environ", "Deno.env")
+    ENV_CALLS = ("os.getenv", "os.environ.get", "Deno.env.get", "process.env.get")
+
+    @staticmethod
+    def _env_key(tail: str) -> str | None:
+        """The variable named by what follows an environment object.
+
+        Three outcomes, and the difference between them matters. `.NAME` or
+        `["NAME"]` names a variable. `[expr]` is a real read whose name is
+        computed, so it is reported as unknown. Anything else — `.NAME.trim`,
+        `.NAME.length` — is a chained access, where the *inner* node is the
+        read and has already been recorded; reporting the outer one too would
+        invent a second, dynamic-looking read out of ordinary code and make
+        `plan` claim a runtime-computed key where none exists.
+        """
+        dotted = re.fullmatch(r"\.([A-Za-z_$][\w$]*)", tail)
+        if dotted: return dotted.group(1)
+        quoted = re.fullmatch(r"""\[\s*['"]([^'"]*)['"]\s*\]""", tail)
+        if quoted: return quoted.group(1) or None
+        return UNKNOWN_ENV if re.fullmatch(r"\[[^\[\]]*\]", tail) else None
+
+    @staticmethod
+    def _string_value(node) -> str | None:
+        """The literal text of a string node, or None if any of it is computed.
+
+        An interpolated string names a variable whose identity is only known at
+        runtime. Stripping its quotes and recording the remainder would invent
+        a `PROVEN` variable literally called `${prefix}_URL`.
+        """
+        if any("interpolation" in child.type or "substitution" in child.type
+               for child in node.named_children):
+            return None
+        raw = node.text.decode("utf-8", errors="replace").strip()
+        raw = re.sub(r"^[A-Za-z]+(?=['\"`])", "", raw)      # f/r/b/u string prefixes
+        if "${" in raw: return None
+        return raw.strip("'\"`") or None
+
+    def _env_edges(self, node) -> list[tuple[str, str, str]]:
+        """Environment variables read here, by structure rather than by text.
+
+        Only the *name* is recorded, never a value: values live in the
+        environment and in `.env`, and CodeLedger reads neither. A computed key
+        (`import.meta.env[name]`) is recorded as a read whose identity is
+        unknown, because the dependency is real even when its name is not
+        discoverable from the source.
+        """
+        found: list[tuple[str, str, str]] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            # Decoding is deliberately inside the branches. `current.text` for a
+            # node is its whole source span, so decoding every node on the way
+            # past costs the file size once per level of nesting.
+            if current.type in ACCESS_TYPES:
+                text = current.text.decode("utf-8", errors="replace")
+                for prefix in self.ENV_OBJECTS:
+                    if not text.startswith(prefix) or len(text) == len(prefix):
+                        continue
+                    tail = text[len(prefix):]
+                    if tail[0] not in ".[":
+                        # `process.environment` merely begins with `process.env`.
+                        break
+                    name = self._env_key(tail)
+                    if name: found.append(("__module__", name, "env"))
+                    break
+            elif current.type in CALL_TYPES:
+                target = current.child_by_field_name("function")
+                callee = target.text.decode("utf-8", errors="replace") if target is not None else ""
+                if callee in self.ENV_CALLS:
+                    argument = current.child_by_field_name("arguments")
+                    literal = next((child for child in (argument.named_children if argument is not None else [])
+                                    if "string" in child.type), None)
+                    value = self._string_value(literal) if literal is not None else None
+                    found.append(("__module__", value or UNKNOWN_ENV, "env"))
+            stack.extend(current.named_children)
+        return found
+
+    # Roots that name a place inside the current crate or module tree rather
+    # than a distributed package.
+    LOCAL_MODULE_ROOTS = frozenset({"crate", "self", "super"})
+
+    def _module_packages(self, node) -> list[str]:
+        """The distributed packages one import statement depends on.
+
+        Grammars spell a module two ways, and the difference decides how the
+        name is cut. JavaScript and Go quote a *path*, where `/` separates and a
+        leading `.` means local — `@supabase/supabase-js/dist` is one package.
+        Python, Java and Rust write a *dotted or scoped path*, where the first
+        component is the package and `.`/`::` separate.
+
+        Reading the wrong one either way produces a plausible package name that
+        does not exist, so each is handled on its own terms and anything that
+        cannot be cut confidently is dropped.
+        """
+        def text(item) -> str:
+            return item.text.decode("utf-8", errors="replace").strip().strip("'\"`")
+
+        source = node.child_by_field_name("source")
+        if source is not None:
+            return [name for name in [package_name(text(source))] if name]
+
+        # Go and the other string-based grammars: the strings in the statement
+        # are the module paths.
+        strings, stack = [], list(node.named_children)
+        while stack:
+            current = stack.pop(0)
+            if "string" in current.type: strings.append(current)
+            else: stack.extend(current.named_children)
+        if strings:
+            return [name for name in (package_name(text(item)) for item in strings) if name]
+
+        # Dotted or scoped paths. A Python relative import has its own node type
+        # and is by definition inside this project.
+        module = node.child_by_field_name("module_name")
+        if module is not None:
+            candidates = [] if module.type == "relative_import" else [module]
+        else:
+            # A bare identifier is excluded deliberately. `IMPORT_HINTS` matches
+            # the nested parts of an import too (`import_specifier`,
+            # `import_clause`), whose identifier is the *bound name* —
+            # accepting it turns `import { createClient } from "..."` into a
+            # package called `createClient`. A module path is always dotted or
+            # scoped, so requiring that shape costs nothing real.
+            candidates = [child for child in node.named_children
+                          if child.type in ("dotted_name", "scoped_identifier")]
+            candidates += [child.child_by_field_name("name") for child in node.named_children
+                           if child.type == "aliased_import"]
+        found = []
+        for item in candidates:
+            if item is None: continue
+            root = re.split(r"[.:]+", text(item))[0]
+            if root and root not in self.LOCAL_MODULE_ROOTS and re.fullmatch(r"[A-Za-z_$][\w$-]*", root):
+                found.append(root)
+        return found
+
     def edges(self, path: Path, text: str, symbols: list[SymbolData]) -> list[tuple[str, str, str]]:
         result: list[tuple[str, str, str]] = []
         defined = {item.name for item in symbols}
@@ -294,7 +436,8 @@ class TreeSitterProvider:
                     best = (start, name)
             return best[1] if best else "__module__"
 
-        stack = [self._tree(text).root_node]
+        root = self._tree(text).root_node
+        stack = [root]
         while stack:
             node = stack.pop()
             if node.type in CALL_TYPES:
@@ -316,8 +459,16 @@ class TreeSitterProvider:
             elif any(hint in node.type for hint in IMPORT_HINTS):
                 for piece in re.findall(r"[A-Za-z_$][\w$]*", node.text.decode("utf-8", errors="replace")):
                     result.append(("__module__", piece, "imports"))
+                # The identifier bag above is deliberately coarse: it feeds
+                # name-matching in the dependency graph, where a stray `from`
+                # or `js` matches nothing and costs nothing. It is useless as an
+                # answer to "which packages does this need?", so the module
+                # specifier is read structurally and kept separate.
+                for package in self._module_packages(node):
+                    result.append(("__module__", package, "module"))
             for child in node.named_children:
                 stack.append(child)
+        result.extend(self._env_edges(root))     # same parse: `_tree` has no cache
         return sorted(set(result))
 
 _REGEX = RegexProvider()

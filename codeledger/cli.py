@@ -120,6 +120,36 @@ def emit_plan(value, as_json=False):
         print(f"\nRelevant symbols: {', '.join(s['name'] for s in value['relevant_symbols'][:10])}")
     print(f"Existing files:   {', '.join(value['existing_files'][:10]) or 'none indexed'}")
     if value["suggested_tests"]: print(f"Suggested tests:  {', '.join(value['suggested_tests'][:5])}")
+    emit_external_dependencies(value.get("external_dependencies"))
+
+def emit_external_dependencies(value):
+    """What the code needs from outside, and what the repository cannot settle.
+
+    The unknowns are printed even when nothing was proven, because they are the
+    half that answers "why might correct-looking code still fail?" — and a plan
+    that lists only what it proved reads as though it checked everything.
+    """
+    if not value: return
+    proven = value.get("environment_variables") or []
+    packages = value.get("external_packages") or []
+    def shown(items, total):
+        """Never let a truncated list read as the whole answer."""
+        return f" (showing {len(items)} of {total})" if total and total > len(items) else ""
+
+    if proven:
+        print(f"\nENVIRONMENT VARIABLES READ (proven from source)"
+              f"{shown(proven, value.get('environment_variables_total'))}")
+        for item in proven:
+            print(f"   {item['name']}  —  {', '.join(item['files'][:3])}")
+    if packages:
+        listed = packages[:10]
+        print(f"\nEXTERNAL PACKAGES (imported, defined outside this project)"
+              f"{shown(listed, value.get('external_packages_total'))}")
+        print(f"   {', '.join(item['name'] for item in listed)}")
+    for item in value.get("cannot_prove") or []:
+        print(f"\nCANNOT PROVE — {item['what']}")
+        print(f"   {item['why']}")
+        if item.get("files"): print(f"   in: {', '.join(item['files'][:3])}")
 
 def emit_handshake(value, as_json=False):
     if as_json: print(json.dumps(value, indent=2, default=str)); return
