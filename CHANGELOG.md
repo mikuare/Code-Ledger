@@ -73,7 +73,129 @@ two with a guess.
   "why might correct-looking code still fail?", and it prints even when nothing
   was proven, so a plan never reads as though it checked everything.
 
+- **Evidence about a change, before it is made: `codeledger check`.** Also
+  `codeledger_check_before_change` over MCP. It answers one question — does the
+  repository support what is about to happen? — with one of four labels over
+  the evidence returned beside it:
+
+  - `PROCEED` — a target is established and its measured footprint is small.
+  - `CLARIFY` — several areas match and the request names none of them. All the
+    candidates come back, unranked, with the question and bounded options.
+  - `WARN` — the target is established and the measurement is worth saying out
+    loud: a wide dependent set, several affected areas, something needed from
+    outside the repository, verification that the change would invalidate, or
+    recent churn on the same files.
+  - `UNKNOWN` — no target resolves, coverage is insufficient, the target has
+    moved on disk since it was indexed, or the footprint cannot be measured.
+
+  These are labels over evidence, not permissions. Nothing is blocked: `WARN`
+  means "here is what this reaches", the CLI exits zero on every outcome, and
+  no payload carries refusing language. Nothing is chosen: an ambiguous request
+  comes back with an empty scope and `intended_target: UNKNOWN`.
+
+  Every input to the label is in `signals` beside the threshold it was compared
+  against, so a caller can recompute the verdict and disagree with it. The
+  check reads only; it records nothing and creates no evidence.
+
+- **Candidate target discovery: `codeledger targets`.** Also
+  `codeledger_find_targets` over MCP, and folded into `context` and `plan`.
+  Retrieval matched symbol names against the whole prompt, so "fix the
+  authentication" found nothing in a project with `src/auth/`, three auth
+  screens and four auth Edge Functions — and an empty result then travelled
+  onward as "no ambiguity", which let an agent proceed on an interpretation
+  nothing had confirmed. Nothing found and nothing to ask about are different
+  answers, and they are now reported as `TARGET_UNKNOWN` and `TARGET_RESOLVED`
+  rather than sharing an empty one.
+
+  Matching is lexical and structural: the words of the request against the
+  words of paths, filenames and symbol names, split on case and separators so
+  `auth-login`, `AuthGate` and `password_recovery` are all reachable. Equality
+  or a prefix of at least four characters, never substring, so `auth` does not
+  reach `oauth`. Every candidate carries the reason it matched, the order is
+  alphabetical and says so, and no candidate is marked likelier than another —
+  which one was meant is a question about intent, and intent is not in the
+  index. A request that names a path or directory resolves without
+  manufacturing alternatives.
+
+- **A derived trust level on evidence: `PROVEN`, `RECORDED`, `INFERRED`,
+  `UNKNOWN`.** CodeLedger already spoke five overlapping vocabularies —
+  applicability, coverage, evidence, confidence, source — and left every
+  consumer to work out how they combine. `trust` reads them as one level,
+  derived at read time and stored nowhere, with the raw fields alongside so the
+  projection can be checked rather than believed.
+
+  It is downgrade-only by construction: a full parse is `PROVEN`, a shallow one
+  `INFERRED`, a verification with a command and an exit code against a commit
+  `PROVEN` subject to its applicability, one without that provenance
+  `RECORDED`, and anything a person or an agent merely wrote down `RECORDED`
+  however confidently it was written. Nothing this projection does can make
+  weak evidence strong.
+
+- **A currentness block on the composed reads: `as_of`.** "Authentication was
+  tested" and "authentication was tested against the code that is here now" are
+  different claims, and a payload that omits its own as-of date leaves the
+  reader to assume the second. `context`, `plan`, `project_context` and the
+  pre-action check now state the commit, whether the tree was dirty, when the
+  index was written, and which of the files behind the answer have since
+  changed on disk. It is a disclosure, not a validity guarantee, and not a
+  cache key.
+
+- **Engineering risk measured from a footprint: `impact_risk`.** The existing
+  reading of a request's wording keeps its meaning under the name
+  `request_risk_hint`, labelled `INFERRED`, and the `risk` key is unchanged for
+  existing callers. The two were being conflated: "delete the old
+  authentication code" scored `HIGH` on the verb while the blast radius behind
+  it was zero files, and "tidy up the login helper" scored `LOW` over the same
+  code. `impact_risk` is `UNKNOWN` until a target exists, because the absence
+  of a measured radius must never read as the absence of danger.
+
+- **One compact engineering context: `codeledger project-context`.** Also
+  `codeledger_get_project_context` over MCP. Assembling this took four to six
+  calls whose payloads repeated each other; composed once it is materially
+  smaller than the calls it replaces, carries `as_of` and trust, and lists what
+  could not be determined rather than omitting it — an absent field reads as
+  "nothing to worry about", which is the one thing it must never mean. Index
+  churn is kept out of the agent-facing history: a record with no captured
+  request is bookkeeping, not context.
+
 ### Fixed
+
+- **`Deno.env.get("X")` reported an environment variable called `get`, as
+  `PROVEN`.** The call and the member access inside it are the same source, and
+  both extraction rules matched: the call recorded `X`, and the access
+  `Deno.env.get` — which begins with the environment object `Deno.env` and
+  continues `.get` — recorded a variable named `get`. It was then reported with
+  `evidence: PROVEN`, because the parse really had happened. `process.env.get`
+  and `os.environ.get` have the same shape.
+
+  A fabricated name carrying the strongest trust label is the failure this
+  project exists to prevent, and it was live rather than theoretical: a real
+  index held four such edges, one for each Supabase Edge Function in the
+  project.
+
+  The guard is structural rather than textual. An access is skipped only when
+  it *is* the callee of its parent call, so an access that merely looks like
+  one — `const read = process.env.get` — stays a genuine read of a variable
+  named `get`. Every other form is unchanged: `import.meta.env.VITE_X`,
+  `process.env.PORT`, `process.env["QUEUE_URL"]`, the chained
+  `process.env.NODE_ENV.toLowerCase()`, and a computed key reported as
+  `<dynamic>`.
+
+- **An empty result became a positive claim, in four places.** Finding nothing
+  is not a finding, and each of these turned it into one.
+
+  `context` reported the whole repository as avoided while telling the agent a
+  full scan was still required — `files_avoided` is `total - relevant`, and
+  with nothing matched that is everything. `resume` and the no-checkpoint
+  branch of `progress` did the same when no file was named.
+
+  A blast radius with no dependents came back with `HIGH` confidence, which
+  reads as "proven contained" when in fact nothing was measured: the matched
+  symbols may be irrelevant to the request, or referenced in ways the index
+  cannot see, and this cannot tell those apart. It is now `UNKNOWN`, with a
+  caveat saying the radius is unmeasured rather than proven empty. Shallow
+  coverage keeps its existing `LOW` and its own caveat, which already said an
+  empty list is unproven; only the fully-parsed case changes.
 
 - **Language keywords and comment prose were indexed as project symbols.** The
   shallow provider's method pattern matched any `keyword (...) {` statement, so
@@ -166,6 +288,15 @@ two with a guess.
 
 ### Changed
 
+- **`efficiency.files_avoided` reports `0` when nothing matched**, in `context`,
+  `resume` and `progress`, instead of the size of the repository. Anything
+  summing that figure will see lower and correct numbers.
+
+- **`blast_radius.confidence` reports `UNKNOWN` for an unmeasured radius.**
+  Previously `HIGH` whenever the defining files were fully parsed, including
+  when no dependent was found at all. A consumer branching on `HIGH` will now
+  see `UNKNOWN` in that case; a radius with dependents behind it is unchanged.
+
 - **Verifications recorded before provenance support now report
   `UNVERIFIABLE`.** A verification is a claim about a state of the code, and
   until now it stored none of that state: no commit, no command, no exit code,
@@ -196,6 +327,49 @@ two with a guess.
   Projects not under Git are unaffected. A record written where no repository
   exists is stored distinguishably from one that predates provenance, and
   continues to report `CURRENT` on the content-hash rule.
+
+### Known limitations
+
+- **`PROCEED` does not mean the change is correct.** It means a target was
+  established and its measured footprint cleared every threshold. CodeLedger
+  cannot tell whether the change itself is right, whether it does what the user
+  wanted, or whether the interpretation behind it was the intended one. The
+  guidance on the result says so, and the request's own wording never
+  contributes to the outcome — the same footprint gives the same answer whether
+  the verb was "delete" or "tidy".
+
+- **Runtime and dynamic behaviour cannot be proven from a repository.** The
+  dependency index records what the source says statically. A reference built
+  at runtime, resolved by name, or dispatched dynamically is invisible to it,
+  so an empty dependent list is never proof of isolation — it is the absence of
+  recorded evidence. This limit is printed on every pre-action result,
+  including `PROCEED`, rather than being left for the reader to remember.
+
+  The same boundary applies to everything outside the repository: a source
+  reference proves a variable is read, and proves nothing about whether it is
+  set, correct, or pointing at the right project in any environment.
+
+- **Bounded evidence is bounded, and says so.** Each probe behind the
+  pre-action check is capped so the cost cannot grow without limit: 5 files
+  carrying recorded verification, 20 carrying an external dependency, 25
+  symbols followed into the dependency graph, 8 candidate areas displayed.
+
+  The caps count the files that actually hold the evidence in question rather
+  than the first few in the requested scope, so they bind on a genuinely large
+  body of evidence rather than on scope size. Where one still binds it reports
+  itself — in `signals`, in `limits`, and with its own counts — and it
+  withdraws `PROCEED`, because a probe that ran out is not a probe that found
+  nothing. Widening a scope can therefore raise concern but never lower it.
+
+  A truncated candidate list says so where the options are, carries
+  `candidate_count` and `candidates_truncated`, and offers the remainder rather
+  than presenting the shown subset as the whole set.
+
+- **Candidate discovery matches words, not meaning.** It finds what a request
+  could be about by spelling alone. A subsystem the request names in domain
+  language that appears nowhere in a path, filename or symbol will not be
+  found — reported as `TARGET_UNKNOWN`, which means the target could not be
+  established, not that nothing relevant exists.
 
 ### Notes
 
@@ -246,6 +420,32 @@ two with a guess.
   environment — with no caveat, because the file *was* fully parsed, just by a
   version that did not look. Symbols are re-derived, not destroyed, and all
   change history is preserved; no migration and no schema change.
+- `files.analysis_version` moves again, to `:4`, so `refresh --changed`
+  reparses each file once and drops the fabricated `get` environment edges
+  described above. Nothing else retires them: the edge is a real row about a
+  real file, and only reanalysing the file removes it. Symbols are re-derived
+  rather than destroyed, all change history is preserved, and there is no
+  migration and no schema change.
+- **No schema change in this release.** `db.py` is byte-identical to 0.4.0 —
+  17 tables, the same additive migration list — and every addition above is
+  derived at read time from what was already stored.
+- The MCP surface grows from 25 tools to 28: `codeledger_find_targets`,
+  `codeledger_get_project_context` and `codeledger_check_before_change`. Purely
+  additive — no established tool was removed, renamed, or had its input schema
+  changed, and a test asserts each of the original 25 is still present with a
+  schema.
+- `codeledger_analyze_prompt` now returns the candidate blocks alongside its
+  existing keys. Additive: nothing it returned before has changed or gone.
+- `context` and `plan` gain `as_of`. `analyze_prompt` gains
+  `request_risk_hint` and `impact_risk`; its existing `risk` key keeps both its
+  name and its value, and a test pins the two together so the meaning cannot
+  drift. No key was removed from any public payload — `context`, `plan`,
+  `impact`, `resume` and `status` were compared field by field against 0.4.0.
+- New CLI commands: `targets`, `project-context` and `check`, all supporting
+  `--json`. No existing command changed.
+- Candidate discovery is off by default inside `analyze_prompt` and is asked
+  for by the pre-change readers, so the refresh path — which reads a risk label
+  from the same function on every indexed change — does not pay for it.
 
 ## [0.4.0]
 
