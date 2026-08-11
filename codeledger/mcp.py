@@ -19,6 +19,7 @@ TOOLS = [
     ("codeledger_get_changes_since", "What changed since a point in time, and which agent did it. Call at the start of a turn when more than one agent works on this project."),
     ("codeledger_analyze_prompt", "Convert a user request into an explicit task brief."),
     ("codeledger_find_targets", "Which parts of this repository a request could be about, and whether that is ambiguous. Call BEFORE editing when the request names a subsystem rather than a file. Returns bounded candidates with the evidence for each; it never decides which one the user meant."),
+    ("codeledger_check_before_change", "Engineering evidence about a change BEFORE making it. Pass the user request as `intent`, and `files`/`symbols` if you have already resolved the target. Returns PROCEED, CLARIFY, WARN or UNKNOWN with the measured evidence behind it. It never blocks and never picks a target for you: on CLARIFY, ask the user which option they meant."),
     ("codeledger_get_project_context", "One compact read of the engineering context for a request: current goal, next action, candidate targets, dependencies, external requirements, verification state, risk, and what could not be determined."),
     ("codeledger_task_handshake", "Compare the user request with the AI implementation plan before editing."),
     ("codeledger_find_symbol", "Find active or deleted symbols."),
@@ -64,6 +65,7 @@ SCHEMAS = {
     "codeledger_get_changes_since": {"type": "object", "properties": {"marker": {"type": "string", "description": "change id, session id, or ISO timestamp"}, "agent": {"type": "string", "description": "your own agent name; means 'since I last recorded anything'"}}},
     "codeledger_analyze_prompt": {"type": "object", "properties": {"prompt": {"type": "string"}, "task": {"type": "string"}}, "required": ["prompt"]},
     "codeledger_find_targets": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "query": {"type": "string"}}},
+    "codeledger_check_before_change": {"type": "object", "properties": {"intent": {"type": "string", "description": "the user request, in their words"}, "files": {"type": "array", "items": {"type": "string"}, "description": "target files, if already resolved"}, "symbols": {"type": "array", "items": {"type": "string"}, "description": "target symbols, if already resolved"}, "request": {"type": "string"}, "task": {"type": "string"}}},
     "codeledger_get_project_context": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "query": {"type": "string"}}},
     "codeledger_task_handshake": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "ai_plan": {"type": "string"}}, "required": ["ai_plan"]},
     "codeledger_find_symbol": {"type": "object", "properties": {"query": {"type": "string"}, "task": {"type": "string"}}, "required": ["query"]},
@@ -243,6 +245,9 @@ def serve(root, agent: str = "", session: str = ""):
                         request = arg(args, "request", "task", "query")
                         found = ledger.candidate_targets(request)
                         result = _result({**found, "target_ambiguity": ledger._target_ambiguity(found)})
+                    elif name == "codeledger_check_before_change":
+                        result = _result(ledger.pre_action(arg(args, "intent", "request", "task", "query"),
+                                                           args.get("files") or [], args.get("symbols") or []))
                     elif name == "codeledger_get_project_context": result = _result(ledger.project_context(arg(args, "request", "task", "query")))
                     elif name == "codeledger_task_handshake": result = _result(ledger.handshake(arg(args, "request", "task"), args.get("ai_plan", "")))
                     elif name == "codeledger_find_symbol": result = _result(ledger.lookup(arg(args, "query", "task")))

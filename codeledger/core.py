@@ -85,6 +85,28 @@ PATH_STOPWORDS = {"src", "lib", "libs", "app", "apps", "index", "main", "dist", 
 CANDIDATE_EVIDENCE_LIMIT = 6
 CANDIDATE_SYMBOL_LIMIT = 12
 CANDIDATE_FILE_LIMIT = 10
+# When a measured footprint is worth saying out loud before an edit. Few, fixed,
+# and named — the same discipline as the ambiguity thresholds above, and for the
+# same reason: a check that fires on ordinary work teaches an agent to ignore it.
+# These decide only whether evidence is *reported* as notable. Nothing here
+# blocks anything, and no threshold is configurable.
+PREACTION_WARN_FILES = 10
+PREACTION_WARN_AREAS = AMBIGUITY_LONE_AREAS
+# How far back "recently churned" looks, and how many touches make it notable.
+PREACTION_CHURN_WINDOW = 20
+PREACTION_WARN_CHURN = 3
+# How many target files are probed for recorded verification. Bounded because
+# this is a pre-change check and must stay cheap.
+PREACTION_VERIFY_PROBE = 5
+# How many files carrying an external edge are inventoried. Both probes count
+# only the files that actually hold the evidence in question, so the cap binds
+# on a genuinely large body of evidence rather than on scope size — and when it
+# does bind it is reported, never silently rendered as an empty result.
+PREACTION_EXTERNAL_PROBE = 20
+# How many of a target's symbols are followed into the dependency graph. A file
+# can hold hundreds; the footprint stays a lower bound and says so rather than
+# turning a pre-change check into a full graph walk.
+PREACTION_SYMBOL_PROBE = 25
 # Roughly four characters per token. Deliberately crude: CodeLedger takes no
 # tokenizer dependency, and every figure derived from this is labelled an
 # estimate rather than presented as a measurement.
@@ -1561,6 +1583,374 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 "guidance": ("Present these candidates and ask which is intended. The intended target is UNKNOWN: "
                              "CodeLedger matched words, not meaning, and cannot tell which area the request is "
                              "about. Do not choose one silently, and do not treat the first as the likeliest.")}
+
+    def _target_scope(self, intent: str, files, symbols) -> dict:
+        """What this change is about to touch, and how that was established.
+
+        Two ways in. The agent may already know — it names files or symbols, and
+        there is nothing to disambiguate because it has answered the question
+        itself. Or it does not, and the repository is asked what the request
+        could be about. Which of those happened travels in `source`, because an
+        agent-supplied scope is the agent's claim and a discovered one is the
+        ledger's, and a reader is entitled to know whose it is.
+        """
+        named_files = sorted({str(path) for path in (files or []) if str(path).strip()})
+        named_symbols = sorted({str(name) for name in (symbols or []) if str(name).strip()})
+        if named_files or named_symbols:
+            if named_symbols and not named_files:
+                owners = self._symbol_files(set(named_symbols))
+                named_files = sorted({path for paths in owners.values() for path in paths})
+            return {"source": "agent-supplied", "files": named_files, "symbols": named_symbols,
+                    "target": {"status": "TARGET_SUPPLIED", "intended_target": ", ".join(named_files[:3]) or ", ".join(named_symbols[:3]),
+                               "candidate_count": 1, "evidence": ["the caller named the target explicitly"],
+                               "guidance": "The caller supplied this scope; CodeLedger did not infer it."},
+                    "candidates": {"request": intent, "candidates": [], "candidate_count": 0,
+                                   "tokens": [], "named_paths": named_files, "candidates_truncated": False,
+                                   "order": "not applicable; the caller named the target"}}
+        found = self.candidate_targets(intent)
+        target = self._target_ambiguity(found)
+        chosen = found["candidates"][0]["files"] if target["status"] == "TARGET_RESOLVED" else []
+        # Every candidate's files when resolved, not just the first — a request
+        # naming a directory legitimately resolves to several areas at once.
+        if target["status"] == "TARGET_RESOLVED":
+            chosen = sorted({path for item in found["candidates"] for path in item["files"]})
+        return {"source": "candidate-discovery", "files": chosen,
+                "symbols": sorted({name for item in found["candidates"] for name in item["symbols"]})
+                if target["status"] == "TARGET_RESOLVED" else [],
+                "target": target, "candidates": found}
+
+    def _coverage_of(self, paths: list[str]) -> dict:
+        """How well the target files were analysed, per file and overall.
+
+        The pre-change question this answers is not "did we parse it" but "is an
+        empty dependent list worth anything". Under shallow analysis it is not,
+        and saying so is the difference between an honest UNKNOWN and a
+        confident wrong answer about containment.
+        """
+        rows = {row["path"]: (row["coverage"] or SHALLOW) for row in self.db.execute(
+            f"SELECT path,coverage FROM files WHERE status!='deleted' AND path IN ({','.join('?' * len(paths))})",
+            paths)} if paths else {}
+        unanalysed = sorted(set(paths) - set(rows))
+        full = sorted(path for path, tier in rows.items() if tier == FULL)
+        shallow = sorted(path for path, tier in rows.items() if tier != FULL)
+        # No target is not a coverage finding. Reporting "none" here would read
+        # as "these files could not be analysed" when in fact there are no files
+        # yet, which are different states and lead to different questions.
+        if not paths:
+            tier = UNKNOWN
+        elif not shallow and not unanalysed:
+            tier = FULL
+        elif not rows:
+            tier = "none"
+        else:
+            tier = SHALLOW
+        return {"tier": tier, "full": full, "shallow": shallow, "unanalysed": unanalysed,
+                "trust": trust(tier if tier in (FULL, SHALLOW) else "none" if tier == "none" else "absent")}
+
+    def _footprint_of(self, paths: list[str], names: list[str]) -> dict:
+        """Which files a change to this target would reach, from the index alone.
+
+        `fallback=False` deliberately: the scanning fallback reads the whole
+        working tree, which is the right trade when a user has asked about one
+        symbol and the wrong one on a pre-change check that may run on every
+        edit. The cost is that an empty answer is weaker, which is why coverage
+        travels beside it and decides what the emptiness is worth.
+        """
+        if names:
+            symbols = sorted(set(names))
+        elif paths:
+            symbols = sorted({row["name"] for row in self.db.execute(
+                f"SELECT name FROM symbols WHERE status='active' AND file_id IN "
+                f"(SELECT id FROM files WHERE path IN ({','.join('?' * len(paths))}))", paths)})
+        else:
+            symbols = []
+        reached: set[str] = set()
+        for name in symbols[:PREACTION_SYMBOL_PROBE]:
+            reached.update(self.impact(name, fallback=False)["referencing_files"])
+        reached -= set(paths)
+        areas = self._areas(reached)
+        return {"symbols_examined": symbols[:PREACTION_SYMBOL_PROBE], "symbol_count": len(symbols),
+                "symbols_truncated": len(symbols) > PREACTION_SYMBOL_PROBE,
+                "dependent_files": sorted(reached)[:CANDIDATE_FILE_LIMIT], "dependent_count": len(reached),
+                "areas": areas, "area_count": len(areas)}
+
+    def _activity_on(self, paths: list[str]) -> dict:
+        """How much these files have moved lately, from recorded changes."""
+        if not paths:
+            return {"changes_touching_target": 0, "window": PREACTION_CHURN_WINDOW, "agents": []}
+        slots = ",".join("?" * len(paths))
+        rows = [dict(row) for row in self.db.execute(
+            f"SELECT c.id,c.agent FROM changes c JOIN change_files f ON f.change_id=c.id "
+            f"WHERE f.path IN ({slots}) AND c.id > (SELECT COALESCE(MAX(id),0)-? FROM changes) "
+            f"GROUP BY c.id", (*paths, PREACTION_CHURN_WINDOW))]
+        return {"changes_touching_target": len(rows), "window": PREACTION_CHURN_WINDOW,
+                "agents": sorted({row["agent"] for row in rows if row["agent"]})}
+
+    def _verification_on(self, paths: list[str]) -> dict:
+        """Recorded verification for the target files, and whether it still holds.
+
+        The probe is bounded because `verification_state` is not cheap — it asks
+        git for the current commit — but it is bounded over the files that
+        *have* verification rows rather than over the first few files in the
+        scope. Probing the scope blindly meant a verified file in seventh place
+        was never looked at, so widening a change from one file to eight turned
+        a WARN into a PROCEED: more scope, weaker verdict, and nothing in the
+        answer saying why. Selecting the relevant files first costs one indexed
+        query and makes the cap bind only when a scope genuinely holds more
+        verified files than the probe allows.
+
+        When it does bind, the remainder is reported rather than dropped. An
+        unprobed file is not an unverified one, and the difference has to
+        survive into the answer or the count becomes a claim it cannot support.
+        """
+        if not paths:
+            return {"states": [], "verified_files": 0, "probed": 0, "truncated": False, "unprobed": []}
+        verified = sorted({row["subject_id"] for row in self.db.execute(
+            f"SELECT DISTINCT subject_id FROM verifications WHERE subject_type='file' "
+            f"AND subject_id IN ({','.join('?' * len(paths))})", paths)})
+        probed, unprobed = verified[:PREACTION_VERIFY_PROBE], verified[PREACTION_VERIFY_PROBE:]
+        states = []
+        for path in probed:
+            state = self.verification_state("file", path)
+            if state.get("applicability") != "NONE":
+                states.append({"subject": path, **{key: state[key] for key in
+                               ("applicability", "result_recorded", "reason") if key in state},
+                               "trust": trust("verified" if (state.get("provenance") or {}).get("command")
+                                              else "recorded-verification", state.get("applicability", "N/A"))})
+        return {"states": states, "verified_files": len(verified), "probed": len(probed),
+                "truncated": bool(unprobed), "unprobed": unprobed[:CANDIDATE_FILE_LIMIT]}
+
+    def _external_on(self, paths: list[str]) -> dict:
+        """What the target files need from outside, over the files that need anything.
+
+        Same failure as the verification probe and the same fix. Slicing the
+        scope to the first twenty files meant a scope of twenty-five reported an
+        empty inventory when the twenty-fifth was the one reading the
+        environment — and an empty inventory is indistinguishable from "needs
+        nothing", which is the reading that makes a change look safe.
+
+        Narrowing to the files that actually carry an external edge is one
+        indexed query and leaves the cap binding only on a scope with more such
+        files than the probe allows. That case reports itself.
+        """
+        empty = {"environment_variables": [], "external_packages": [], "cannot_prove": []}
+        if not paths:
+            return {**empty, "files_with_external_needs": 0, "files_probed": 0, "probe_truncated": False}
+        needing = sorted({row["path"] for row in self.db.execute(
+            f"SELECT DISTINCT f.path FROM dependencies d JOIN files f ON f.id=d.source_file_id "
+            f"WHERE d.kind IN ({','.join('?' * len(EXTERNAL_EDGE_KINDS))}) "
+            f"AND f.path IN ({','.join('?' * len(paths))})", (*EXTERNAL_EDGE_KINDS, *paths))})
+        probed = needing[:PREACTION_EXTERNAL_PROBE]
+        report = self.external_dependencies(probed) if probed else dict(empty)
+        return {**report, "files_with_external_needs": len(needing), "files_probed": len(probed),
+                "probe_truncated": len(needing) > len(probed)}
+
+    def pre_action(self, intent: str = "", files: list[str] | None = None,
+                   symbols: list[str] | None = None) -> dict:
+        """Engineering evidence about a change, before it is made.
+
+        Answers one question — "does the repository support what is about to
+        happen?" — and answers it with measurements, not permission. The outcome
+        is a label over the evidence returned alongside it, and every input to
+        that label is in `signals` with the threshold it was compared against,
+        so a caller can recompute the verdict and disagree with it. Nothing here
+        blocks anything: WARN means "here is what this reaches", not "no".
+
+        It consumes evidence and never creates any. Trust levels come from the
+        existing projection and are only ever passed through; a check cannot
+        make a shallow parse into a proven one by looking at it harder.
+
+        The one thing it will not do is choose. A request matching several parts
+        of the repository comes back CLARIFY with all of them and no ranking,
+        because which one was meant is a question about intent, and intent is
+        not in the index.
+        """
+        scope = self._target_scope(intent, files, symbols)
+        target, paths = scope["target"], scope["files"]
+        coverage = self._coverage_of(paths)
+        footprint = self._footprint_of(paths, scope["symbols"])
+        stamp = self.as_of(paths or None)
+        external = self._external_on(paths)
+        verification = self._verification_on(paths)
+        activity = self._activity_on(paths)
+        radius = {"files": footprint["dependent_files"], "areas": footprint["areas"],
+                  "file_count": footprint["dependent_count"], "area_count": footprint["area_count"],
+                  "confidence": "HIGH" if coverage["tier"] == FULL else "LOW" if coverage["tier"] == SHALLOW else UNKNOWN}
+        lexical = self.analyze_prompt(intent, scope=False)["request_risk_hint"] if intent else None
+        measured = self._impact_risk({"target_ambiguity": target, "blast_radius": radius,
+                                      "coverage_caveat": "shallow" if coverage["tier"] != FULL else None})
+        # Everything the outcome is computed from, with the number it was
+        # compared against. This is the whole of the reasoning: there is no
+        # branch below that consults anything absent from here.
+        signals = {
+            "target_status": target["status"],
+            "candidate_count": target.get("candidate_count", 0),
+            "coverage_tier": coverage["tier"],
+            "unanalysed_files": len(coverage["unanalysed"]),
+            "shallow_files": len(coverage["shallow"]),
+            "stale_files": len(stamp["stale_files"]),
+            "dependent_files": footprint["dependent_count"],
+            "dependent_files_threshold": PREACTION_WARN_FILES,
+            "affected_areas": footprint["area_count"],
+            "affected_areas_threshold": PREACTION_WARN_AREAS,
+            "external_dependencies": len(external["environment_variables"]) + len(external["external_packages"]),
+            # Truncation travels as its own signal rather than being folded into
+            # the count above. A count that quietly means "at least this many"
+            # cannot be compared against a threshold, and the outcome has to be
+            # able to tell "nothing found" from "not all of it was looked at".
+            "external_probe_truncated": external["probe_truncated"],
+            "current_verifications": sum(1 for item in verification["states"]
+                                         if item.get("applicability") == "CURRENT"),
+            "verification_probe_truncated": verification["truncated"],
+            "changes_touching_target": activity["changes_touching_target"],
+            "churn_threshold": PREACTION_WARN_CHURN,
+        }
+        outcome, because = self._pre_action_outcome(signals)
+        result = {
+            "intent": intent, "outcome": outcome, "because": because,
+            "evidence": {"targets": {**scope["candidates"], "target_ambiguity": target},
+                         "scope": {"source": scope["source"], "files": paths, "symbols": scope["symbols"]},
+                         "coverage": coverage, "footprint": footprint, "external": external,
+                         "verification": verification, "activity": activity,
+                         "risk": {"impact_risk": measured, "request_risk_hint": lexical},
+                         "as_of": stamp},
+            "signals": signals,
+            "limits": self._pre_action_limits(coverage, footprint, stamp, verification, external,
+                                              scope["candidates"]),
+        }
+        if outcome == "CLARIFY":
+            found = scope["candidates"]
+            areas = [item["area"] for item in found["candidates"]]
+            shown, total = len(areas), found["candidate_count"]
+            truncated = found["candidates_truncated"]
+            # The count belongs in the question, not only in a flag further down
+            # the payload. A caller rendering the question and the options — the
+            # obvious thing to do with them — was being handed a partial list
+            # that read as the whole one.
+            result["question"] = ("Which target is intended?" if not truncated else
+                                  f"Which target is intended? {total} areas matched and {shown} are listed "
+                                  f"below; the list is incomplete.")
+            # The concrete areas, in the alphabetical order they were found, and
+            # then the answers that are not an area. No entry is marked likelier
+            # than another, because nothing measured makes one likelier.
+            result["options"] = [*areas,
+                                 *([f"ask for the remaining {total - shown} area(s) not listed here"] if truncated else []),
+                                 "all affected areas", "specify another path"]
+            result["candidate_count"] = total
+            result["candidates_shown"] = shown
+            result["candidates_truncated"] = truncated
+        result["guidance"] = self._pre_action_guidance(outcome, target)
+        return result
+
+    @staticmethod
+    def _pre_action_outcome(signals: dict) -> tuple[str, list[str]]:
+        """The verdict, as a function of `signals` and nothing else.
+
+        Written as one readable cascade so that "recomputable from the evidence"
+        is a property of the code rather than a promise about it. Order is the
+        argument: not knowing what the target is outranks not knowing its size,
+        which outranks knowing it is large. Any doubt costs the claim, which is
+        the same rule the verification lattice follows.
+        """
+        because: list[str] = []
+        if signals["target_status"] == "TARGET_UNKNOWN":
+            return "UNKNOWN", ["no candidate target matched the request",
+                               "the repository holds no evidence establishing what to change"]
+        if signals["target_status"] == "TARGET_AMBIGUOUS":
+            return "CLARIFY", [f"{signals['candidate_count']} candidate targets matched the request",
+                               "the request names no path or area",
+                               "which one is intended is UNKNOWN and cannot be derived from the repository"]
+        if signals["unanalysed_files"]:
+            because.append(f"{signals['unanalysed_files']} target file(s) are not in the index")
+        if signals["shallow_files"]:
+            because.append(f"{signals['shallow_files']} target file(s) are analysed shallowly, "
+                           "so an empty dependent list proves nothing")
+        if signals["stale_files"]:
+            because.append(f"{signals['stale_files']} target file(s) changed on disk since they were indexed")
+        if because:
+            return "UNKNOWN", [*because, "the footprint cannot be measured from the current index"]
+        if signals["dependent_files"] > signals["dependent_files_threshold"]:
+            because.append(f"{signals['dependent_files']} dependent file(s), over the "
+                           f"{signals['dependent_files_threshold']} that makes a change notable")
+        if signals["affected_areas"] >= signals["affected_areas_threshold"]:
+            because.append(f"the change reaches {signals['affected_areas']} areas, at or over "
+                           f"{signals['affected_areas_threshold']}")
+        if signals["external_dependencies"]:
+            because.append(f"the target needs {signals['external_dependencies']} thing(s) from outside the "
+                           "repository, whose state here is UNKNOWN")
+        if signals["current_verifications"]:
+            because.append(f"{signals['current_verifications']} verification(s) currently describe this target "
+                           "and would stop doing so")
+        if signals["changes_touching_target"] >= signals["churn_threshold"]:
+            because.append(f"{signals['changes_touching_target']} recent change(s) already touched this target, "
+                           f"at or over {signals['churn_threshold']}")
+        # A probe that ran out is not a probe that found nothing. Both counts
+        # above become lower bounds when their probe was capped, so neither can
+        # clear a threshold on its own — and PROCEED, which is exactly the claim
+        # that every threshold was cleared, is no longer available. Without this
+        # a wider scope could exhaust a probe and come back safer than the
+        # narrow one it contains.
+        if signals["verification_probe_truncated"]:
+            because.append("verification evidence was probed up to its limit, so whether more of this target "
+                           "is currently verified is UNKNOWN")
+        if signals["external_probe_truncated"]:
+            because.append("the external dependency inventory was probed up to its limit, so what else this "
+                           "target needs from outside is UNKNOWN")
+        if because:
+            return "WARN", because
+        return "PROCEED", [f"the target is established ({signals['target_status']})",
+                           f"all target files are fully analysed and current",
+                           f"{signals['dependent_files']} dependent file(s) across "
+                           f"{signals['affected_areas']} area(s), under every threshold"]
+
+    @staticmethod
+    def _pre_action_limits(coverage: dict, footprint: dict, stamp: dict,
+                           verification: dict, external: dict, candidates: dict) -> list[str]:
+        """What this check could not see, said out loud rather than left blank.
+
+        Every bounded probe reports itself here. The rule the omissions broke is
+        that bounded evidence must never be presented as complete evidence: a
+        capped probe that says nothing is indistinguishable from a thorough one
+        that found nothing, and the two justify opposite decisions.
+        """
+        limits = ["The dependency index records what the source says statically; a reference built at runtime "
+                  "or resolved by name is not visible to it, so an empty dependent list is not proof of isolation."]
+        if coverage["shallow"] or coverage["unanalysed"]:
+            limits.append(f"{len(coverage['shallow']) + len(coverage['unanalysed'])} target file(s) are not fully "
+                          "analysed; their edges were recorded conservatively or not at all.")
+        if footprint["symbols_truncated"]:
+            limits.append(f"{footprint['symbol_count']} symbols are in scope and the first "
+                          f"{PREACTION_SYMBOL_PROBE} were examined; the footprint is a lower bound.")
+        if verification.get("truncated"):
+            limits.append(f"{verification['verified_files']} target file(s) carry recorded verification and "
+                          f"{verification['probed']} were checked; the verification picture is incomplete, and "
+                          f"an unprobed file is not an unverified one.")
+        if external.get("probe_truncated"):
+            limits.append(f"{external['files_with_external_needs']} target file(s) need something from outside "
+                          f"and {external['files_probed']} were inventoried; the list below is a lower bound, "
+                          f"not an empty or complete answer.")
+        if candidates.get("candidates_truncated"):
+            limits.append(f"{candidates['candidate_count']} areas matched and "
+                          f"{len(candidates['candidates'])} are listed; the candidate list is incomplete.")
+        if stamp["stale_files"]:
+            limits.append("Some target files have changed on disk since indexing; run `codeledger refresh --changed`.")
+        return limits
+
+    @staticmethod
+    def _pre_action_guidance(outcome: str, target: dict) -> str:
+        if outcome == "CLARIFY":
+            return ("Ask which target is intended and wait for an answer. The options are the areas that matched, "
+                    "in alphabetical order; none is more likely than another, and CodeLedger cannot tell which "
+                    "was meant. Do not pick one silently.")
+        if outcome == "UNKNOWN":
+            return ("CodeLedger does not have the evidence to describe this change. That is not permission to "
+                    "proceed and not a reason to stop — it means the footprint is unmeasured, so treat any "
+                    "assumption about what this touches as unproven and say so to the user.")
+        if outcome == "WARN":
+            return ("This is measured impact, not a refusal. The listed evidence is what the change reaches; "
+                    "confirm with the user that this is intended before editing.")
+        return ("The target is established and its measured footprint is small. This describes evidence, not "
+                "correctness: CodeLedger cannot tell whether the change itself is right.")
 
     def project_context(self, query: str = "") -> dict:
         """The engineering context for one question, composed once and kept small.

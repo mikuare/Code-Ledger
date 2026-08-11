@@ -12,7 +12,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from codeledger.cli import build_parser
-from codeledger.core import Ledger, process_alive
+from codeledger.core import Ledger, process_alive, PREACTION_WARN_CHURN, PREACTION_VERIFY_PROBE, PREACTION_EXTERNAL_PROBE
 from codeledger import db as db_module
 from codeledger.db import SCHEMA
 from codeledger.parser import digest_bytes
@@ -4482,6 +4482,27 @@ class EnvironmentEdgeUpgradeTests(unittest.TestCase):
             self.assertGreaterEqual(ledger.db.execute("SELECT COUNT(*) FROM changes").fetchone()[0], before,
                                     "change history was lost")
 
+def forlive_shaped(root: Path) -> None:
+    """A repository laid out the way the production project this was built for is.
+
+    Authentication is not one place: it is a directory of screens, three Edge
+    Functions with their own names, and a migration. That shape is the whole
+    reason candidate discovery exists, so the fixtures use it rather than a
+    tidier invention where every request has one obvious answer.
+    """
+    (root / "src" / "auth").mkdir(parents=True)
+    (root / "src" / "lib").mkdir(parents=True)
+    (root / "supabase" / "functions" / "auth-login").mkdir(parents=True)
+    (root / "supabase" / "functions" / "password-recovery").mkdir(parents=True)
+    (root / "supabase" / "migrations").mkdir(parents=True)
+    (root / "src" / "auth" / "SignIn.py").write_text("def SignIn():\n    return 1\n")
+    (root / "src" / "auth" / "AuthGate.py").write_text("def AuthGate():\n    return 1\n")
+    (root / "src" / "auth" / "ResetPassword.py").write_text("def ResetPassword():\n    return 1\n")
+    (root / "src" / "lib" / "supabase.py").write_text("import os\n\ndef client():\n    return os.environ['SUPABASE_URL']\n")
+    (root / "supabase" / "functions" / "auth-login" / "index.py").write_text(
+        "import os\n\ndef captchaIsValid():\n    return os.environ['HCAPTCHA_SECRET']\n")
+    (root / "supabase" / "functions" / "password-recovery" / "index.py").write_text("def recover():\n    return 1\n")
+    (root / "supabase" / "migrations" / "0001_username_login.py").write_text("def on_auth_user_created():\n    return 1\n")
 
 class EnvironmentCallExtractionTests(unittest.TestCase):
     """`Deno.env.get("X")` reads X. It does not also read a variable called `get`.
@@ -4540,29 +4561,6 @@ class EnvironmentCallExtractionTests(unittest.TestCase):
             ledger = Ledger(root); ledger.init()
             stamp = ledger.db.execute("SELECT analysis_version FROM files WHERE path='app.py'").fetchone()[0]
             self.assertTrue(stamp.endswith(":4"), f"analysis stamp did not move past the fabrication: {stamp}")
-
-
-def forlive_shaped(root: Path) -> None:
-    """A repository laid out the way the production project this was built for is.
-
-    Authentication is not one place: it is a directory of screens, three Edge
-    Functions with their own names, and a migration. That shape is the whole
-    reason candidate discovery exists, so the fixtures use it rather than a
-    tidier invention where every request has one obvious answer.
-    """
-    (root / "src" / "auth").mkdir(parents=True)
-    (root / "src" / "lib").mkdir(parents=True)
-    (root / "supabase" / "functions" / "auth-login").mkdir(parents=True)
-    (root / "supabase" / "functions" / "password-recovery").mkdir(parents=True)
-    (root / "supabase" / "migrations").mkdir(parents=True)
-    (root / "src" / "auth" / "SignIn.py").write_text("def SignIn():\n    return 1\n")
-    (root / "src" / "auth" / "AuthGate.py").write_text("def AuthGate():\n    return 1\n")
-    (root / "src" / "auth" / "ResetPassword.py").write_text("def ResetPassword():\n    return 1\n")
-    (root / "src" / "lib" / "supabase.py").write_text("import os\n\ndef client():\n    return os.environ['SUPABASE_URL']\n")
-    (root / "supabase" / "functions" / "auth-login" / "index.py").write_text(
-        "import os\n\ndef captchaIsValid():\n    return os.environ['HCAPTCHA_SECRET']\n")
-    (root / "supabase" / "functions" / "password-recovery" / "index.py").write_text("def recover():\n    return 1\n")
-    (root / "supabase" / "migrations" / "0001_username_login.py").write_text("def on_auth_user_created():\n    return 1\n")
 
 class EmptyEvidenceInvariantTests(unittest.TestCase):
     """Nothing found is not a saving, and not a measurement to be confident about.
@@ -4627,7 +4625,6 @@ class EmptyEvidenceInvariantTests(unittest.TestCase):
             self.assertEqual(efficiency["files_relevant"], 0)
             self.assertEqual(efficiency["files_avoided"], 0,
                              "a checkpoint that named no file reported the repository as avoided")
-
 
 class CandidateTargetTests(unittest.TestCase):
     """"Fix the authentication" must find the authentication, or say it did not.
@@ -4994,3 +4991,576 @@ class McpSurfaceCompatibilityTests(unittest.TestCase):
         names = {name for name, _description in mcp.TOOLS}
         self.assertIn("codeledger_find_targets", names)
         self.assertIn("codeledger_get_project_context", names)
+
+def recompute_outcome(result: dict) -> str:
+    """Re-derive the verdict from the returned evidence, independently of `core`.
+
+    Deliberately a second implementation rather than a call into the first: a
+    test that reuses the production function proves the function agrees with
+    itself. This reads only what the caller receives, which is the actual claim
+    being made — that nothing was decided by reasoning the response withheld.
+    """
+    s = result["signals"]
+    if s["target_status"] == "TARGET_UNKNOWN": return "UNKNOWN"
+    if s["target_status"] == "TARGET_AMBIGUOUS": return "CLARIFY"
+    if s["unanalysed_files"] or s["shallow_files"] or s["stale_files"]: return "UNKNOWN"
+    if (s["dependent_files"] > s["dependent_files_threshold"]
+            or s["affected_areas"] >= s["affected_areas_threshold"]
+            or s["external_dependencies"]
+            or s["current_verifications"]
+            or s["changes_touching_target"] >= s["churn_threshold"]): return "WARN"
+    return "PROCEED"
+
+class PreActionCheckTests(unittest.TestCase):
+    """Evidence about a change before it is made — never a decision about it."""
+
+    def ledger(self, directory: str) -> Ledger:
+        root = Path(directory); forlive_shaped(root)
+        ledger = Ledger(root); ledger.init(); return ledger
+
+    def wide(self, directory: str) -> Ledger:
+        """A shared symbol reaching enough areas to be worth reporting."""
+        root = Path(directory)
+        (root / "shared.py").write_text("def helper():\n    return 1\n")
+        for area in ("one", "two", "three", "four"):
+            (root / area).mkdir()
+            (root / area / "m.py").write_text(f"from shared import helper\n\ndef {area}():\n    return helper()\n")
+        ledger = Ledger(root); ledger.init(); return ledger
+
+    def isolated(self, directory: str) -> Ledger:
+        """A fully analysed file nothing depends on and nothing outside it needs."""
+        root = Path(directory)
+        (root / "solo.py").write_text("def only_here():\n    return 1\n")
+        ledger = Ledger(root); ledger.init(); return ledger
+
+    # 1
+    def test_a_vague_request_with_several_targets_asks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("fix the authentication")
+            self.assertEqual(result["outcome"], "CLARIFY")
+            self.assertEqual(result["question"], "Which target is intended?")
+            self.assertIn("all affected areas", result["options"])
+            self.assertIn("specify another path", result["options"])
+            self.assertIn("src/auth", result["options"])
+
+    # 2
+    def test_a_unique_explicit_path_proceeds_or_warns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("fix src/auth/SignIn.py")
+            self.assertIn(result["outcome"], ("PROCEED", "WARN"))
+            self.assertEqual(result["signals"]["target_status"], "TARGET_RESOLVED")
+
+    # 3
+    def test_a_target_that_does_not_exist_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("fix the unicorn subsystem")
+            self.assertEqual(result["outcome"], "UNKNOWN")
+            self.assertIn("no candidate target matched the request", result["because"])
+
+    # 4
+    def test_an_ambiguous_destructive_request_clarifies_rather_than_alarming(self):
+        """The word "delete" must not become a verdict on its own."""
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("delete the old authentication code")
+            self.assertEqual(result["outcome"], "CLARIFY")
+            self.assertEqual(result["evidence"]["risk"]["request_risk_hint"]["level"], "HIGH")
+            self.assertEqual(result["evidence"]["risk"]["impact_risk"]["level"], "UNKNOWN")
+            self.assertFalse(any("delete" in line or "HIGH" in line for line in result["because"]),
+                             f"request wording leaked into the verdict: {result['because']}")
+
+    # 5
+    def test_a_resolved_wide_blast_radius_warns_with_its_measurements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.wide(directory).pre_action("change helper", symbols=["helper"])
+            self.assertEqual(result["outcome"], "WARN")
+            self.assertGreaterEqual(result["signals"]["affected_areas"],
+                                    result["signals"]["affected_areas_threshold"])
+            self.assertTrue(any("areas" in line for line in result["because"]))
+
+    # 6
+    def test_an_unresolvable_footprint_is_unknown_not_low(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.ledger(directory)
+            result = ledger.pre_action("fix the authentication")
+            self.assertEqual(result["outcome"], "CLARIFY")
+            self.assertEqual(result["evidence"]["risk"]["impact_risk"]["level"], "UNKNOWN")
+            self.assertNotIn(result["evidence"]["risk"]["impact_risk"]["level"], ("LOW", "MEDIUM"))
+
+    # 7
+    def test_shallow_coverage_downgrades_to_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "styles.css").write_text(".a { color: red; }\n")
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("restyle", files=["styles.css"])
+            self.assertEqual(result["outcome"], "UNKNOWN")
+            self.assertNotEqual(result["evidence"]["coverage"]["trust"]["level"], "PROVEN")
+            self.assertTrue(any("shallow" in line for line in result["because"]))
+
+    def test_a_file_outside_the_index_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("change it", files=["not/in/the/index.py"])
+            self.assertEqual(result["outcome"], "UNKNOWN")
+            self.assertEqual(result["signals"]["unanalysed_files"], 1)
+
+    # 8
+    def test_external_dependencies_appear_in_the_evidence_by_name_only(self):
+        """Names reach the evidence. The values behind them never do."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            secret = "sb-live-4f9c2a-do-not-leak"
+            (root / ".env").write_text(f"SUPABASE_URL={secret}\n")
+            (root / ".env.local").write_text(f"SUPABASE_URL={secret}\n")
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("fix it", files=["src/lib/supabase.py"])
+            names = {item["name"] for item in result["evidence"]["external"]["environment_variables"]}
+            self.assertIn("SUPABASE_URL", names)
+            self.assertNotIn(secret, json.dumps(result, default=str),
+                             "a secret value reached the pre-action evidence")
+            self.assertTrue(any("outside the repository" in line for line in result["because"]))
+
+    # 9
+    def test_verification_currentness_appears_in_the_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.ledger(directory)
+            ledger.verify("file", "src/auth/SignIn.py", "TEST", "PASSED", "suite green")
+            result = ledger.pre_action("fix it", files=["src/auth/SignIn.py"])
+            recorded = result["evidence"]["verification"]["states"]
+            self.assertTrue(recorded, "a recorded verification did not reach the evidence")
+            self.assertIn("applicability", recorded[0])
+            self.assertIn(recorded[0]["trust"]["level"], ("PROVEN", "RECORDED", "INFERRED", "UNKNOWN"))
+            self.assertFalse(result["evidence"]["verification"]["truncated"])
+
+    # 10
+    def test_as_of_reports_the_repository_state_the_answer_describes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("fix src/auth/SignIn.py")
+            for key in ("git_commit", "tree_dirty", "indexed_at", "stale_files", "computed_at"):
+                self.assertIn(key, result["evidence"]["as_of"])
+
+    def test_a_stale_target_is_downgraded_rather_than_reported_as_current(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.ledger(directory)
+            time.sleep(0.01)
+            (Path(directory) / "src" / "auth" / "SignIn.py").write_text("def SignIn():\n    return 99\n")
+            result = ledger.pre_action("fix it", files=["src/auth/SignIn.py"])
+            self.assertEqual(result["outcome"], "UNKNOWN")
+            self.assertEqual(result["signals"]["stale_files"], 1)
+            self.assertTrue(any("changed on disk" in line for line in result["because"]))
+
+    # 11
+    def test_every_outcome_is_recomputable_from_the_returned_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.ledger(directory)
+            requests = ["fix the authentication", "fix src/auth/SignIn.py", "fix the unicorn subsystem",
+                        "delete the old authentication code", "captcha", "update supabase/functions"]
+            seen = set()
+            for request in requests:
+                result = ledger.pre_action(request)
+                seen.add(result["outcome"])
+                self.assertEqual(recompute_outcome(result), result["outcome"],
+                                 f"{request!r} produced {result['outcome']} that its own evidence does not explain")
+            self.assertIn("CLARIFY", seen); self.assertIn("UNKNOWN", seen)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.wide(directory).pre_action("change helper", symbols=["helper"])
+            self.assertEqual(recompute_outcome(result), result["outcome"])
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.isolated(directory).pre_action("edit it", files=["solo.py"])
+            self.assertEqual(result["outcome"], "PROCEED")
+            self.assertEqual(recompute_outcome(result), "PROCEED")
+
+    def test_the_signals_carry_the_thresholds_they_were_compared_against(self):
+        with tempfile.TemporaryDirectory() as directory:
+            signals = self.ledger(directory).pre_action("fix src/auth/SignIn.py")["signals"]
+            for key in ("dependent_files_threshold", "affected_areas_threshold", "churn_threshold"):
+                self.assertIsInstance(signals[key], int)
+
+    # 12
+    def test_no_outcome_silently_selects_a_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("fix the authentication")
+            self.assertEqual(result["evidence"]["targets"]["target_ambiguity"]["intended_target"], "UNKNOWN")
+            self.assertEqual(result["evidence"]["scope"]["files"], [],
+                             "an ambiguous request had a scope chosen for it")
+            for word in ("recommended", "most likely", "best match", "probably"):
+                self.assertNotIn(word, json.dumps(result).lower())
+
+    # 13
+    def test_no_outcome_blocks_or_forbids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.ledger(directory)
+            for request in ("fix the authentication", "delete the old authentication code",
+                            "fix the unicorn subsystem", "fix src/auth/SignIn.py"):
+                result = ledger.pre_action(request)
+                self.assertIn(result["outcome"], ("PROCEED", "CLARIFY", "WARN", "UNKNOWN"))
+                text = json.dumps(result).lower()
+                for word in ("forbidden", "denied", "blocked", "not permitted", "you may not"):
+                    self.assertNotIn(word, text, f"{request!r} produced blocking language")
+
+    def test_the_check_creates_no_evidence_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.ledger(directory)
+            counts = lambda: tuple(ledger.db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                                   for table in ("changes", "verifications", "checkpoints", "symbols", "dependencies"))
+            before = counts()
+            ledger.pre_action("fix the authentication")
+            ledger.pre_action("fix src/auth/SignIn.py")
+            self.assertEqual(before, counts(), "a read-only check wrote to the ledger")
+
+    def test_an_agent_supplied_scope_is_marked_as_the_agents_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.ledger(directory).pre_action("tidy up", files=["src/auth/SignIn.py"])
+            self.assertEqual(result["evidence"]["scope"]["source"], "agent-supplied")
+            self.assertEqual(result["signals"]["target_status"], "TARGET_SUPPLIED")
+
+    def test_request_wording_alone_cannot_produce_a_warning(self):
+        """The same footprint must give the same outcome whatever the verb."""
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.isolated(directory)
+            outcomes = {verb: ledger.pre_action(f"{verb} only_here", files=["solo.py"])["outcome"]
+                        for verb in ("delete", "remove", "improve", "tidy")}
+            self.assertEqual(set(outcomes.values()), {"PROCEED"}, f"wording changed the verdict: {outcomes}")
+
+    def test_the_check_never_upgrades_the_trust_of_what_it_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "styles.css").write_text(".a { color: red; }\n")
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("restyle", files=["styles.css"])
+            self.assertEqual(result["evidence"]["coverage"]["trust"]["level"], "INFERRED")
+
+    def test_limits_are_stated_even_when_the_outcome_is_proceed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.isolated(directory).pre_action("edit it", files=["solo.py"])
+            self.assertEqual(result["outcome"], "PROCEED")
+            self.assertTrue(any("not proof of isolation" in limit for limit in result["limits"]))
+
+class PreActionSurfaceTests(unittest.TestCase):
+    """Reachable from both surfaces, and additive to neither's contract."""
+
+    def test_the_mcp_tool_exists_with_a_schema(self):
+        from codeledger import mcp
+        names = {name for name, _description in mcp.TOOLS}
+        self.assertIn("codeledger_check_before_change", names)
+        schema = mcp.SCHEMAS["codeledger_check_before_change"]
+        for field in ("intent", "files", "symbols"):
+            self.assertIn(field, schema["properties"])
+
+    def test_the_cli_command_reports_the_outcome_and_its_reasons(self):
+        import io, contextlib
+        from codeledger.cli import main
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root); Ledger(root).init()
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                main(["--root", str(root), "check", "fix the authentication"])
+            output = buffer.getvalue()
+            self.assertIn("Outcome: CLARIFY", output)
+            self.assertIn("Which target is intended?", output)
+            self.assertIn("Limits:", output)
+            self.assertNotIn("forbidden", output.lower())
+
+class PreActionSignalWiringTests(unittest.TestCase):
+    """Each warning signal must actually reach the outcome, not merely be reported.
+
+    Written after mutation testing showed several guards could be disabled with
+    the suite still green: the evidence blocks were asserted, but nothing proved
+    they changed the verdict.
+    """
+
+    def test_recent_churn_alone_produces_a_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "solo.py").write_text("def only_here():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            clean = ledger.pre_action("edit it", files=["solo.py"])
+            self.assertEqual(clean["outcome"], "PROCEED")
+            for index in range(PREACTION_WARN_CHURN):
+                ledger.record_change("codex", "s", f"edit {index}", f"touched solo {index}",
+                                     "unverified", files=["solo.py"])
+            churned = ledger.pre_action("edit it", files=["solo.py"])
+            self.assertEqual(churned["outcome"], "WARN")
+            self.assertGreaterEqual(churned["signals"]["changes_touching_target"], PREACTION_WARN_CHURN)
+            self.assertTrue(any("recent change" in line for line in churned["because"]))
+
+    def test_a_current_verification_alone_produces_a_warning(self):
+        """A change that would invalidate live evidence is worth saying so."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_project(root, {"solo.py": "def only_here():\n    return 1\n"})
+            ledger = Ledger(root); ledger.init()
+            before = ledger.pre_action("edit it", files=["solo.py"])
+            self.assertEqual(before["signals"]["current_verifications"], 0)
+            self.assertEqual(before["outcome"], "PROCEED")
+            ledger.verify("file", "solo.py", "TEST", "PASSED", "suite green")
+            after = ledger.pre_action("edit it", files=["solo.py"])
+            self.assertEqual(after["signals"]["current_verifications"], 1,
+                             f"a fresh verification was not CURRENT: {after['evidence']['verification']['states']}")
+            self.assertEqual(after["outcome"], "WARN")
+            self.assertTrue(any("verification" in line for line in after["because"]))
+
+    def test_a_resolved_directory_scopes_every_area_it_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("update supabase/functions")
+            self.assertEqual(result["signals"]["target_status"], "TARGET_RESOLVED")
+            scoped = set(result["evidence"]["scope"]["files"])
+            self.assertIn("supabase/functions/auth-login/index.py", scoped)
+            self.assertIn("supabase/functions/password-recovery/index.py", scoped,
+                          "a resolved multi-area target dropped one of its areas")
+
+    def test_a_file_is_never_listed_as_its_own_dependent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "solo.py").write_text("def only_here():\n    return 1\n\ndef caller():\n    return only_here()\n")
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("edit it", files=["solo.py"])
+            self.assertNotIn("solo.py", result["evidence"]["footprint"]["dependent_files"],
+                             "the target counted itself in its own blast radius")
+            self.assertEqual(result["signals"]["dependent_files"], 0)
+
+    def test_the_footprint_uses_the_index_and_does_not_scan_the_working_tree(self):
+        """A name mentioned in a string is not a dependency, and must not become one."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "solo.py").write_text("def only_here():\n    return 1\n")
+            (root / "other.py").write_text('LABEL = "only_here"\n\ndef unrelated():\n    return LABEL\n')
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("edit it", files=["solo.py"])
+            self.assertEqual(result["signals"]["dependent_files"], 0,
+                             "a text match was counted as a dependency")
+            self.assertEqual(result["outcome"], "PROCEED")
+
+    def test_a_file_already_in_scope_is_not_collateral_damage(self):
+        """Dependents means files the change would reach *beyond itself*.
+
+        `impact` already drops the file a symbol is defined in, so this only
+        shows when the scope holds several files and one of them depends on
+        another: counting it inflates the blast radius with work the caller had
+        already declared it was doing.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "core_mod.py").write_text("def helper():\n    return 1\n")
+            (root / "user_mod.py").write_text("from core_mod import helper\n\ndef use():\n    return helper()\n")
+            (root / "outside.py").write_text("from core_mod import helper\n\ndef other():\n    return helper()\n")
+            ledger = Ledger(root); ledger.init()
+            both = ledger.pre_action("refactor", files=["core_mod.py", "user_mod.py"])
+            dependents = both["evidence"]["footprint"]["dependent_files"]
+            self.assertNotIn("user_mod.py", dependents,
+                             "a file the caller already named was counted as collateral")
+            self.assertIn("outside.py", dependents)
+            self.assertEqual(both["signals"]["dependent_files"], 1)
+
+# How permissive an outcome is. PROCEED is the only one that says "the evidence
+# is complete and clears every threshold"; the rest all withhold that claim.
+PERMISSIVENESS = {"UNKNOWN": 0, "CLARIFY": 0, "WARN": 1, "PROCEED": 2}
+
+class BoundedEvidenceTests(unittest.TestCase):
+    """Bounded evidence must never be presented as complete evidence.
+
+    Each probe in `pre_action` is capped for performance. A cap that goes
+    unreported turns "we stopped looking" into "there was nothing there", and
+    the two justify opposite decisions — which is how a scope of eight files
+    came back safer than the single file inside it that carried the evidence.
+    """
+
+    def git_files(self, root: Path, names: list[str]) -> Ledger:
+        for name in names:
+            (root / name).write_text("def fn_%s():\n    return 1\n" % name[:-3])
+        git_project(root, {})
+        ledger = Ledger(root); ledger.init(); return ledger
+
+    # ---- D-1 ----
+    def test_a_verified_file_is_found_wherever_it_sits_in_the_scope(self):
+        """The review case: the verification was on the eighth of eight files."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = ["f%02d.py" % index for index in range(8)]
+            ledger = self.git_files(root, names)
+            ledger.verify("file", "f07.py", "TEST", "PASSED", "green")
+            narrow = ledger.pre_action("refactor", files=["f07.py"])
+            wide = ledger.pre_action("refactor", files=names)
+            self.assertEqual(narrow["signals"]["current_verifications"], 1)
+            self.assertEqual(wide["signals"]["current_verifications"], 1,
+                             "a verified file beyond the probe position was dropped")
+            self.assertFalse(wide["signals"]["verification_probe_truncated"],
+                             "the probe should bind on verified files, not on scope size")
+            self.assertEqual(wide["outcome"], "WARN")
+
+    def test_an_exhausted_verification_probe_is_disclosed_and_not_permissive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = ["h%02d.py" % index for index in range(PREACTION_VERIFY_PROBE + 2)]
+            ledger = self.git_files(root, names)
+            for name in names:
+                ledger.verify("file", name, "TEST", "PASSED", "green")
+            result = ledger.pre_action("refactor", files=names)
+            block = result["evidence"]["verification"]
+            self.assertTrue(result["signals"]["verification_probe_truncated"])
+            self.assertEqual(block["verified_files"], len(names))
+            self.assertEqual(block["probed"], PREACTION_VERIFY_PROBE)
+            self.assertTrue(block["unprobed"], "the unprobed remainder was not reported")
+            self.assertNotEqual(result["outcome"], "PROCEED")
+            self.assertTrue(any("unprobed file is not an unverified one" in limit for limit in result["limits"]))
+
+    # ---- D-2 ----
+    def test_an_external_dependency_is_found_wherever_it_sits_in_the_scope(self):
+        """The review case: the environment read was in the twenty-fifth file."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = ["g%02d.py" % index for index in range(25)]
+            for name in names:
+                (root / name).write_text("def fn_%s():\n    return 1\n" % name[:-3])
+            (root / "g24.py").write_text("import os\n\ndef fn_g24():\n    return os.environ['DATABASE_URL']\n")
+            ledger = Ledger(root); ledger.init()
+            narrow = ledger.pre_action("refactor", files=["g24.py"])
+            wide = ledger.pre_action("refactor", files=names)
+            self.assertEqual(narrow["signals"]["external_dependencies"], 1)
+            self.assertEqual(wide["signals"]["external_dependencies"], 1,
+                             "an external dependency beyond the probe position was dropped")
+            self.assertFalse(wide["signals"]["external_probe_truncated"])
+            self.assertIn("DATABASE_URL",
+                          {item["name"] for item in wide["evidence"]["external"]["environment_variables"]})
+            self.assertEqual(wide["outcome"], "WARN")
+
+    def test_an_exhausted_external_probe_is_disclosed_and_not_an_empty_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = ["e%02d.py" % index for index in range(PREACTION_EXTERNAL_PROBE + 2)]
+            for name in names:
+                (root / name).write_text(
+                    "import os\n\ndef fn_%s():\n    return os.environ['VAR_%s']\n" % (name[:-3], name[1:3]))
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("refactor", files=names)
+            block = result["evidence"]["external"]
+            self.assertTrue(result["signals"]["external_probe_truncated"])
+            self.assertEqual(block["files_with_external_needs"], len(names))
+            self.assertEqual(block["files_probed"], PREACTION_EXTERNAL_PROBE)
+            self.assertTrue(block["environment_variables"],
+                            "a truncated inventory was rendered as an empty one")
+            self.assertNotEqual(result["outcome"], "PROCEED")
+            self.assertTrue(any("lower bound, not an empty or complete answer" in limit
+                                for limit in result["limits"]))
+
+    # ---- D-3 ----
+    def test_a_truncated_candidate_list_says_so_where_the_options_are(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index in range(12):
+                area = root / ("area%02d" % index) / "auth"; area.mkdir(parents=True)
+                (area / "handler.py").write_text("def handler%02d():\n    return 1\n" % index)
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("fix the authentication")
+            self.assertEqual(result["outcome"], "CLARIFY")
+            self.assertEqual(result["candidate_count"], 12)
+            self.assertEqual(result["candidates_shown"], 8)
+            self.assertTrue(result["candidates_truncated"])
+            self.assertIn("the list is incomplete", result["question"])
+            self.assertIn("12", result["question"])
+            self.assertTrue(any("remaining 4 area(s)" in option for option in result["options"]),
+                            f"the options never mention the omitted areas: {result['options']}")
+            self.assertTrue(any("candidate list is incomplete" in limit for limit in result["limits"]))
+
+    def test_an_untruncated_candidate_list_invents_no_incompleteness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("fix the authentication")
+            self.assertEqual(result["outcome"], "CLARIFY")
+            self.assertFalse(result["candidates_truncated"])
+            self.assertEqual(result["candidates_shown"], result["candidate_count"])
+            self.assertNotIn("incomplete", result["question"])
+            self.assertFalse(any("remaining" in option for option in result["options"]))
+
+    # ---- the general invariant ----
+    def test_widening_a_scope_never_makes_the_verdict_more_permissive(self):
+        """Adding files may raise concern. It must never lower it.
+
+        The property the three defects broke, stated once and checked over a
+        scope grown one file at a time across every kind of evidence: a plain
+        file, a verified one, one reading the environment, a shallow one, and
+        one that is not indexed at all.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plain = ["p%02d.py" % index for index in range(6)]
+            for name in plain:
+                (root / name).write_text("def fn_%s():\n    return 1\n" % name[:-3])
+            (root / "env_reader.py").write_text("import os\n\ndef reads():\n    return os.environ['TOKEN']\n")
+            (root / "styles.css").write_text(".a{color:red}\n")
+            git_project(root, {})
+            ledger = Ledger(root); ledger.init()
+            ledger.verify("file", "p05.py", "TEST", "PASSED", "green")
+            growing = [*plain, "env_reader.py", "styles.css", "not/indexed.py"]
+            previous, scope = None, []
+            for name in growing:
+                scope = [*scope, name]
+                outcome = ledger.pre_action("refactor", files=scope)["outcome"]
+                if previous is not None:
+                    self.assertLessEqual(
+                        PERMISSIVENESS[outcome], PERMISSIVENESS[previous],
+                        f"widening to {scope} moved {previous} -> {outcome}, which is more permissive")
+                previous = outcome
+
+    def test_every_bounded_probe_reports_itself_in_the_signals(self):
+        """A cap that can change the outcome must be visible to a recomputing caller."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            signals = ledger.pre_action("fix src/auth/SignIn.py")["signals"]
+            for key in ("verification_probe_truncated", "external_probe_truncated"):
+                self.assertIn(key, signals)
+                self.assertIsInstance(signals[key], bool)
+
+    def test_verification_truncation_alone_prevents_proceed(self):
+        """Isolates the guard: the probe is exhausted and nothing else is notable.
+
+        All the recorded verifications are SUPERSEDED, so the CURRENT count is
+        zero and no other signal fires. What remains is the one fact that must
+        still block PROCEED — five of seven verified files were examined, so
+        "nothing currently verifies this" is a claim the probe cannot make.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = ["v%02d.py" % index for index in range(PREACTION_VERIFY_PROBE + 2)]
+            ledger = self.git_files(root, names)
+            for name in names:
+                ledger.verify("file", name, "TEST", "PASSED", "green")
+            time.sleep(0.01)
+            for name in names:
+                (root / name).write_text("def fn_%s():\n    return 2\n" % name[:-3])
+            ledger.refresh(changed_only=True)
+            result = ledger.pre_action("refactor", files=names)
+            signals = result["signals"]
+            self.assertEqual(signals["current_verifications"], 0)
+            self.assertEqual(signals["stale_files"], 0)
+            self.assertEqual(signals["dependent_files"], 0)
+            self.assertEqual(signals["external_dependencies"], 0)
+            self.assertLess(signals["changes_touching_target"], signals["churn_threshold"])
+            self.assertTrue(signals["verification_probe_truncated"])
+            self.assertEqual(result["outcome"], "WARN",
+                             "an exhausted verification probe still allowed PROCEED")
+            self.assertTrue(any("whether more of this target" in line for line in result["because"]))
+
+    def test_external_truncation_alone_prevents_proceed(self):
+        """The probed files import only the standard library, so the inventory is
+        legitimately empty while the probe is still exhausted. Zero found and
+        zero looked for must not read the same."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = ["s%02d.py" % index for index in range(PREACTION_EXTERNAL_PROBE + 1)]
+            for name in names:
+                (root / name).write_text("import os\n\ndef fn_%s():\n    return 1\n" % name[:-3])
+            ledger = Ledger(root); ledger.init()
+            result = ledger.pre_action("refactor", files=names)
+            signals = result["signals"]
+            self.assertEqual(signals["external_dependencies"], 0)
+            self.assertEqual(signals["current_verifications"], 0)
+            self.assertEqual(signals["dependent_files"], 0)
+            self.assertTrue(signals["external_probe_truncated"])
+            self.assertEqual(result["outcome"], "WARN",
+                             "an exhausted external probe still allowed PROCEED")
+            self.assertTrue(any("what else this target needs from outside" in line
+                                for line in result["because"]))

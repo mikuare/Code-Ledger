@@ -95,6 +95,51 @@ def closing_session(ledger, session, result):
             try: signal.signal(sig, handler)
             except (ValueError, OSError): pass
 
+def emit_check(value, as_json=False):
+    """Lead with the verdict, then the measurements that produced it.
+
+    The `because` lines come first and the thresholds are printed beside the
+    measurements, because a reader who cannot see why the outcome was reached
+    has to take it on trust — and taking things on trust is what this exists to
+    replace.
+    """
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    print(f"CODELEDGER CHECK — {value['intent'] or '(no request given)'}\n")
+    print(f"Outcome: {value['outcome']}\n")
+    for line in value["because"]: print(f"   - {line}")
+    scope = value["evidence"]["scope"]
+    print(f"\nScope ({scope['source']}): {', '.join(scope['files'][:8]) or 'none established'}")
+    signals = value["signals"]
+    print(f"Coverage: {signals['coverage_tier']}   "
+          f"dependents: {signals['dependent_files']}/{signals['dependent_files_threshold']}   "
+          f"areas: {signals['affected_areas']}/{signals['affected_areas_threshold']}   "
+          f"external: {signals['external_dependencies']}   "
+          f"stale: {signals['stale_files']}   "
+          f"recent changes: {signals['changes_touching_target']}/{signals['churn_threshold']}")
+    risk = value["evidence"]["risk"]
+    hint = (risk["request_risk_hint"] or {}).get("level", "n/a")
+    print(f"Impact risk (measured): {risk['impact_risk']['level']}   Request risk hint (wording only): {hint}")
+    external = value["evidence"]["external"]
+    if external["environment_variables"] or external["external_packages"]:
+        print("\nNeeds from outside the repository (names only):")
+        for item in external["environment_variables"]: print(f"   env      {item['name']}")
+        for item in external["external_packages"]: print(f"   package  {item['name']}")
+    verification = value["evidence"]["verification"]
+    if verification["states"]:
+        print("\nRecorded verification:")
+        for item in verification["states"]:
+            print(f"   {item['subject']}: {item.get('result_recorded')} [{item['applicability']}] "
+                  f"trust {item['trust']['level']}")
+    stamp = value["evidence"]["as_of"]
+    print(f"\nAs of: commit {str(stamp['git_commit'])[:8]}  tree_dirty={stamp['tree_dirty']}  "
+          f"indexed_at={stamp['indexed_at']}  stale_files={len(stamp['stale_files'])}")
+    if value.get("question"):
+        print(f"\nQuestion: {value['question']}")
+        for option in value["options"]: print(f"   - {option}")
+    print("\nLimits:")
+    for limit in value["limits"]: print(f"   - {limit}")
+    print(f"\n{value['guidance']}")
+
 def emit_targets(value, as_json=False):
     """Print candidates without implying one of them is the answer.
 
@@ -349,6 +394,10 @@ def build_parser():
     # Both take a free-text request rather than a symbol: they exist for the
     # case where the user does not yet know which symbol they mean.
     add("targets", "Which parts of the repository a request could be about").add_argument("request")
+    check = add("check", "Engineering evidence about a change before making it")
+    check.add_argument("intent", nargs="?", default="", help="the user request, in their words")
+    check.add_argument("--files", nargs="*", default=[], help="target files, if already resolved")
+    check.add_argument("--symbols", nargs="*", default=[], help="target symbols, if already resolved")
     add("project-context", "One compact engineering context for a request").add_argument("request", nargs="?", default="")
     add("progress", "Check whether prior attempts at this request achieved anything").add_argument("request")
     since = add("since", "What changed since a change id, session, timestamp, or an agent's last turn")
@@ -597,6 +646,8 @@ def main(argv=None):
     elif args.command == "restore-info": value={"query":args.query,"last_known_versions":ledger.lookup(args.query),"history":ledger.history(args.query),"automatic_restore":False}
     elif args.command == "scope": value=ledger.scope_check(args.request, args.files, args.symbols, args.plan_files, args.plan_symbols)
     elif args.command == "plan": emit_plan(ledger.plan(args.request), args.as_json); return 0
+    elif args.command == "check":
+        emit_check(ledger.pre_action(args.intent, args.files, args.symbols), args.as_json); return 0
     elif args.command == "targets":
         found = ledger.candidate_targets(args.request)
         emit_targets({**found, "target_ambiguity": ledger._target_ambiguity(found)}, args.as_json); return 0
