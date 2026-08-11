@@ -4627,3 +4627,370 @@ class EmptyEvidenceInvariantTests(unittest.TestCase):
             self.assertEqual(efficiency["files_relevant"], 0)
             self.assertEqual(efficiency["files_avoided"], 0,
                              "a checkpoint that named no file reported the repository as avoided")
+
+
+class CandidateTargetTests(unittest.TestCase):
+    """"Fix the authentication" must find the authentication, or say it did not.
+
+    Retrieval used to search symbol names for the whole prompt, so a sentence
+    matched nothing in a repository that plainly contained the subject — and the
+    empty result then travelled onward as "no ambiguity", which let an agent
+    proceed on an interpretation nothing had confirmed.
+    """
+
+    def ledger(self, directory: str) -> Ledger:
+        root = Path(directory); forlive_shaped(root)
+        ledger = Ledger(root); ledger.init(); return ledger
+
+    def test_a_domain_word_finds_the_areas_that_implement_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            found = self.ledger(directory).candidate_targets("fix the authentication")
+            areas = {item["area"] for item in found["candidates"]}
+            self.assertIn("src/auth", areas)
+            self.assertIn("supabase/functions/auth-login", areas)
+            self.assertGreaterEqual(found["candidate_count"], 2)
+
+    def test_every_candidate_says_why_it_matched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            found = self.ledger(directory).candidate_targets("fix the authentication")
+            for candidate in found["candidates"]:
+                self.assertTrue(candidate["evidence"], f"{candidate['area']} was offered with no justification")
+
+    def test_candidates_are_not_ranked(self):
+        """Alphabetical, and stated to be. An order that looks like a ranking is one."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            # One matching file in a directory that sorts first, three in one that
+            # sorts last: any size-based order would disagree with alphabetical.
+            (root / "api").mkdir()
+            (root / "api" / "auth_route.py").write_text("def auth_route():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            found = ledger.candidate_targets("fix the authentication")
+            areas = [item["area"] for item in found["candidates"]]
+            self.assertEqual(areas, sorted(areas), f"candidates were not in alphabetical order: {areas}")
+            self.assertEqual(areas[0], "api")
+            self.assertGreater(max(item["file_count"] for item in found["candidates"]),
+                               found["candidates"][0]["file_count"],
+                               "fixture no longer distinguishes alphabetical order from size order")
+            self.assertIn("not a ranking", found["order"])
+            for candidate in found["candidates"]:
+                self.assertNotIn("score", candidate)
+
+    def test_a_named_path_does_not_manufacture_alternatives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            found = self.ledger(directory).candidate_targets("fix src/auth/SignIn.py")
+            self.assertEqual(found["candidate_count"], 1)
+            self.assertEqual(found["candidates"][0]["area"], "src/auth")
+
+    def test_nothing_matching_is_reported_as_unknown_rather_than_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            found = self.ledger(directory).candidate_targets("fix the unicorn subsystem")
+            self.assertEqual(found["candidate_count"], 0)
+            self.assertEqual(found["intended_target"], "UNKNOWN")
+            self.assertIn("UNKNOWN", found["reason"])
+
+    def test_generic_layout_words_do_not_return_the_whole_repository(self):
+        """`src` and `jsx` narrow nothing; matching them is the same as matching all."""
+        with tempfile.TemporaryDirectory() as directory:
+            found = self.ledger(directory).candidate_targets("update the src files")
+            self.assertEqual(found["tokens"], [])
+            self.assertEqual(found["candidate_count"], 0)
+
+    def test_a_token_matches_a_prefix_and_not_a_word_that_merely_contains_it(self):
+        """`auth` sits inside `oauth`, which is a different subsystem.
+
+        Substring matching would offer it, and a candidate the evidence does not
+        support is worse than one fewer candidate: it is the list an agent learns
+        to stop reading.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            (root / "src" / "oauth").mkdir()
+            (root / "src" / "oauth" / "client.py").write_text("def connect():\n    return 1\n")
+            ledger = Ledger(root); ledger.init()
+            areas = {item["area"] for item in ledger.candidate_targets("fix the auth flow")["candidates"]}
+            self.assertIn("src/auth", areas)
+            self.assertNotIn("src/oauth", areas,
+                             "a substring match offered an unrelated subsystem as a candidate")
+
+    def test_a_symbol_match_brings_in_a_file_its_path_never_mentions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            found = self.ledger(directory).candidate_targets("captcha")
+            areas = {item["area"] for item in found["candidates"]}
+            self.assertIn("supabase/functions/auth-login", areas,
+                          "a symbol-only match did not pull in its own file")
+
+class TargetAmbiguityTests(unittest.TestCase):
+    """Ambiguity, resolution and ignorance are three answers, not two."""
+
+    def analysis(self, directory: str, request: str) -> dict:
+        root = Path(directory); forlive_shaped(root)
+        ledger = Ledger(root); ledger.init()
+        return ledger.analyze_prompt(request, candidates=True)
+
+    def test_several_plausible_targets_ask_rather_than_choose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.analysis(directory, "fix the authentication")["target_ambiguity"]
+            self.assertEqual(target["status"], "TARGET_AMBIGUOUS")
+            self.assertEqual(target["intended_target"], "UNKNOWN")
+            self.assertTrue(target["question"])
+            self.assertEqual(len(target["options"]), 3)
+            self.assertIn("Do not choose one silently", target["guidance"])
+
+    def test_a_named_target_is_resolved_without_interrogation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.analysis(directory, "fix src/auth/SignIn.py")["target_ambiguity"]
+            self.assertEqual(target["status"], "TARGET_RESOLVED")
+            self.assertNotIn("question", target)
+
+    def test_a_named_directory_resolves_even_when_it_spans_areas(self):
+        """The user already answered the question, however many areas the answer covers."""
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.analysis(directory, "update supabase/functions")["target_ambiguity"]
+            self.assertGreater(target["candidate_count"], 1)
+            self.assertEqual(target["status"], "TARGET_RESOLVED")
+            self.assertIn("names its own target", target["guidance"])
+
+    def test_no_match_is_unknown_and_never_no_ambiguity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = self.analysis(directory, "fix the unicorn subsystem")["target_ambiguity"]
+            self.assertEqual(target["status"], "TARGET_UNKNOWN")
+            self.assertEqual(target["intended_target"], "UNKNOWN")
+            self.assertIn("UNKNOWN", target["guidance"])
+
+    def test_the_ambiguity_reaches_the_clarifying_questions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            analysis = self.analysis(directory, "fix the authentication")
+            self.assertTrue(any("intended" in question for question in analysis["clarifying_questions"]))
+
+    def test_candidate_discovery_stays_off_the_refresh_path(self):
+        """`record_change` reads a risk label from here on every refresh."""
+        with tempfile.TemporaryDirectory() as directory:
+            analysis = self.analysis(directory, "fix the authentication")
+            self.assertIn("target_ambiguity", analysis)
+            root = Path(directory); ledger = Ledger(root)
+            self.assertNotIn("target_ambiguity", ledger.analyze_prompt("fix the authentication", scope=False))
+
+class ImpactRiskTests(unittest.TestCase):
+    """Risk read off a verb is not risk measured from a footprint."""
+
+    def analysis(self, directory: str, request: str) -> dict:
+        root = Path(directory); forlive_shaped(root)
+        ledger = Ledger(root); ledger.init()
+        return ledger.analyze_prompt(request, candidates=True)
+
+    def test_an_unresolved_target_has_unknown_impact_risk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            analysis = self.analysis(directory, "delete the old authentication code")
+            self.assertEqual(analysis["impact_risk"]["level"], "UNKNOWN")
+            self.assertEqual(analysis["request_risk_hint"]["level"], "HIGH")
+            self.assertTrue(any("candidate targets" in item for item in analysis["impact_risk"]["inputs"]),
+                            f"unknown risk did not say the target was ambiguous: {analysis['impact_risk']}")
+
+    def test_the_lexical_reading_is_labelled_as_inferred(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hint = self.analysis(directory, "delete the old authentication code")["request_risk_hint"]
+            self.assertEqual(hint["trust"]["level"], "INFERRED")
+            self.assertEqual(hint["basis"], "request wording")
+
+    def test_the_existing_risk_key_keeps_its_meaning(self):
+        """Consumers read `risk`; it must not silently become a different quantity."""
+        with tempfile.TemporaryDirectory() as directory:
+            analysis = self.analysis(directory, "delete the old authentication code")
+            self.assertEqual(analysis["risk"], analysis["request_risk_hint"]["level"])
+
+    def test_different_verbs_over_the_same_footprint_agree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "shared.py").write_text("def helper():\n    return 1\n")
+            (root / "one").mkdir(); (root / "two").mkdir(); (root / "three").mkdir()
+            for area in ("one", "two", "three"):
+                (root / area / "m.py").write_text(f"from shared import helper\n\ndef {area}():\n    return helper()\n")
+            ledger = Ledger(root); ledger.init()
+            levels = {verb: ledger.analyze_prompt(f"{verb} helper", candidates=True)["impact_risk"]["level"]
+                      for verb in ("delete", "refactor", "improve", "update")}
+            self.assertEqual(len(set(levels.values())), 1,
+                             f"the same footprint produced different impact risk per verb: {levels}")
+            self.assertNotEqual(set(levels.values()), {"UNKNOWN"})
+
+class TrustProjectionTests(unittest.TestCase):
+    """The projection may weaken a claim. It may never strengthen one."""
+
+    def test_a_note_is_recorded_and_never_proven(self):
+        from codeledger.core import trust
+        self.assertEqual(trust("note")["level"], "RECORDED")
+
+    def test_full_parsing_is_proven_and_shallow_is_inferred(self):
+        from codeledger.core import trust
+        self.assertEqual(trust("full")["level"], "PROVEN")
+        self.assertEqual(trust("shallow")["level"], "INFERRED")
+
+    def test_absent_evidence_is_unknown(self):
+        from codeledger.core import trust
+        self.assertEqual(trust("absent")["level"], "UNKNOWN")
+
+    def test_applicability_can_only_lower_the_level(self):
+        from codeledger.core import trust, TRUST_RANK, TRUST_BASIS
+        for basis in TRUST_BASIS:
+            base = trust(basis)["level"]
+            for applicability in ("CURRENT", "SUPERSEDED", "EXPIRED", "UNVERIFIABLE", "NONE", "N/A"):
+                projected = trust(basis, applicability)["level"]
+                self.assertLessEqual(TRUST_RANK[projected], TRUST_RANK[base],
+                                     f"{basis}+{applicability} upgraded {base} to {projected}")
+
+    def test_a_superseded_verification_is_not_proven(self):
+        from codeledger.core import trust
+        self.assertEqual(trust("verified", "SUPERSEDED")["level"], "RECORDED")
+        self.assertEqual(trust("verified", "CURRENT")["level"], "PROVEN")
+
+    def test_the_projection_says_what_it_was_derived_from(self):
+        from codeledger.core import trust
+        projected = trust("shallow", "CURRENT")
+        self.assertEqual(projected["basis"], "shallow")
+        self.assertTrue(projected["reason"])
+
+class CurrentnessTests(unittest.TestCase):
+    """An answer that does not date itself invites being read as current."""
+
+    def test_as_of_reports_the_index_and_the_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            stamp = ledger.as_of()
+            self.assertNotEqual(stamp["indexed_at"], "UNKNOWN")
+            self.assertIn("computed_at", stamp)
+            self.assertEqual(stamp["stale_files"], [])
+
+    def test_as_of_names_the_files_the_filesystem_has_moved_past(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            target = root / "src" / "auth" / "SignIn.py"
+            time.sleep(0.01); target.write_text("def SignIn():\n    return 2\n\ndef extra():\n    return 3\n")
+            self.assertEqual(ledger.as_of(["src/auth/SignIn.py"])["stale_files"], ["src/auth/SignIn.py"])
+
+    def test_composed_reads_carry_their_own_as_of(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            self.assertIn("as_of", ledger.context("SignIn"))
+            self.assertIn("as_of", ledger.plan("fix SignIn"))
+            self.assertIn("as_of", ledger.project_context("fix the authentication"))
+
+class ProjectContextTests(unittest.TestCase):
+    """One composed read, and what it could not determine said out loud."""
+
+    def build(self, directory: str) -> Ledger:
+        root = Path(directory); forlive_shaped(root)
+        ledger = Ledger(root); ledger.init(); return ledger
+
+    def test_it_carries_the_agreed_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self.build(directory).project_context("fix the authentication")
+            for key in ("project", "as_of", "active_goal", "recent_work", "targets",
+                        "dependencies", "external", "verification", "risk", "unknown"):
+                self.assertIn(key, answer)
+
+    def test_ambiguity_is_reported_as_an_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self.build(directory).project_context("fix the authentication")
+            self.assertEqual(answer["targets"]["status"], "TARGET_AMBIGUOUS")
+            self.assertTrue(any("UNKNOWN" in item for item in answer["unknown"]))
+
+    def test_a_recorded_goal_is_never_promoted_to_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            session = ledger.start_session("codex", "work")
+            ledger.record_checkpoint(session["session_id"], goal="CAPTCHA is fixed", next_action="verify")
+            answer = ledger.project_context("captcha")
+            self.assertEqual(answer["active_goal"]["goal"], "CAPTCHA is fixed")
+            self.assertEqual(answer["active_goal"]["trust"]["level"], "RECORDED")
+
+    def test_a_missing_goal_is_stated_rather_than_omitted(self):
+        """No checkpoint means the current work is UNKNOWN, not that there is none."""
+        with tempfile.TemporaryDirectory() as directory:
+            answer = self.build(directory).project_context("fix the authentication")
+            self.assertTrue(any("currently being worked on is UNKNOWN" in item for item in answer["unknown"]),
+                            f"an absent goal was not reported: {answer['unknown']}")
+
+    def test_index_churn_is_kept_out_of_agent_facing_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = self.build(directory)
+            for _ in range(6):
+                ledger.record_change("codex", "s", "", "Indexed 2 changed file(s)", "unverified")
+            ledger.record_change("codex", "s", "make the login work", "Reworked SignIn", "unverified")
+            summaries = [row["summary"] for row in ledger.project_context("SignIn")["recent_work"]["changes"]]
+            self.assertIn("Reworked SignIn", summaries)
+            self.assertNotIn("Indexed 2 changed file(s)", summaries)
+
+class TargetCommandTests(unittest.TestCase):
+    """The capability has to be reachable, and its output must not imply a choice."""
+
+    def run_cli(self, root: Path, *argv) -> str:
+        import io, contextlib
+        from codeledger.cli import main
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            # Commands that fall through to the generic emitter return None
+            # rather than 0, which is how every existing read command behaves.
+            self.assertIn(main(["--root", str(root), *argv]), (0, None))
+        return buffer.getvalue()
+
+    def test_the_targets_command_presents_candidates_without_recommending_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            Ledger(root).init()
+            output = self.run_cli(root, "targets", "fix the authentication")
+            self.assertIn("TARGET_AMBIGUOUS", output)
+            self.assertIn("Intended target: UNKNOWN", output)
+            self.assertIn("not a ranking", output)
+            self.assertIn("Do not choose one silently", output)
+            for word in ("recommended", "most likely", "best match"):
+                self.assertNotIn(word, output.lower())
+
+    def test_the_targets_command_says_unknown_rather_than_printing_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            Ledger(root).init()
+            output = self.run_cli(root, "targets", "fix the unicorn subsystem")
+            self.assertIn("TARGET_UNKNOWN", output)
+            self.assertIn("UNKNOWN", output)
+
+    def test_project_context_is_reachable_and_json_serialisable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            Ledger(root).init()
+            output = self.run_cli(root, "project-context", "fix the authentication", "--json")
+            payload = json.loads(output)
+            self.assertEqual(payload["targets"]["status"], "TARGET_AMBIGUOUS")
+            self.assertIn("unknown", payload)
+
+class McpSurfaceCompatibilityTests(unittest.TestCase):
+    """New tools are additive; every tool that existed still exists with its schema."""
+
+    ESTABLISHED = ("codeledger_get_resume", "codeledger_get_session_state", "codeledger_record_checkpoint",
+                   "codeledger_get_context", "codeledger_get_plan", "codeledger_get_progress",
+                   "codeledger_get_changes_since", "codeledger_analyze_prompt", "codeledger_task_handshake",
+                   "codeledger_find_symbol", "codeledger_get_impact", "codeledger_get_history",
+                   "codeledger_get_changes", "codeledger_get_recent_changes", "codeledger_get_issues",
+                   "codeledger_get_decisions", "codeledger_record_change", "codeledger_mark_verified",
+                   "codeledger_get_regressions", "codeledger_suggest_tests", "codeledger_get_features",
+                   "codeledger_get_active_agents", "codeledger_check_conflicts", "codeledger_doctor",
+                   "codeledger_refresh")
+
+    def test_no_established_tool_was_removed_or_renamed(self):
+        from codeledger import mcp
+        names = {name for name, _description in mcp.TOOLS}
+        for tool in self.ESTABLISHED:
+            self.assertIn(tool, names, f"{tool} disappeared from the MCP surface")
+
+    def test_every_tool_still_declares_a_schema(self):
+        from codeledger import mcp
+        for name, _description in mcp.TOOLS:
+            self.assertIn(name, mcp.SCHEMAS, f"{name} is advertised with no input schema")
+
+    def test_the_new_tools_are_present(self):
+        from codeledger import mcp
+        names = {name for name, _description in mcp.TOOLS}
+        self.assertIn("codeledger_find_targets", names)
+        self.assertIn("codeledger_get_project_context", names)

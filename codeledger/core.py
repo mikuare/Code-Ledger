@@ -67,6 +67,24 @@ SHARED_NAME_HINTS = ("provider", "context", "theme", "store", "config", "global"
 AMBIGUITY_MIN_AREAS = 2
 AMBIGUITY_LONE_AREAS = 3
 AMBIGUITY_LONE_FILES = 5
+# Shortest word worth matching a request against, and shortest prefix allowed to
+# stand in for a longer word. Three keeps `api` and `dtr`; four stops `use` from
+# reaching `users` and `sig` from reaching `signature`, which is the difference
+# between a candidate list an agent reads and one it learns to ignore.
+MIN_TOKEN = 3
+MIN_PREFIX = 4
+# Words that appear in a path because of how projects are laid out rather than
+# because of what the code does. A request saying "src" or "jsx" has narrowed
+# nothing, and letting them match returns most of the repository as candidates,
+# which is the same as returning none.
+PATH_STOPWORDS = {"src", "lib", "libs", "app", "apps", "index", "main", "dist", "build", "out", "public",
+                  "assets", "static", "node_modules", "test", "tests", "spec", "specs", "__init__",
+                  "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "sql", "css", "scss", "html", "json",
+                  "md", "vue", "svelte", "go", "rs", "java", "rb", "php", "cs", "kt", "swift", "dart"}
+# How much of a candidate's justification is shown before it reports a count.
+CANDIDATE_EVIDENCE_LIMIT = 6
+CANDIDATE_SYMBOL_LIMIT = 12
+CANDIDATE_FILE_LIMIT = 10
 # Roughly four characters per token. Deliberately crude: CodeLedger takes no
 # tokenizer dependency, and every figure derived from this is labelled an
 # estimate rather than presented as a measurement.
@@ -99,6 +117,52 @@ def article(word: str) -> str:
     """`a` or `an`. Small, but "A endpoint-level result" is the kind of seam
     that makes a report read as though nobody has ever looked at it."""
     return "an" if word[:1].lower() in "aeiou" else "a"
+
+# What kind of thing a claim is, before asking whether it still holds. The two
+# questions are separate on purpose: `applicability` already says whether
+# evidence still describes the present, and answers it well. What it never said
+# is whether the thing being described was ever evidence at all — a parsed
+# source file and a sentence somebody typed arrive in the same payload wearing
+# the same clothes. Ranked, because the only operation allowed on it is
+# downgrade.
+TRUST_RANK = {"UNKNOWN": 0, "INFERRED": 1, "RECORDED": 2, "PROVEN": 3}
+TRUST_BASIS = {
+    FULL: ("PROVEN", "the file was parsed in full, so this was read out of the source"),
+    SHALLOW: ("INFERRED", "the file was matched by line patterns rather than parsed, so this is not proven"),
+    "none": ("UNKNOWN", "the file could not be analysed, so nothing about its contents is established"),
+    "verified": ("PROVEN", "a command was run and its exit code recorded against a commit"),
+    "recorded-verification": ("RECORDED", "a result was recorded without the provenance to prove which code it describes"),
+    "note": ("RECORDED", "a person or an agent wrote this down; nothing has checked it"),
+    "heuristic": ("INFERRED", "derived from naming and structure conventions, which can be wrong"),
+    "absent": ("UNKNOWN", "no evidence of this exists in the index"),
+}
+# The most any claim can be worth once applicability has spoken. A record that
+# does not describe the present is still a record — it is never promoted back to
+# proof by this projection, and never can be.
+TRUST_CEILING = {"CURRENT": "PROVEN", "N/A": "PROVEN", "SUPERSEDED": "RECORDED",
+                 "EXPIRED": "RECORDED", "UNVERIFIABLE": "RECORDED", "NONE": "UNKNOWN"}
+
+def trust(basis: str, applicability: str = "N/A", reason: str = "") -> dict:
+    """What an agent should take this claim to be worth, derived on the spot.
+
+    A projection over signals that already exist — coverage, verification
+    provenance, applicability, whether anything was found at all — and stored
+    nowhere. Persisting it would create a sixth vocabulary to keep in step with
+    the five it summarises, and the first time they disagreed the summary would
+    win, which is exactly backwards.
+
+    Downgrade-only, structurally: the level is the weaker of what the basis
+    claims and what applicability permits. Nothing here can make weak evidence
+    strong, so a note saying "CAPTCHA is fixed" is RECORDED however confidently
+    it was written, and only a command with an exit code against a commit is
+    PROVEN. The raw fields travel alongside so the projection can be checked
+    rather than believed.
+    """
+    level, because = TRUST_BASIS.get(basis, TRUST_BASIS["absent"])
+    ceiling = TRUST_CEILING.get(applicability, "RECORDED")
+    if TRUST_RANK[ceiling] < TRUST_RANK[level]:
+        level, because = ceiling, f"{because}, but the evidence is {applicability.lower()}"
+    return {"level": level, "applicability": applicability, "basis": basis, "reason": reason or because}
 
 def savings_from(total: int, relevant: int, nothing_found: bool) -> int:
     """Files this answer saved opening — zero when it did not answer.
@@ -1010,6 +1074,28 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # exactly what makes the commit an incomplete description of what ran.
         return commit, 1 if git_status(self.root) else 0
 
+    def as_of(self, paths: list[str] | None = None) -> dict:
+        """The state this answer describes, so a reader can tell how old it is.
+
+        "Authentication was tested" and "authentication was tested against the
+        code that is here now" are different claims, and every payload that
+        omits its own as-of date leaves the reader to assume the second. The
+        four values are already computed elsewhere for other purposes; the only
+        thing missing was saying them out loud alongside the answer.
+
+        Not a validity guarantee and not a cache key. It reports what was true
+        when the answer was computed — including, when `paths` are given, which
+        of them the filesystem has already moved past.
+        """
+        commit, dirty = self._git_provenance()
+        indexed = self.db.execute(
+            "SELECT MAX(last_analyzed) AS at FROM files WHERE status!='deleted'").fetchone()["at"]
+        return {"git_commit": commit or UNKNOWN,
+                "tree_dirty": UNKNOWN if dirty is None else bool(dirty),
+                "indexed_at": indexed or UNKNOWN,
+                "stale_files": [item["path"] for item in self.stale_records(paths)] if paths else [],
+                "computed_at": NOW()}
+
     @staticmethod
     def _verification_applicability(verified_at, verified_result, code_changed_at, alive: bool,
                                     git_commit=None, indexed=True, subject_type: str = "symbol",
@@ -1267,7 +1353,284 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                       "stale_records_reanalyzed": stale}
         # The matches are already computed; handing them over keeps the scope
         # analysis from repeating the symbol search on every context call.
-        return {"query": query, "task_analysis": self.analyze_prompt(query, symbols=matches), "features": features, "symbols": matches[:20], "files": paths[:20], "recent_changes": recent, "known_issues": issues, "decisions": decisions, "scan_required": not bool(matches or features), "efficiency": efficiency}
+        # Measured before it was added: `as_of` costs about 2.4ms, nearly all of
+        # it two git subprocesses. That is affordable once on a composed answer
+        # and not affordable inside `lookup` or `impact`, which are primitives
+        # and are called in loops — so it lives here and `plan` reuses this one
+        # rather than paying again.
+        return {"query": query, "as_of": self.as_of(paths), "task_analysis": self.analyze_prompt(query, symbols=matches, candidates=True), "features": features, "symbols": matches[:20], "files": paths[:20], "recent_changes": recent, "known_issues": issues, "decisions": decisions, "scan_required": not bool(matches or features), "efficiency": efficiency}
+
+    @staticmethod
+    def _lexical_tokens(text: str) -> list[str]:
+        """The words in a name, however that name was spelled.
+
+        `auth-login`, `AuthGate`, `password_recovery` and `auth.login` are the
+        same convention wearing four costumes, and a request says "login" to all
+        of them. Splitting on case and on the separators normalises them to
+        comparable words without knowing anything about what they mean.
+        """
+        parts = re.split(r"[^A-Za-z0-9]+", text or "")
+        words: list[str] = []
+        for part in parts:
+            words.extend(re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z0-9]+", part) or ([part] if part else []))
+        return [word.lower() for word in words if len(word) >= MIN_TOKEN]
+
+    @staticmethod
+    def _token_hit(request_token: str, name_token: str) -> bool:
+        """Do these two words name the same thing, by spelling alone?
+
+        Equality, or one being a prefix of the other. The prefix rule is what
+        connects a request saying "authentication" to a directory called `auth`,
+        which is the single commonest way a repository and a person disagree
+        about a name. It is deliberately not substring matching: `auth` inside
+        `oauthprovider` is a different subsystem, and matching it would put
+        candidates in front of the user that the evidence does not support.
+        """
+        if request_token == name_token:
+            return True
+        shorter, longer = sorted((request_token, name_token), key=len)
+        return len(shorter) >= MIN_PREFIX and longer.startswith(shorter)
+
+    def candidate_targets(self, request: str, limit: int = 8) -> dict:
+        """Which parts of *this* repository a request could be about.
+
+        The evidence layer under every "what did you mean?" question. Retrieval
+        before this searched symbol names for the whole prompt, so "fix the
+        authentication" matched nothing in a project with `src/auth/`, three
+        auth screens and four auth Edge Functions — and an empty result then
+        travelled onward as "no ambiguity", which is the opposite of the truth.
+
+        Matching is lexical and structural only: the words of the request
+        against the words of paths, filenames and symbol names. No ranking, no
+        scoring, no "most likely". Every candidate carries the reason it is
+        here, so an agent can discard the ones the evidence does not justify.
+        Which one the user meant is not a question this can answer, and it does
+        not pretend to.
+        """
+        tokens = [word for word in dict.fromkeys(self._lexical_tokens(request))
+                  if word not in STOPWORDS and word not in PATH_STOPWORDS]
+        named_paths = sorted(set(re.findall(r"(?:[\w.-]+/)+[\w.-]+", request or "")))
+        # Narrow in SQL before tokenising anything. `_token_hit` only ever fires
+        # when the name contains the token's first `MIN_PREFIX` characters, so
+        # this is a superset of the real answer and never hides a match — it
+        # just means the Python below sees tens of rows instead of tens of
+        # thousands. Without it every request re-tokenised the whole symbol
+        # table, which on a large repository cost more than the query it served.
+        stems = sorted({word[:MIN_PREFIX].translate(LIKE_ESCAPE) for word in tokens})
+        clause = " OR ".join(["path LIKE ? ESCAPE '\\'"] * len(stems)) or "0"
+        args = [f"%{stem}%" for stem in stems]
+        if named_paths:
+            clause = " OR ".join(["path LIKE ? ESCAPE '\\'"] * len(named_paths))
+            args = [f"%{named.translate(LIKE_ESCAPE)}%" for named in named_paths]
+        rows = [dict(row) for row in self.db.execute(
+            f"SELECT id,path,coverage FROM files WHERE status!='deleted' AND ({clause})", args)] if args else []
+        # A request that names a path has already answered the question this
+        # exists to ask. Everything outside it is dropped rather than offered
+        # back as an alternative the user did not raise.
+        if named_paths:
+            rows = [row for row in rows
+                    if any(row["path"] == named or row["path"].startswith(named.rstrip("/") + "/")
+                           or named in row["path"] for named in named_paths)]
+        blank = {"request": request, "tokens": tokens, "named_paths": named_paths, "candidates": [],
+                 "candidate_count": 0, "candidates_truncated": False, "files_considered": len(rows),
+                 "order": "alphabetical by area; this is not a ranking",
+                 "intended_target": UNKNOWN}
+        if not tokens and not named_paths:
+            return {**blank, "reason": "The request contains no word specific enough to match anything indexed."}
+        # One pass over the file table, tokenising each path once. Everything
+        # after this works on the handful of files that matched.
+        hits: dict[int, dict] = {}
+        for row in rows:
+            rel = row["path"]
+            words = set(self._lexical_tokens(rel))
+            reasons = set()
+            for token in tokens:
+                for segment in Path(rel).parts[:-1]:
+                    if any(self._token_hit(token, part) for part in self._lexical_tokens(segment)):
+                        reasons.add(f'path segment "{segment}"'); break
+                if any(self._token_hit(token, part) for part in self._lexical_tokens(Path(rel).name)):
+                    reasons.add(f'filename "{Path(rel).name}"')
+            if named_paths and any(rel == named or rel.startswith(named.rstrip("/") + "/") or named in rel
+                                   for named in named_paths):
+                reasons.add(f'path named in the request')
+            if reasons:
+                hits[row["id"]] = {"path": rel, "coverage": row["coverage"] or SHALLOW,
+                                   "reasons": reasons, "words": words}
+        # Symbols are matched on their own names, and pull in their file even
+        # when the path says nothing — `captchaIsValid` lives in a file whose
+        # name mentions neither captcha nor validity.
+        # Only a request that named a path restricts which files may appear. In
+        # every other case a symbol match brings its own file in, because
+        # `captchaIsValid` lives in a file whose path says nothing about captcha.
+        allowed = {row["id"] for row in rows} if named_paths else None
+        name_clause = " OR ".join(["s.name LIKE ? ESCAPE '\\'"] * len(stems))
+        symbol_rows = [dict(row) for row in self.db.execute(
+            "SELECT s.id,s.name,s.file_id,f.path,f.coverage FROM symbols s JOIN files f ON f.id=s.file_id "
+            f"WHERE s.status='active' AND f.status!='deleted' AND ({name_clause})",
+            [f"%{stem}%" for stem in stems])] if stems else []
+        by_file: dict[int, set] = {}
+        for row in symbol_rows:
+            if allowed is not None and row["file_id"] not in allowed:
+                continue
+            parts = self._lexical_tokens(row["name"])
+            matched = [token for token in tokens if any(self._token_hit(token, part) for part in parts)]
+            if not matched:
+                continue
+            entry = hits.setdefault(row["file_id"], {"path": row["path"], "coverage": row["coverage"] or SHALLOW,
+                                                     "reasons": set(), "words": set()})
+            entry["reasons"].add(f'symbol name "{row["name"]}"')
+            by_file.setdefault(row["file_id"], set()).add(row["name"])
+        if not hits:
+            return {**blank, "reason": ("No indexed path, filename or symbol matches any word of this request. "
+                                        "Whether the target exists is UNKNOWN, not absent — it may be unindexed, "
+                                        "spelled differently, or outside this repository.")}
+        grouped: dict[str, dict] = {}
+        for file_id, hit in hits.items():
+            parent = Path(hit["path"]).parent.as_posix()
+            area = parent if parent not in ("", ".") else "(repository root)"
+            bucket = grouped.setdefault(area, {"area": area, "files": set(), "symbols": set(),
+                                               "evidence": set(), "coverage": set()})
+            bucket["files"].add(hit["path"])
+            bucket["symbols"].update(by_file.get(file_id, ()))
+            bucket["evidence"].update(hit["reasons"])
+            bucket["coverage"].add(hit["coverage"])
+        candidates = [{"area": item["area"], "files": sorted(item["files"])[:CANDIDATE_FILE_LIMIT],
+                       "symbols": sorted(item["symbols"])[:CANDIDATE_SYMBOL_LIMIT],
+                       "symbol_count": len(item["symbols"]),
+                       "evidence": sorted(item["evidence"])[:CANDIDATE_EVIDENCE_LIMIT],
+                       "evidence_count": len(item["evidence"]),
+                       "file_count": len(item["files"]),
+                       # Coverage travels with the candidate because a shallowly
+                       # parsed file yields a filename match and no symbols, and
+                       # an empty symbol list must not read as "nothing here".
+                       "coverage": FULL if item["coverage"] == {FULL} else SHALLOW,
+                       "trust": trust(FULL if item["coverage"] == {FULL} else SHALLOW)}
+                      for item in grouped.values()]
+        candidates.sort(key=lambda item: item["area"])
+        return {**blank, "candidates": candidates[:limit], "candidate_count": len(candidates),
+                "candidates_truncated": len(candidates) > limit}
+
+    @staticmethod
+    def _target_ambiguity(found: dict) -> dict:
+        """Whether the request says *what* to change, in the same shape as scope.
+
+        The candidate list itself is not repeated here: it already travels in
+        `candidate_targets`, and carrying it twice doubled the size of every
+        `context` call for no added information.
+
+        Deliberately the same vocabulary as `_scope_ambiguity` — status,
+        evidence, question, options, guidance — because they are two readings of
+        one question and an agent should not have to learn two answers. Scope
+        ambiguity asks how widely a known change applies; this asks which thing
+        is being changed at all, which comes first.
+
+        The distinction that matters most here is between no candidates and no
+        ambiguity. Before candidates existed, a request matching nothing
+        produced an empty analysis, and empty read downstream as "nothing to
+        ask about" — the agent proceeded on an interpretation the repository had
+        never confirmed. Nothing found is UNKNOWN, and says so.
+        """
+        candidates, count = found["candidates"], found["candidate_count"]
+        if not candidates:
+            return {"status": "TARGET_UNKNOWN", "intended_target": UNKNOWN,
+                    "candidate_count": 0, "evidence": [found.get("reason", "")] if found.get("reason") else [],
+                    "question": "Which part of this repository does the request refer to?",
+                    "options": ["name a path or directory", "name a symbol",
+                                "confirm the target is not in this repository"],
+                    "guidance": ("Nothing indexed matches this request, so the target is UNKNOWN — not absent. "
+                                 "Ask the user to name it rather than searching on a guess, and do not treat "
+                                 "the empty result as evidence that there is nothing to change.")}
+        if found["named_paths"] or count == 1:
+            only = candidates[0]
+            return {"status": "TARGET_RESOLVED", "intended_target": only["area"],
+                    "candidate_count": count, "evidence": only["evidence"],
+                    "guidance": ("One area matches, so no clarification is manufactured. Confirm it is the "
+                                 "intended one before editing." if not found["named_paths"] else
+                                 "The request names its own target, so there is nothing to disambiguate.")}
+        areas = [item["area"] for item in candidates]
+        return {"status": "TARGET_AMBIGUOUS", "intended_target": UNKNOWN, "candidate_count": count,
+                "evidence": [f'{item["area"]}: {", ".join(item["evidence"][:2])}' for item in candidates],
+                "question": (f"{count} areas of this repository match this request — {', '.join(areas[:6])}"
+                             f"{' and others' if count > len(areas) else ''}. The request does not say which "
+                             f"of them is intended."),
+                # The order above is alphabetical, and the first entry is not a
+                # recommendation. Naming one here would be choosing for the user
+                # with the appearance of evidence.
+                "options": ["one area only — ask which of the candidates", "all matching areas",
+                            "a specific subset the user names"],
+                "guidance": ("Present these candidates and ask which is intended. The intended target is UNKNOWN: "
+                             "CodeLedger matched words, not meaning, and cannot tell which area the request is "
+                             "about. Do not choose one silently, and do not treat the first as the likeliest.")}
+
+    def project_context(self, query: str = "") -> dict:
+        """The engineering context for one question, composed once and kept small.
+
+        Assembling this took four to six calls whose payloads repeated each
+        other — `context` and `plan` both carry the recent-change block and the
+        task reading — so the pieces are gathered here once instead. It is a
+        composition and holds no logic of its own: every field below is
+        available separately, and nothing is computed here that could not be
+        recomputed from the parts.
+
+        Deliberately not everything the ledger knows. Full symbol records,
+        dependency edge lists and hashes are excluded because an agent asking
+        "what am I working on and what would this touch?" cannot spend its
+        window on database bookkeeping; `impact` remains the drill-down. What
+        the ledger could not determine is listed rather than omitted, because an
+        absent field reads as "nothing to worry about" and that is the one thing
+        it must never mean.
+        """
+        unknown: list[str] = []
+        # Deliberately unfiltered by the query. The active goal is whatever the
+        # last session was doing; asking `resume` to match it against this
+        # request answers a different question and returns NO_RELEVANT_CHECKPOINT
+        # for any query that happens not to resemble the recorded goal, which
+        # then reads as "there is no work in progress".
+        current = self.resume()
+        analysis = self.analyze_prompt(query, candidates=True) if query else {}
+        found = analysis.get("candidate_targets") or {"candidates": [], "candidate_count": 0}
+        target = analysis.get("target_ambiguity") or {}
+        files = sorted({path for item in found["candidates"] for path in item["files"]})
+        if query and not found["candidate_count"]:
+            unknown.append("No indexed path, filename or symbol matches the request; the target is UNKNOWN.")
+        if target.get("status") == "TARGET_AMBIGUOUS":
+            unknown.append(f"{target['candidate_count']} areas match the request; which one is intended is UNKNOWN.")
+        if not current.get("goal"):
+            unknown.append(f"No checkpoint supplies an active goal ({current.get('status', UNKNOWN)}), "
+                           "so what is currently being worked on is UNKNOWN.")
+        external = self.external_dependencies(files[:20]) if files else None
+        if files and not external["environment_variables"] and not external["external_packages"]:
+            unknown.append("No external dependency was proven for the matching files.")
+        # Index churn is real history and stays in `changes`; it is simply not
+        # context. Nine hundred rows of "Indexed 2 changed file(s)" crowd out
+        # the handful of records that say what somebody was actually doing.
+        recent = [dict(row) for row in self.db.execute(
+            "SELECT timestamp,agent,summary,user_request,risk FROM changes "
+            "WHERE user_request IS NOT NULL AND user_request!='' ORDER BY id DESC LIMIT 5")]
+        if not recent:
+            unknown.append("No change carries a recorded request, so why the code is as it is is UNKNOWN.")
+        verification = self.verification_state("project", "project")
+        return {
+            "project": {"name": self.config.project_name,
+                        "files": self.db.execute("SELECT count(*) AS n FROM files WHERE status!='deleted'").fetchone()["n"],
+                        "symbols": self.db.execute("SELECT count(*) AS n FROM symbols WHERE status='active'").fetchone()["n"]},
+            "as_of": self.as_of(files[:20] or None),
+            "active_goal": {"goal": current.get("goal", UNKNOWN), "next_action": current.get("next_action", UNKNOWN),
+                            "current_state": current.get("current_state", ""),
+                            "recorded_by": current.get("recorded_by", {}),
+                            "trust": trust("note", reason="an agent recorded this; nothing has re-checked it")},
+            "recent_work": {"unresolved": current.get("unresolved", []), "changes": recent},
+            "targets": {"status": target.get("status", "NOT_ASKED"),
+                        "intended_target": target.get("intended_target", UNKNOWN),
+                        "candidates": found["candidates"], "candidate_count": found["candidate_count"],
+                        "question": target.get("question"), "options": target.get("options"),
+                        "guidance": target.get("guidance")},
+            "dependencies": analysis.get("blast_radius") or {},
+            "external": external,
+            "verification": verification,
+            "risk": {"impact_risk": analysis.get("impact_risk"), "request_risk_hint": analysis.get("request_risk_hint")},
+            "unknown": unknown,
+        }
 
     def _area_for_path(self, rel: str) -> str:
         """The part of the system a file belongs to, for reporting blast radius.
@@ -1412,7 +1775,15 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                          "not change every area on the assumption that wider is safer."),
         }
 
-    def analyze_prompt(self, prompt: str, scope: bool = True, symbols: list[dict] | None = None) -> dict:
+    def analyze_prompt(self, prompt: str, scope: bool = True, symbols: list[dict] | None = None,
+                       candidates: bool = False) -> dict:
+        """Read a request: what it says, and what in the repository it could mean.
+
+        `candidates` is off by default because finding them costs a bounded but
+        real query, and `record_change` calls this on every refresh only to
+        derive a risk label. The pre-change readers — `context`, `plan` — ask
+        for them, because for those callers the candidates *are* the answer.
+        """
         text = " ".join(prompt.strip().split()); lower = text.lower()
         first = re.match(r"(?:please\s+)?([a-z]+)", lower)
         verb = first.group(1) if first else "investigate"
@@ -1432,7 +1803,19 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         if intent == "feature" and not acceptance: questions.append("Confirm how success should be verified and which existing UI/API should be extended.")
         if intent == "recovery" and not data_sources: questions.append("Which source of truth should be used: project files, Git history, database, or browser/runtime storage?")
         if data_sources and intent == "recovery": questions.append("Is the requested runtime data backed up or exported, or should the system create a new persistence path?")
-        result = {"original": prompt, "normalized": text, "intent": intent, "verb": verb, "areas": areas, "paths": paths, "constraints": constraints, "preservation_constraints": preservation, "data_sources": data_sources, "acceptance_criteria": acceptance, "risk": risk, "clarifying_questions": questions}
+        result = {"original": prompt, "normalized": text, "intent": intent, "verb": verb, "areas": areas, "paths": paths, "constraints": constraints, "preservation_constraints": preservation, "data_sources": data_sources, "acceptance_criteria": acceptance, "risk": risk,
+                  # The same value `risk` has always carried, under a name that
+                  # says what it is. It is read off the words of the request —
+                  # "delete" and "auth" make it HIGH — and knows nothing about
+                  # what the repository would actually be asked to change. Kept
+                  # because it is a real signal about intent; renamed in place
+                  # because callers read `risk` and must not silently get a
+                  # different quantity under the old key.
+                  "request_risk_hint": {"level": risk, "basis": "request wording",
+                                        "trust": trust("heuristic", reason=(
+                                            "read from the words of the request, not from the repository; it says "
+                                            "what the user asked for, not what the change would reach"))},
+                  "clarifying_questions": questions}
         # Off by default for callers that only want the text reading of a
         # request — `record_change` derives `risk` on every refresh and must not
         # pay for dependency queries to do it.
@@ -1445,7 +1828,57 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
             result["scope_ambiguity"] = ambiguity
             if ambiguity:
                 questions.append(ambiguity["question"] + " Ask which scope is intended before editing.")
+        if candidates:
+            found = self.candidate_targets(prompt)
+            target = self._target_ambiguity(found)
+            result["candidate_targets"] = found
+            result["target_ambiguity"] = target
+            if target["status"] == "TARGET_AMBIGUOUS":
+                questions.append(target["question"] + " Ask which target is intended before editing.")
+            elif target["status"] == "TARGET_UNKNOWN":
+                questions.append(target["question"] + " Nothing indexed matches it, so the target is UNKNOWN.")
+        result["impact_risk"] = self._impact_risk(result)
         return result
+
+    def _impact_risk(self, analysis: dict) -> dict:
+        """Risk measured from what a change would reach, once there is a target.
+
+        Separate from `request_risk_hint` because they answer different
+        questions and were being conflated. "Delete the old authentication
+        code" scored HIGH on the word "delete" while the blast radius behind it
+        was zero files — an alarming label attached to no measurement — and
+        "tidy up the login helper" scored LOW over the same code. A verb is not
+        a footprint.
+
+        Nothing is measured until a target exists, so an unresolved request is
+        UNKNOWN rather than LOW. That is the whole point: absence of a measured
+        radius must never read as absence of danger.
+        """
+        target = analysis.get("target_ambiguity")
+        radius = analysis.get("blast_radius") or {}
+        inputs: list[str] = []
+        if target and target["status"] == "TARGET_UNKNOWN":
+            return {"level": UNKNOWN, "inputs": ["no candidate target matched the request"],
+                    "trust": trust("absent", reason=("nothing in the repository matched, so there is no footprint "
+                                                     "to measure and no risk can be derived"))}
+        if target and target["status"] == "TARGET_AMBIGUOUS":
+            return {"level": UNKNOWN,
+                    "inputs": [f"{target['candidate_count']} candidate targets; the intended one is UNKNOWN"],
+                    "trust": trust("absent", reason=("risk depends on which target is meant, and that is not "
+                                                     "established; measuring the wrong one would be worse than "
+                                                     "measuring nothing"))}
+        if not radius or radius.get("confidence") == UNKNOWN:
+            return {"level": UNKNOWN,
+                    "inputs": ["no dependency evidence was measured for the matched symbols"],
+                    "trust": trust("absent", reason="the blast radius is unmeasured, so containment is not established")}
+        files, areas = radius.get("file_count", 0), radius.get("area_count", 0)
+        inputs.append(f"{files} dependent file(s) across {areas} area(s)")
+        level = "HIGH" if files > 10 or areas >= AMBIGUITY_LONE_AREAS else "MEDIUM" if files > 3 or areas >= AMBIGUITY_MIN_AREAS else "LOW"
+        if analysis.get("coverage_caveat"):
+            inputs.append("some defining files are analysed shallowly, so the radius is a lower bound")
+        basis = SHALLOW if analysis.get("coverage_caveat") else FULL
+        return {"level": level, "inputs": inputs, "trust": trust(basis, reason=(
+            "derived from the recorded dependency graph for the matched symbols"))}
 
     def _symbol_files(self, names: set[str]) -> dict[str, set[str]]:
         """Which indexed file(s) define each of these symbol names."""
@@ -1671,7 +2104,7 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                               f"implementation rather than adding a parallel one.")
         else:
             recommendation = "Inspect the existing implementation before adding new code."
-        return {"request": request, "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols,
+        return {"request": request, "as_of": context["as_of"], "task_analysis": analysis, "existing_files": sorted(impact_files), "relevant_symbols": symbols,
                 "external_dependencies": self.external_dependencies(sorted(impact_files)[:20]),
                 "shared_dependencies": shared, "blast_radius": radius, "coverage_caveat": analysis.get("coverage_caveat"),
                 "scope_ambiguity": analysis.get("scope_ambiguity"),

@@ -95,6 +95,34 @@ def closing_session(ledger, session, result):
             try: signal.signal(sig, handler)
             except (ValueError, OSError): pass
 
+def emit_targets(value, as_json=False):
+    """Print candidates without implying one of them is the answer.
+
+    The order is alphabetical and says so, no candidate is marked recommended,
+    and when nothing matched the output says the target is UNKNOWN rather than
+    printing an empty list, which reads as "there is nothing there".
+    """
+    if as_json: print(json.dumps(value, indent=2, default=str)); return
+    target = value["target_ambiguity"]
+    print(f"CODELEDGER TARGETS — {value['request']}\n")
+    print(f"Status: {target['status']}   Intended target: {target['intended_target']}")
+    if value["tokens"]: print(f"Matched on: {', '.join(value['tokens'])}")
+    if not value["candidates"]:
+        print(f"\n{value.get('reason', 'Nothing matched.')}")
+    else:
+        print(f"\n{value['candidate_count']} candidate(s) — {value['order']}:")
+        for item in value["candidates"]:
+            print(f"\n   {item['area']}  [{item['file_count']} file(s), trust {item['trust']['level']}]")
+            for path in item["files"]: print(f"      {path}")
+            if item["symbols"]: print(f"      symbols: {', '.join(item['symbols'])}")
+            print(f"      why: {'; '.join(item['evidence'])}")
+        if value["candidates_truncated"]: print(f"\n   (showing {len(value['candidates'])} of {value['candidate_count']})")
+    if target.get("question"): print(f"\nQuestion: {target['question']}")
+    if target.get("options"):
+        print("Options:")
+        for option in target["options"]: print(f"   - {option}")
+    print(f"\n{target['guidance']}")
+
 def emit_plan(value, as_json=False):
     """Lead with what a change would reach, not with the file it is defined in."""
     if as_json: print(json.dumps(value, indent=2, default=str)); return
@@ -318,6 +346,10 @@ def build_parser():
     scope.add_argument("--plan-symbols", nargs="*", default=[], help="Symbols the implementation plan said it would change")
 
     add("plan", "Generate pre-change intelligence").add_argument("request")
+    # Both take a free-text request rather than a symbol: they exist for the
+    # case where the user does not yet know which symbol they mean.
+    add("targets", "Which parts of the repository a request could be about").add_argument("request")
+    add("project-context", "One compact engineering context for a request").add_argument("request", nargs="?", default="")
     add("progress", "Check whether prior attempts at this request achieved anything").add_argument("request")
     since = add("since", "What changed since a change id, session, timestamp, or an agent's last turn")
     since.add_argument("marker", nargs="?", default="")
@@ -565,6 +597,10 @@ def main(argv=None):
     elif args.command == "restore-info": value={"query":args.query,"last_known_versions":ledger.lookup(args.query),"history":ledger.history(args.query),"automatic_restore":False}
     elif args.command == "scope": value=ledger.scope_check(args.request, args.files, args.symbols, args.plan_files, args.plan_symbols)
     elif args.command == "plan": emit_plan(ledger.plan(args.request), args.as_json); return 0
+    elif args.command == "targets":
+        found = ledger.candidate_targets(args.request)
+        emit_targets({**found, "target_ambiguity": ledger._target_ambiguity(found)}, args.as_json); return 0
+    elif args.command == "project-context": value=ledger.project_context(args.request)
     elif args.command == "progress": value=ledger.progress(args.request)
     elif args.command == "since": emit_since(ledger.since(args.marker, args.agent), args.as_json); return 0
     elif args.command == "resume": emit_resume(ledger.resume(args.task), args.as_json); return 0

@@ -18,6 +18,8 @@ TOOLS = [
     ("codeledger_get_progress", "Check whether previous attempts at this request changed anything or are repeating. Call before retrying a task that did not work."),
     ("codeledger_get_changes_since", "What changed since a point in time, and which agent did it. Call at the start of a turn when more than one agent works on this project."),
     ("codeledger_analyze_prompt", "Convert a user request into an explicit task brief."),
+    ("codeledger_find_targets", "Which parts of this repository a request could be about, and whether that is ambiguous. Call BEFORE editing when the request names a subsystem rather than a file. Returns bounded candidates with the evidence for each; it never decides which one the user meant."),
+    ("codeledger_get_project_context", "One compact read of the engineering context for a request: current goal, next action, candidate targets, dependencies, external requirements, verification state, risk, and what could not be determined."),
     ("codeledger_task_handshake", "Compare the user request with the AI implementation plan before editing."),
     ("codeledger_find_symbol", "Find active or deleted symbols."),
     ("codeledger_get_impact", "Find dependencies and likely affected files."),
@@ -61,6 +63,8 @@ SCHEMAS = {
     "codeledger_get_progress": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}}, "required": ["request"]},
     "codeledger_get_changes_since": {"type": "object", "properties": {"marker": {"type": "string", "description": "change id, session id, or ISO timestamp"}, "agent": {"type": "string", "description": "your own agent name; means 'since I last recorded anything'"}}},
     "codeledger_analyze_prompt": {"type": "object", "properties": {"prompt": {"type": "string"}, "task": {"type": "string"}}, "required": ["prompt"]},
+    "codeledger_find_targets": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "query": {"type": "string"}}},
+    "codeledger_get_project_context": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "query": {"type": "string"}}},
     "codeledger_task_handshake": {"type": "object", "properties": {"request": {"type": "string"}, "task": {"type": "string"}, "ai_plan": {"type": "string"}}, "required": ["ai_plan"]},
     "codeledger_find_symbol": {"type": "object", "properties": {"query": {"type": "string"}, "task": {"type": "string"}}, "required": ["query"]},
     "codeledger_get_impact": {"type": "object", "properties": {"query": {"type": "string"}, "task": {"type": "string"}, "scan": {"type": "boolean", "default": False, "description": "Read every source file instead of trusting the index. Slow on large repositories."}}, "required": ["query"]},
@@ -234,7 +238,12 @@ def serve(root, agent: str = "", session: str = ""):
                     elif name == "codeledger_get_plan": result = _result(ledger.plan(arg(args, "request", "task", "query")))
                     elif name == "codeledger_get_progress": result = _result(ledger.progress(arg(args, "request", "task", "query")))
                     elif name == "codeledger_get_changes_since": result = _result(ledger.since(args.get("marker", ""), args.get("agent", "")))
-                    elif name == "codeledger_analyze_prompt": result = _result(ledger.analyze_prompt(arg(args, "prompt", "task", "query")))
+                    elif name == "codeledger_analyze_prompt": result = _result(ledger.analyze_prompt(arg(args, "prompt", "task", "query"), candidates=True))
+                    elif name == "codeledger_find_targets":
+                        request = arg(args, "request", "task", "query")
+                        found = ledger.candidate_targets(request)
+                        result = _result({**found, "target_ambiguity": ledger._target_ambiguity(found)})
+                    elif name == "codeledger_get_project_context": result = _result(ledger.project_context(arg(args, "request", "task", "query")))
                     elif name == "codeledger_task_handshake": result = _result(ledger.handshake(arg(args, "request", "task"), args.get("ai_plan", "")))
                     elif name == "codeledger_find_symbol": result = _result(ledger.lookup(arg(args, "query", "task")))
                     elif name == "codeledger_get_impact": result = _result(ledger.impact(arg(args, "query", "task"), scan=bool(args.get("scan", False))))
