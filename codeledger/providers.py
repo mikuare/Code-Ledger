@@ -326,6 +326,30 @@ class TreeSitterProvider:
         if "${" in raw: return None
         return raw.strip("'\"`") or None
 
+    def _is_env_callee(self, node) -> bool:
+        """Is this access the *callee* of an environment call, rather than a read?
+
+        `Deno.env.get("DATABASE_URL")` contains the member access `Deno.env.get`,
+        which starts with the environment object `Deno.env` and continues
+        `.get`. Read as an access that names a variable called `get`; read as a
+        call it names the variable in the argument. Both branches below saw the
+        same source, so the call recorded `DATABASE_URL` and the access invented
+        `get` alongside it — reported `PROVEN`, because the parse really did
+        happen. Only the call is a read of the environment, and it is already
+        recorded, so the callee is skipped here.
+
+        The test is structural rather than textual on purpose. An access that
+        merely looks like a callee — `const read = process.env.get` — is not
+        one, and stays a genuine read of a variable named `get`.
+        """
+        parent = node.parent
+        if parent is None or parent.type not in CALL_TYPES:
+            return False
+        target = parent.child_by_field_name("function")
+        if target is None or (target.start_byte, target.end_byte) != (node.start_byte, node.end_byte):
+            return False
+        return node.text.decode("utf-8", errors="replace") in self.ENV_CALLS
+
     def _env_edges(self, node) -> list[tuple[str, str, str]]:
         """Environment variables read here, by structure rather than by text.
 
@@ -342,7 +366,7 @@ class TreeSitterProvider:
             # Decoding is deliberately inside the branches. `current.text` for a
             # node is its whole source span, so decoding every node on the way
             # past costs the file size once per level of nesting.
-            if current.type in ACCESS_TYPES:
+            if current.type in ACCESS_TYPES and not self._is_env_callee(current):
                 text = current.text.decode("utf-8", errors="replace")
                 for prefix in self.ENV_OBJECTS:
                     if not text.startswith(prefix) or len(text) == len(prefix):
@@ -514,8 +538,13 @@ def version_for(path: Path) -> str:
     that: the file was fully parsed, just by a version that did not look — so
     the coverage caveat stays silent and the answer reads as "this code needs
     nothing from outside". Re-stamping makes each file reparse once.
+
+    Bumped to 4 when `Deno.env.get` / `process.env.get` stopped being read as
+    both a call and an access. Indexes built before it hold a fabricated `env`
+    edge named `get`, reported as `PROVEN`. Nothing else retires it: the edge is
+    a real row about a real file, so only reanalysing the file removes it.
     """
-    return f"{provider_for(path).name}:3"
+    return f"{provider_for(path).name}:4"
 
 def analyze(path: Path, text: str) -> tuple[list[SymbolData], list[tuple[str, str, str]], str, str]:
     """Symbols, edges, provider name, and coverage tier for one file."""

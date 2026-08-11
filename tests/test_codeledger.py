@@ -4481,3 +4481,62 @@ class EnvironmentEdgeUpgradeTests(unittest.TestCase):
                 "SELECT name FROM symbols WHERE status='active'")}, "a live symbol was retired by the upgrade")
             self.assertGreaterEqual(ledger.db.execute("SELECT COUNT(*) FROM changes").fetchone()[0], before,
                                     "change history was lost")
+
+
+class EnvironmentCallExtractionTests(unittest.TestCase):
+    """`Deno.env.get("X")` reads X. It does not also read a variable called `get`.
+
+    The member access `Deno.env.get` and the call around it are the same source,
+    and both extraction rules matched it: the call recorded `X`, the access
+    recorded `get`, and the inventory reported `get` as PROVEN because the parse
+    really had happened. A fabricated name carrying the strongest trust label is
+    the exact failure the product exists to prevent.
+    """
+
+    def extract(self, name: str, source: str) -> set[str]:
+        from codeledger.providers import analyze
+        _symbols, edges, _provider, _coverage = analyze(Path(name), source)
+        return {target for _source, target, kind in edges if kind == "env"}
+
+    def grammar(self):
+        if not capabilities()["tree_sitter_installed"]:
+            raise unittest.SkipTest("tree-sitter grammars are not installed")
+
+    def test_deno_env_get_yields_only_the_named_variable(self):
+        self.grammar()
+        self.assertEqual(self.extract("a.ts", 'const u = Deno.env.get("SUPABASE_URL")!;\n'), {"SUPABASE_URL"})
+
+    def test_process_env_get_yields_only_the_named_variable(self):
+        self.grammar()
+        self.assertEqual(self.extract("a.js", 'const d = process.env.get("DATABASE_URL");\n'), {"DATABASE_URL"})
+
+    def test_import_meta_env_access_is_unaffected(self):
+        self.grammar()
+        self.assertEqual(self.extract("a.js", "const x = import.meta.env.VITE_X;\n"), {"VITE_X"})
+
+    def test_a_chained_access_still_records_only_the_inner_read(self):
+        self.grammar()
+        self.assertEqual(self.extract("a.js", "const m = process.env.NODE_ENV.toLowerCase();\n"), {"NODE_ENV"})
+
+    def test_genuine_non_call_environment_access_still_works(self):
+        self.grammar()
+        self.assertEqual(self.extract("a.js", 'const p = process.env.PORT;\nconst q = process.env["QUEUE_URL"];\n'),
+                         {"PORT", "QUEUE_URL"})
+
+    def test_a_variable_genuinely_named_get_is_still_recorded(self):
+        """The guard is structural, so an access that is not a callee survives it."""
+        self.grammar()
+        self.assertEqual(self.extract("a.js", "const read = process.env.get;\n"), {"get"})
+
+    def test_python_environ_get_does_not_fabricate_a_variable(self):
+        source = 'import os\nX = os.environ.get("DB")\nY = os.environ["Z"]\nW = os.getenv("W")\n'
+        self.assertEqual(self.extract("a.py", source), {"DB", "Z", "W"})
+
+    def test_the_analysis_stamp_moved_so_existing_indexes_rederive(self):
+        """A fabricated edge is a real row; only reanalysing the file removes it."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text('import os\n\ndef connect():\n    return os.environ.get("DB")\n')
+            ledger = Ledger(root); ledger.init()
+            stamp = ledger.db.execute("SELECT analysis_version FROM files WHERE path='app.py'").fetchone()[0]
+            self.assertTrue(stamp.endswith(":4"), f"analysis stamp did not move past the fabrication: {stamp}")
