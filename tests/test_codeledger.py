@@ -4540,3 +4540,90 @@ class EnvironmentCallExtractionTests(unittest.TestCase):
             ledger = Ledger(root); ledger.init()
             stamp = ledger.db.execute("SELECT analysis_version FROM files WHERE path='app.py'").fetchone()[0]
             self.assertTrue(stamp.endswith(":4"), f"analysis stamp did not move past the fabrication: {stamp}")
+
+
+def forlive_shaped(root: Path) -> None:
+    """A repository laid out the way the production project this was built for is.
+
+    Authentication is not one place: it is a directory of screens, three Edge
+    Functions with their own names, and a migration. That shape is the whole
+    reason candidate discovery exists, so the fixtures use it rather than a
+    tidier invention where every request has one obvious answer.
+    """
+    (root / "src" / "auth").mkdir(parents=True)
+    (root / "src" / "lib").mkdir(parents=True)
+    (root / "supabase" / "functions" / "auth-login").mkdir(parents=True)
+    (root / "supabase" / "functions" / "password-recovery").mkdir(parents=True)
+    (root / "supabase" / "migrations").mkdir(parents=True)
+    (root / "src" / "auth" / "SignIn.py").write_text("def SignIn():\n    return 1\n")
+    (root / "src" / "auth" / "AuthGate.py").write_text("def AuthGate():\n    return 1\n")
+    (root / "src" / "auth" / "ResetPassword.py").write_text("def ResetPassword():\n    return 1\n")
+    (root / "src" / "lib" / "supabase.py").write_text("import os\n\ndef client():\n    return os.environ['SUPABASE_URL']\n")
+    (root / "supabase" / "functions" / "auth-login" / "index.py").write_text(
+        "import os\n\ndef captchaIsValid():\n    return os.environ['HCAPTCHA_SECRET']\n")
+    (root / "supabase" / "functions" / "password-recovery" / "index.py").write_text("def recover():\n    return 1\n")
+    (root / "supabase" / "migrations" / "0001_username_login.py").write_text("def on_auth_user_created():\n    return 1\n")
+
+class EmptyEvidenceInvariantTests(unittest.TestCase):
+    """Nothing found is not a saving, and not a measurement to be confident about.
+
+    The general rule, enforced rather than spot-checked: no payload may report a
+    positive quantity or a non-UNKNOWN confidence that was computed from an empty
+    result set. `context` claimed the whole repository had been avoided while
+    telling the agent a full scan was still required, and a zero-file blast
+    radius came back HIGH.
+    """
+
+    def test_a_query_that_matches_nothing_claims_no_files_avoided(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            answer = ledger.context("unicorn subsystem")
+            self.assertTrue(answer["efficiency"]["full_scan_required"])
+            self.assertEqual(answer["efficiency"]["files_avoided"], 0,
+                             "a scan-required answer still reported files avoided")
+
+    def test_a_query_that_matches_something_still_reports_its_saving(self):
+        """The invariant must not flatten the number it exists to keep honest."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            answer = ledger.context("SignIn")
+            self.assertFalse(answer["efficiency"]["full_scan_required"])
+            self.assertGreater(answer["efficiency"]["files_avoided"], 0)
+
+    def test_an_unmeasured_blast_radius_is_not_reported_with_confidence(self):
+        """A matched symbol nothing depends on is unmeasured, not proven contained."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            analysis = ledger.analyze_prompt("fix captchaIsValid")
+            radius = analysis["blast_radius"]
+            self.assertTrue(analysis["shared_dependencies"] == [] and radius["file_count"] == 0,
+                            "fixture no longer produces a matched symbol with no dependents")
+            self.assertEqual(radius["confidence"], "UNKNOWN",
+                             "an empty blast radius was reported with positive confidence")
+            self.assertIn("unmeasured", analysis["coverage_caveat"] or "")
+
+    def test_a_measured_blast_radius_keeps_its_confidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "shared.py").write_text("def helper():\n    return 1\n")
+            (root / "one").mkdir(); (root / "two").mkdir()
+            (root / "one" / "a.py").write_text("from shared import helper\n\ndef a():\n    return helper()\n")
+            (root / "two" / "b.py").write_text("from shared import helper\n\ndef b():\n    return helper()\n")
+            ledger = Ledger(root); ledger.init()
+            radius = ledger.analyze_prompt("change helper")["blast_radius"]
+            self.assertGreater(radius["file_count"], 0)
+            self.assertNotEqual(radius["confidence"], "UNKNOWN")
+
+    def test_a_checkpoint_naming_no_file_claims_no_files_avoided(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); forlive_shaped(root)
+            ledger = Ledger(root); ledger.init()
+            session = ledger.start_session("codex", "work")
+            ledger.record_checkpoint(session["session_id"], goal="something", next_action="carry on")
+            efficiency = ledger.resume()["efficiency"]
+            self.assertEqual(efficiency["files_relevant"], 0)
+            self.assertEqual(efficiency["files_avoided"], 0,
+                             "a checkpoint that named no file reported the repository as avoided")

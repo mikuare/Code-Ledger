@@ -100,6 +100,17 @@ def article(word: str) -> str:
     that makes a report read as though nobody has ever looked at it."""
     return "an" if word[:1].lower() in "aeiou" else "a"
 
+def savings_from(total: int, relevant: int, nothing_found: bool) -> int:
+    """Files this answer saved opening — zero when it did not answer.
+
+    `total - relevant` reads as a saving right up to the moment `relevant` is
+    zero because nothing matched, when the same arithmetic reports the whole
+    repository as avoided beside a flag saying every file still has to be read.
+    Finding nothing is not an efficiency; it is the absence of a result, and
+    absence is never evidence of a saving.
+    """
+    return 0 if nothing_found or relevant <= 0 else max(0, total - relevant)
+
 def is_stdlib(name: str, path: str | None) -> bool:
     """Is this import part of the language's own library, rather than a dependency?
 
@@ -1248,9 +1259,11 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         # What this answer cost, in the terms that matter: files the agent did
         # not have to open. The whole point of the ledger is the third number.
         total = self.db.execute("SELECT count(*) FROM files WHERE status IN ('current','unindexed')").fetchone()[0]
+        scan_required = not bool(matches or features)
         efficiency = {"files_relevant": len(paths), "files_in_repository": total,
-                      "files_avoided": max(0, total - len(paths)), "symbols_returned": len(matches[:20]),
-                      "changes_returned": len(recent), "full_scan_required": not bool(matches or features),
+                      "files_avoided": savings_from(total, len(paths), scan_required),
+                      "symbols_returned": len(matches[:20]),
+                      "changes_returned": len(recent), "full_scan_required": scan_required,
                       "stale_records_reanalyzed": stale}
         # The matches are already computed; handing them over keeps the scope
         # analysis from repeating the symbol search on every context call.
@@ -1323,7 +1336,14 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         shallow = [row["path"] for row in self.db.execute(
             f"SELECT path,coverage FROM files WHERE path IN ({','.join('?' * len(defining))})", defining)
             if (row["coverage"] or SHALLOW) != FULL] if defining else []
-        confidence = "UNKNOWN" if not symbols else "LOW" if shallow else "HIGH"
+        # Confidence describes a *measured* radius. Shallow coverage already
+        # answers for itself with LOW and a caveat that says an empty list is
+        # unproven. The gap was the fully-parsed case: nothing reached became
+        # HIGH, which reads as "proven contained" — and this cannot tell a
+        # genuine leaf from a symbol the request never meant, or from a
+        # reference the index cannot see. Nothing measured, nothing to be
+        # confident about.
+        confidence = "UNKNOWN" if not symbols else "LOW" if shallow else "HIGH" if reached else "UNKNOWN"
         caveat = None
         if shallow:
             caveat = (f"{len(shallow)} of the defining file(s) are analysed shallowly, so the dependency graph for "
@@ -1332,6 +1352,9 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                       f"{capabilities()['install_hint']}")
         elif not symbols:
             caveat = "No indexed symbol matched this request, so no dependency evidence exists either way."
+        elif not reached:
+            caveat = ("No file in the index depends on the matched symbol(s), so the blast radius is unmeasured "
+                      "rather than proven empty. Treat containment as UNKNOWN until the intended target is named.")
         entries.sort(key=lambda item: (-item["area_count"], -item["dependent_count"], item["symbol"]))
         return {"shared_dependencies": entries,
                 "blast_radius": {"files": sorted(reached), "areas": self._areas(reached),
@@ -2544,7 +2567,10 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
         relevant = len(package["important_files"])
         package["efficiency"] = {
             "files_relevant": relevant, "files_in_repository": total_files,
-            "files_avoided": max(0, total_files - relevant),
+            # A checkpoint that named no file saved the agent nothing; claiming
+            # the whole repository was avoided turns "nothing was recorded" into
+            # a measured efficiency.
+            "files_avoided": savings_from(total_files, relevant, relevant <= 0),
             "full_repository_scan_required": False,
             "estimated_checkpoint_tokens": self._estimate_tokens({k: package[k] for k in ("goal", "summary", "current_state", "accomplished", "unresolved", "failed_attempts", "next_action")}),
             "estimated_history_tokens": self._estimate_tokens(package["changed_since_checkpoint"]),
@@ -2594,7 +2620,8 @@ For automatic lifecycle tracking, run the agent through `codeledger run --agent 
                 "symbols": recent["symbols_changed"][:20], "agents": recent["agents"],
                 "efficiency": {"files_relevant": len(relevant_files) or len(recent["files_changed"]),
                                "files_in_repository": total_files,
-                               "files_avoided": max(0, total_files - len(recent["files_changed"])),
+                               "files_avoided": savings_from(total_files, len(recent["files_changed"]),
+                                                             not recent["files_changed"]),
                                "full_repository_scan_required": False,
                                "estimated_tokens": self._estimate_tokens(summary) + self._estimate_tokens(unverified[:5])},
                 "guidance": ("No checkpoint exists, so this is inferred from recorded changes rather than recorded "
